@@ -232,13 +232,14 @@ jobs:
           profile: pixel_6
           disable-animations: true
           emulator-options: -no-snapshot -no-window -gpu swiftshader_indirect -no-boot-anim -camera-back none
-          script: |
-            cd src
-            set +e
-            bash ci/emulator-tier.sh
-            TIER_EXIT=$?
-            set -e
-            echo "tier_exit=$TIER_EXIT" >> "$GITHUB_OUTPUT"
+          # The emulator runner executes each YAML line as a separate /usr/bin/sh -c
+          # invocation, so a plain 'cd src' would not persist. Use a single-line script
+          # that chains all commands in one shell process.
+          script: >-
+            cd src &&
+            bash ci/emulator-tier.sh;
+            TIER_EXIT=$?;
+            echo "tier_exit=$TIER_EXIT" >> "$GITHUB_OUTPUT";
             exit "$TIER_EXIT"
 
       # ── APK handoff to Forgejo generic package registry (scheduled only) ──
@@ -423,7 +424,8 @@ jobs:
             elif [ "$E2E_RESULT" = "cancelled" ]; then
               FAILED_STEP="emulator-job-cancelled"
             fi
-            TIERS_JSON="[{\"name\":\"infra\",\"passed\":0,\"failed\":1,\"total\":1,\"failed_flows\":\"${FAILED_STEP}\"}]"
+            # failed_flows must be a JSON array (API validates type=list).
+            TIERS_JSON="[{\"name\":\"infra\",\"passed\":0,\"failed\":1,\"total\":1,\"failed_flows\":[\"${FAILED_STEP}\"]}]"
           fi
 
           # Resolve commit message (fall back to "n/a" if e2e was skipped/failed before clone).
