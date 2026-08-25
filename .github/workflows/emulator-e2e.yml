@@ -9,9 +9,12 @@ on:
   workflow_dispatch:
     inputs:
       tier:
-        description: Tier to run (ignored for nightly mode)
+        description: >-
+          Tier to run. Use 'nightly' to run the full emulator tier set (same as
+          the 23:30 cron, useful for manual end-to-end verification).
         type: choice
         options:
+          - nightly
           - tier1-smoke
           - tier2-features
           - tier3-deep
@@ -130,8 +133,9 @@ jobs:
     # When skip-gate was bypassed (non-schedule event), its output is "false" → always runs.
     if: needs.skip-gate.outputs.should_skip != 'true'
     runs-on: ubuntu-latest
-    # 150 min for scheduled/dispatch runs (full nightly); 90 min for manual single-tier.
-    timeout-minutes: ${{ (github.event_name == 'schedule' || github.event_name == 'repository_dispatch') && 150 || 90 }}
+    # 150 min for full nightly set (cron, repository_dispatch, or manual nightly tier).
+    # 90 min for manual single-tier dispatches.
+    timeout-minutes: ${{ (github.event_name == 'schedule' || github.event_name == 'repository_dispatch' || inputs.tier == 'nightly') && 150 || 90 }}
 
     outputs:
       commit_sha: ${{ steps.clone.outputs.commit_sha }}
