@@ -18,10 +18,15 @@ Workflows in this repository are triggered only by:
 **Never** by `pull_request` or `push`. This eliminates the fork-PR attack surface
 entirely: no external contributor can trigger a workflow run that touches secrets.
 
-Only the repository owner can push to the default branch. Branch protection is not
-required to enforce this because the repository has no open-source contributors;
-the constraint is organisational, not technical, and is documented here as the
-explicit security boundary.
+Only the repository owner can push to the default branch. This is enforced by two
+complementary controls:
+
+1. **GitHub permission model**: the repository has zero collaborators (verified via
+   API — collaborator count = 1, which is the owner). No external account has write
+   access.
+2. **Branch protection on `main`**: force-pushes and branch deletion are blocked via
+   classic branch protection (applied 2026-08-25). The owner can merge directly
+   without a pull-request review; CI workflows remain unblocked.
 
 ---
 
