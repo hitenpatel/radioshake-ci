@@ -199,16 +199,18 @@ jobs:
           echo "$HOME/.maestro/bin" >> "$GITHUB_PATH"
           "$HOME/.maestro/bin/maestro" --version
 
-      - name: Build debug APK
+      - name: Build debug APK + androidTest APK
         id: build
         working-directory: src
         run: |
           printf 'sdk.dir=%s\n' "$ANDROID_HOME" > local.properties
-          ./gradlew :app:assembleDebug
+          # assembleDebugAndroidTest implies assembleDebug; both tasks run in one invocation.
+          ./gradlew :app:assembleDebug :app:assembleDebugAndroidTest
           echo "apk_path=app/build/outputs/apk/debug/app-debug.apk" >> "$GITHUB_OUTPUT"
+          echo "test_apk_path=app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk" >> "$GITHUB_OUTPUT"
 
-      # Compute SHA-256 of the debug APK for immutable-upload verification.
-      - name: Compute APK checksum
+      # Compute SHA-256 of both APKs for immutable-upload verification.
+      - name: Compute APK checksums
         if: github.event_name == 'schedule'
         id: apk-sha
         working-directory: src
@@ -216,6 +218,9 @@ jobs:
           sha256sum app/build/outputs/apk/debug/app-debug.apk \
             | awk '{print $1}' > app-debug.apk.sha256
           echo "checksum=$(cat app-debug.apk.sha256)" >> "$GITHUB_OUTPUT"
+          sha256sum app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk \
+            | awk '{print $1}' > app-debug-androidTest.apk.sha256
+          echo "test_checksum=$(cat app-debug-androidTest.apk.sha256)" >> "$GITHUB_OUTPUT"
 
       # Run the tier(s):
       #   - scheduled / repository_dispatch → TIER=nightly (full emulator set)
@@ -243,29 +248,36 @@ jobs:
             exit "$TIER_EXIT"
 
       # ── APK handoff to Forgejo generic package registry (scheduled only) ──
+      # Uploads both the debug APK and the androidTest APK (for device-only
+      # @DeviceOnly instrumentation tests that run on the Forgejo device nightly).
       # Immutable version per sha; if 409 (already exists), verify checksum.
       # Then update the `latest` pointer object.
-      - name: Upload APK to Forgejo package registry
+      - name: Upload APKs to Forgejo package registry
         if: github.event_name == 'schedule'
         env:
           HOST: ${{ secrets.FORGEJO_HOST }}
           PKG_TOKEN: ${{ secrets.FORGEJO_PKG_TOKEN }}
           COMMIT_SHA: ${{ steps.clone.outputs.commit_sha }}
           CHECKSUM: ${{ steps.apk-sha.outputs.checksum }}
+          TEST_CHECKSUM: ${{ steps.apk-sha.outputs.test_checksum }}
         run: |
           set -eu
           echo "::add-mask::$PKG_TOKEN"
           APK_SRC="src/app/build/outputs/apk/debug/app-debug.apk"
           SHA256_SRC="src/app-debug.apk.sha256"
+          TEST_APK_SRC="src/app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk"
+          TEST_SHA256_SRC="src/app-debug-androidTest.apk.sha256"
 
           # Forgejo generic package PUT:
           #   /api/packages/<owner>/generic/<package-name>/<version>/<filename>
           PKG_BASE="https://${HOST}/api/packages/hiten/generic/radioshake-nightly"
           PKG_URL="${PKG_BASE}/${COMMIT_SHA}/app-debug.apk"
           SHA_URL="${PKG_BASE}/${COMMIT_SHA}/app-debug.apk.sha256"
+          TEST_PKG_URL="${PKG_BASE}/${COMMIT_SHA}/app-debug-androidTest.apk"
+          TEST_SHA_URL="${PKG_BASE}/${COMMIT_SHA}/app-debug-androidTest.apk.sha256"
 
           upload_file() {
-            local src="$1" url="$2" label="$3"
+            local src="$1" url="$2" label="$3" expected_checksum="${4:-}"
             HTTP=$(curl -sw '%{http_code}' -o /tmp/pkg-resp.txt \
               -X PUT "$url" \
               -H "Authorization: token $PKG_TOKEN" \
@@ -275,16 +287,18 @@ jobs:
             if [ "$HTTP" -eq 201 ] || [ "$HTTP" -eq 200 ]; then
               echo "::notice::${label}: uploaded (HTTP $HTTP)"
             elif [ "$HTTP" -eq 409 ]; then
-              # Already exists from a previous attempt — verify checksum.
+              # Already exists from a previous attempt — verify checksum if provided.
               echo "::notice::${label}: version exists (HTTP 409) — verifying checksum"
-              if [ "$label" = "APK" ]; then
+              if [ -n "$expected_checksum" ]; then
+                # Fetch the corresponding .sha256 file from the same version.
+                SHA_FETCH_URL="${url%.apk}.apk.sha256"
                 REMOTE_SHA=$(curl -sf \
                   -H "Authorization: token $PKG_TOKEN" \
-                  "${PKG_BASE}/${COMMIT_SHA}/app-debug.apk.sha256" | tr -d '[:space:]') || true
-                if [ "$REMOTE_SHA" = "$CHECKSUM" ]; then
-                  echo "::notice::APK: checksum matches existing upload — OK"
+                  "$SHA_FETCH_URL" | tr -d '[:space:]') || true
+                if [ "$REMOTE_SHA" = "$expected_checksum" ]; then
+                  echo "::notice::${label}: checksum matches existing upload — OK"
                 else
-                  echo "::error::APK: checksum mismatch on existing upload (remote=$REMOTE_SHA local=$CHECKSUM)"
+                  echo "::error::${label}: checksum mismatch on existing upload (remote=$REMOTE_SHA local=$expected_checksum)"
                   exit 1
                 fi
               fi
@@ -295,10 +309,14 @@ jobs:
             fi
           }
 
-          upload_file "$APK_SRC" "$PKG_URL" "APK"
-          upload_file "$SHA256_SRC" "$SHA_URL" "SHA256"
+          upload_file "$APK_SRC"       "$PKG_URL"       "APK"         "$CHECKSUM"
+          upload_file "$SHA256_SRC"    "$SHA_URL"       "SHA256"
+          upload_file "$TEST_APK_SRC"  "$TEST_PKG_URL"  "TestAPK"     "$TEST_CHECKSUM"
+          upload_file "$TEST_SHA256_SRC" "$TEST_SHA_URL" "TestSHA256"
 
           # Update the `latest` pointer (a text file containing the sha).
+          # Both APKs are versioned under this sha; consuming the latest pointer
+          # gives the device nightly the correct sha to download both files.
           LATEST_URL="${PKG_BASE}/latest/latest.sha"
           HTTP=$(curl -sw '%{http_code}' -o /tmp/latest-resp.txt \
             -X PUT "$LATEST_URL" \
