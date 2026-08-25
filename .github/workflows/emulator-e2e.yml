@@ -1,10 +1,15 @@
 name: emulator-e2e
 
 on:
+  schedule:
+    # 23:30 UTC — the emulator nightly and the Forgejo device nightly (01:00 UTC)
+    # both land on the same calendar date when SUITE_ID uses +6h offset.
+    - cron: '30 23 * * *'
+
   workflow_dispatch:
     inputs:
       tier:
-        description: Tier to run
+        description: Tier to run (ignored for nightly mode)
         type: choice
         options:
           - tier1-smoke
@@ -17,38 +22,158 @@ on:
       ref:
         description: Source ref to clone (Forgejo branch or tag)
         default: main
+      suite_id:
+        description: >-
+          Force a specific SUITE_ID (for pipeline verification runs only).
+          Leave empty for normal ungrouped manual dispatches.
+        default: ''
+
+  repository_dispatch:
+    types: [radioshake-main-check]
 
 permissions:
   contents: read
 
 jobs:
-  e2e:
+  # ──────────────────────────────────────────────────────────────────────────
+  # Skip-gate: check whether HEAD has already been tested green this suite.
+  # Only actually skips on scheduled runs — all other events pass through.
+  # Fail open: any lookup error → should_skip=false so coverage is never lost.
+  # ──────────────────────────────────────────────────────────────────────────
+  skip-gate:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 5
+    outputs:
+      should_skip: ${{ steps.gate.outputs.should_skip }}
+    steps:
+      - name: Evaluate skip condition
+        id: gate
+        env:
+          E2E_INGEST_URL: ${{ secrets.E2E_INGEST_URL }}
+          E2E_INGEST_TOKEN: ${{ secrets.E2E_INGEST_TOKEN }}
+          HOST: ${{ secrets.FORGEJO_HOST }}
+          TOKEN: ${{ secrets.FORGEJO_CLONE_TOKEN }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          set -eu
+          # Non-schedule events always run — skip gate does not apply.
+          if [ "$EVENT" != "schedule" ]; then
+            echo "should_skip=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::event=$EVENT — skip-gate bypassed"
+            exit 0
+          fi
+
+          # Fail-open wrapper: any error → run the suite.
+          fail_open() {
+            echo "::warning::skip-gate lookup failed: $1 — running suite (fail open)"
+            echo "should_skip=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          }
+
+          # Get current Forgejo HEAD sha for the default branch.
+          AUTH=$(printf 'oauth2:%s' "$TOKEN" | base64 -w0)
+          echo "::add-mask::$AUTH"
+          FORGEJO_HEAD=$(curl -sf --max-time 10 \
+            -H "AUTHORIZATION: basic $AUTH" \
+            "https://${HOST}/api/v1/repos/hiten/RadioShake/branches/main" \
+            2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin)['commit']['id'])" \
+            2>/dev/null) || fail_open "Forgejo HEAD lookup"
+          echo "Forgejo HEAD: $FORGEJO_HEAD"
+
+          # Query dashboard for recent suites.
+          SUITES=$(curl -sf --max-time 10 \
+            -H "Authorization: Bearer $E2E_INGEST_TOKEN" \
+            "${E2E_INGEST_URL}/v1/suites?project=radioshake&limit=10" \
+            2>/dev/null) || fail_open "dashboard suites lookup"
+
+          # Parse: find newest suite; skip only when:
+          #   - newest suite status == "passed"
+          #   - suite has BOTH halves (emulator + device)
+          #   - suite commit_sha == Forgejo HEAD
+          #
+          # One-half-passed never skips to prevent unpaired-halves drift.
+          SKIP=$(echo "$SUITES" | python3 - <<'PY'
+          import json, sys, os
+          try:
+              suites = json.load(sys.stdin)
+              if not suites:
+                  print("false"); sys.exit(0)
+              newest = suites[0]
+              forgejo_head = os.environ.get("FORGEJO_HEAD", "")
+              sha_match = newest.get("commit_sha", "") == forgejo_head
+              status_pass = newest.get("status") == "passed"
+              halves = {r.get("half") for r in newest.get("runs", [])}
+              both_halves = "emulator" in halves and "device" in halves
+              if sha_match and status_pass and both_halves:
+                  print("true")
+              else:
+                  print("false")
+          except Exception as e:
+              print("false", file=sys.stderr)
+              print("false")
+          PY
+          ) || fail_open "suite parse error"
+
+          echo "should_skip=$SKIP" >> "$GITHUB_OUTPUT"
+          if [ "$SKIP" = "true" ]; then
+            echo "::notice::Skipping nightly — newest suite passed both halves at Forgejo HEAD $FORGEJO_HEAD"
+          else
+            echo "::notice::Running nightly — suite not yet complete or HEAD changed"
+          fi
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Main E2E job
+  # ──────────────────────────────────────────────────────────────────────────
+  e2e:
+    needs: [skip-gate]
+    # Run unless the skip-gate explicitly said to skip.
+    # When skip-gate was bypassed (non-schedule event), its output is "false" → always runs.
+    if: needs.skip-gate.outputs.should_skip != 'true'
+    runs-on: ubuntu-latest
+    # 150 min for scheduled/dispatch runs (full nightly); 90 min for manual single-tier.
+    timeout-minutes: ${{ (github.event_name == 'schedule' || github.event_name == 'repository_dispatch') && 150 || 90 }}
+
+    outputs:
+      commit_sha: ${{ steps.clone.outputs.commit_sha }}
+      commit_msg: ${{ steps.clone.outputs.commit_msg }}
+      tier_exit:  ${{ steps.run-tier.outputs.tier_exit }}
 
     steps:
-      # KVM access is required for the hardware-accelerated emulator.
-      # This udev rule grants the runner's user group read/write on /dev/kvm.
       - name: Enable KVM
         run: |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
             | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules && sudo udevadm trigger --name-match=kvm
 
-      # Clone the private source repo using a per-request Authorization header
-      # so the credential is never written to .git/config or the filesystem.
+      # Clone at the explicit sha for repository_dispatch; at the specified ref otherwise.
+      # Note: git clone --branch does not accept a raw SHA — only ref names (branches/tags).
+      # For repository_dispatch we clone main (default), then verify HEAD matches the
+      # requested sha so we never silently test a different commit.
       - name: Clone source from private host
+        id: clone
         env:
           HOST: ${{ secrets.FORGEJO_HOST }}
           TOKEN: ${{ secrets.FORGEJO_CLONE_TOKEN }}
-          REF: ${{ inputs.ref }}
+          REF: ${{ github.event_name == 'repository_dispatch' && 'main' || inputs.ref || 'main' }}
+          WANTED_SHA: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.sha || '' }}
         run: |
+          set -eu
           AUTH=$(printf 'oauth2:%s' "$TOKEN" | base64 -w0)
           echo "::add-mask::$AUTH"
           git -c http.extraheader="AUTHORIZATION: basic $AUTH" \
             clone --depth 1 --branch "$REF" "https://${HOST}/hiten/RadioShake.git" src
-          git -C src rev-parse HEAD > head.sha
-          # Fail the job if the auth header was persisted to .git/config.
+          ACTUAL_SHA=$(git -C src rev-parse HEAD)
+          # For repository_dispatch: verify HEAD is the requested sha.
+          # If the push triggered this workflow, main should already be at the wanted sha.
+          # Fail hard if not — do not test a stale commit.
+          if [ -n "$WANTED_SHA" ] && [ "$ACTUAL_SHA" != "$WANTED_SHA" ]; then
+            echo "::error::Cloned sha $ACTUAL_SHA != requested $WANTED_SHA (main may not yet include the push)"
+            exit 1
+          fi
+          COMMIT_MSG=$(git -C src log -1 --pretty=%s)
+          echo "commit_sha=$ACTUAL_SHA" >> "$GITHUB_OUTPUT"
+          echo "commit_msg=$COMMIT_MSG" >> "$GITHUB_OUTPUT"
+          # Fail-fast: auth must not be persisted to .git/config.
           ! grep -rq "AUTHORIZATION" src/.git/config
 
       - name: Set up JDK 21
@@ -57,15 +182,11 @@ jobs:
           distribution: temurin
           java-version: '21'
 
-      # Ensure the SDK level used in the build is present (GitHub images carry
-      # a recent SDK but the exact platform version may differ across image updates).
       - name: Ensure Android SDK 36 components
         run: |
           yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
             "platforms;android-36" "build-tools;36.0.0" > /dev/null
 
-      # Pin Maestro to a known-good release so a new upstream release cannot
-      # silently change matcher behaviour and flip flows green/red.
       - name: Install Maestro (pinned)
         env:
           MAESTRO_VERSION: "2.8.0"
@@ -75,21 +196,31 @@ jobs:
           "$HOME/.maestro/bin/maestro" --version
 
       - name: Build debug APK
+        id: build
         working-directory: src
         run: |
           printf 'sdk.dir=%s\n' "$ANDROID_HOME" > local.properties
           ./gradlew :app:assembleDebug
+          echo "apk_path=app/build/outputs/apk/debug/app-debug.apk" >> "$GITHUB_OUTPUT"
 
-      # android-emulator-runner boots the emulator, waits for it to be ready,
-      # then runs the `script` with the emulator still alive. CWD for `script`
-      # is the runner workspace, not the matrix directory, so we cd into src/.
-      # TIER is passed via env (not interpolated into `script:`) to prevent
-      # command injection — type:choice is not enforced for API-triggered
-      # workflow_dispatch calls.
-      - name: Run tier on emulator
+      # Compute SHA-256 of the debug APK for immutable-upload verification.
+      - name: Compute APK checksum
+        if: github.event_name == 'schedule'
+        id: apk-sha
+        working-directory: src
+        run: |
+          sha256sum app/build/outputs/apk/debug/app-debug.apk \
+            | awk '{print $1}' > app-debug.apk.sha256
+          echo "checksum=$(cat app-debug.apk.sha256)" >> "$GITHUB_OUTPUT"
+
+      # Run the tier(s):
+      #   - scheduled / repository_dispatch → TIER=nightly (full emulator set)
+      #   - workflow_dispatch               → TIER=inputs.tier (single tier)
+      - name: Run tier(s) on emulator
+        id: run-tier
         uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2
         env:
-          TIER: ${{ inputs.tier }}
+          TIER: ${{ (github.event_name == 'schedule' || github.event_name == 'repository_dispatch') && 'nightly' || inputs.tier }}
         with:
           api-level: 35
           arch: x86_64
@@ -97,20 +228,253 @@ jobs:
           profile: pixel_6
           disable-animations: true
           emulator-options: -no-snapshot -no-window -gpu swiftshader_indirect -no-boot-anim -camera-back none
-          script: cd src && bash ci/emulator-tier.sh "$TIER"
+          script: |
+            cd src
+            set +e
+            bash ci/emulator-tier.sh
+            TIER_EXIT=$?
+            set -e
+            echo "tier_exit=$TIER_EXIT" >> "$GITHUB_OUTPUT"
+            exit "$TIER_EXIT"
 
-      # Upload Maestro run logs and tier-results.json.
-      # local.properties, gradle caches, and raw logcat dumps are NOT included.
-      # r8check-logcat.txt is deleted by emulator-tier.sh before this step runs;
-      # the exclude below is belt-and-braces in case the script exits early.
-      - name: Upload results
+      # ── APK handoff to Forgejo generic package registry (scheduled only) ──
+      # Immutable version per sha; if 409 (already exists), verify checksum.
+      # Then update the `latest` pointer object.
+      - name: Upload APK to Forgejo package registry
+        if: github.event_name == 'schedule'
+        env:
+          HOST: ${{ secrets.FORGEJO_HOST }}
+          PKG_TOKEN: ${{ secrets.FORGEJO_PKG_TOKEN }}
+          COMMIT_SHA: ${{ steps.clone.outputs.commit_sha }}
+          CHECKSUM: ${{ steps.apk-sha.outputs.checksum }}
+        run: |
+          set -eu
+          echo "::add-mask::$PKG_TOKEN"
+          APK_SRC="src/app/build/outputs/apk/debug/app-debug.apk"
+          SHA256_SRC="src/app-debug.apk.sha256"
+
+          # Forgejo generic package PUT:
+          #   /api/packages/<owner>/generic/<package-name>/<version>/<filename>
+          PKG_BASE="https://${HOST}/api/packages/hiten/generic/radioshake-nightly"
+          PKG_URL="${PKG_BASE}/${COMMIT_SHA}/app-debug.apk"
+          SHA_URL="${PKG_BASE}/${COMMIT_SHA}/app-debug.apk.sha256"
+
+          upload_file() {
+            local src="$1" url="$2" label="$3"
+            HTTP=$(curl -sw '%{http_code}' -o /tmp/pkg-resp.txt \
+              -X PUT "$url" \
+              -H "Authorization: token $PKG_TOKEN" \
+              -H "Content-Type: application/octet-stream" \
+              --data-binary "@$src")
+            BODY=$(cat /tmp/pkg-resp.txt)
+            if [ "$HTTP" -eq 201 ] || [ "$HTTP" -eq 200 ]; then
+              echo "::notice::${label}: uploaded (HTTP $HTTP)"
+            elif [ "$HTTP" -eq 409 ]; then
+              # Already exists from a previous attempt — verify checksum.
+              echo "::notice::${label}: version exists (HTTP 409) — verifying checksum"
+              if [ "$label" = "APK" ]; then
+                REMOTE_SHA=$(curl -sf \
+                  -H "Authorization: token $PKG_TOKEN" \
+                  "${PKG_BASE}/${COMMIT_SHA}/app-debug.apk.sha256" | tr -d '[:space:]') || true
+                if [ "$REMOTE_SHA" = "$CHECKSUM" ]; then
+                  echo "::notice::APK: checksum matches existing upload — OK"
+                else
+                  echo "::error::APK: checksum mismatch on existing upload (remote=$REMOTE_SHA local=$CHECKSUM)"
+                  exit 1
+                fi
+              fi
+            else
+              echo "::error::${label}: unexpected HTTP $HTTP from package registry"
+              echo "$BODY"
+              exit 1
+            fi
+          }
+
+          upload_file "$APK_SRC" "$PKG_URL" "APK"
+          upload_file "$SHA256_SRC" "$SHA_URL" "SHA256"
+
+          # Update the `latest` pointer (a text file containing the sha).
+          LATEST_URL="${PKG_BASE}/latest/latest.sha"
+          HTTP=$(curl -sw '%{http_code}' -o /tmp/latest-resp.txt \
+            -X PUT "$LATEST_URL" \
+            -H "Authorization: token $PKG_TOKEN" \
+            -H "Content-Type: text/plain" \
+            --data-raw "$COMMIT_SHA")
+          BODY=$(cat /tmp/latest-resp.txt)
+          if [ "$HTTP" -eq 201 ] || [ "$HTTP" -eq 200 ] || [ "$HTTP" -eq 409 ]; then
+            # On 409 for latest, force-overwrite by deleting and re-uploading.
+            if [ "$HTTP" -eq 409 ]; then
+              echo "::notice::latest pointer exists — overwriting"
+              # Delete the old version first.
+              curl -sf -X DELETE "${PKG_BASE}/latest/latest.sha" \
+                -H "Authorization: token $PKG_TOKEN" || true
+              HTTP2=$(curl -sw '%{http_code}' -o /dev/null \
+                -X PUT "$LATEST_URL" \
+                -H "Authorization: token $PKG_TOKEN" \
+                -H "Content-Type: text/plain" \
+                --data-raw "$COMMIT_SHA")
+              echo "::notice::latest pointer overwrite: HTTP $HTTP2"
+            else
+              echo "::notice::latest pointer: HTTP $HTTP"
+            fi
+          else
+            echo "::error::latest pointer: unexpected HTTP $HTTP"
+            echo "$BODY"
+            exit 1
+          fi
+
+      - name: Upload results artifact
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: results-${{ inputs.tier }}
+          name: results-${{ github.event_name == 'schedule' && 'nightly' || (github.event_name == 'repository_dispatch' && 'main-check') || inputs.tier }}
           path: |
             ~/.maestro/tests/**
             src/tier-results.json
             src/maestro-results/**
             !src/maestro-results/r8check-logcat.txt
           if-no-files-found: warn
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Publish results to the E2E dashboard.
+  # Runs always so a broken build/boot is never absent from the dashboard.
+  # ──────────────────────────────────────────────────────────────────────────
+  publish:
+    needs: [skip-gate, e2e]
+    if: always() && needs.skip-gate.outputs.should_skip != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Clone CI scripts from source repo
+        env:
+          HOST: ${{ secrets.FORGEJO_HOST }}
+          TOKEN: ${{ secrets.FORGEJO_CLONE_TOKEN }}
+          # Use 'main' for repository_dispatch (sha cannot be used as --branch flag).
+          REF: ${{ github.event_name == 'repository_dispatch' && 'main' || inputs.ref || 'main' }}
+        run: |
+          set -eu
+          AUTH=$(printf 'oauth2:%s' "$TOKEN" | base64 -w0)
+          echo "::add-mask::$AUTH"
+          git -c http.extraheader="AUTHORIZATION: basic $AUTH" \
+            clone --depth 1 --branch "$REF" "https://${HOST}/hiten/RadioShake.git" src
+
+      - name: Download tier-results artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: results-*
+          merge-multiple: true
+          path: artifacts
+        continue-on-error: true
+
+      - name: Publish results to dashboard
+        env:
+          E2E_INGEST_URL:  ${{ secrets.E2E_INGEST_URL }}
+          E2E_INGEST_TOKEN: ${{ secrets.E2E_INGEST_TOKEN }}
+          E2E_WORKFLOW: maestro-nightly-emulator
+          COMMIT_SHA: ${{ needs.e2e.outputs.commit_sha || github.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          E2E_RESULT: ${{ needs.e2e.result }}
+          EVENT: ${{ github.event_name }}
+          DISPATCH_SHA: ${{ github.event.client_payload.sha }}
+          SUITE_ID_INPUT: ${{ inputs.suite_id }}
+        run: |
+          set -eu
+
+          # Resolve SUITE_ID:
+          #   - scheduled runs: date in +6h window (emulator at 23:30 + device at 01:00 share a date)
+          #   - repository_dispatch: "" (ungrouped — the sha drives the check)
+          #   - workflow_dispatch with suite_id input: use the forced value (for verification)
+          #   - workflow_dispatch without suite_id: "" (ungrouped)
+          if [ "$EVENT" = "schedule" ]; then
+            SUITE_ID=$(date -u -d '+6 hours' +%F)
+          elif [ -n "${SUITE_ID_INPUT:-}" ]; then
+            SUITE_ID="$SUITE_ID_INPUT"
+          else
+            SUITE_ID=""
+          fi
+
+          # HALF:
+          #   - dispatch events: omit (ungrouped or explicit sha run)
+          #   - scheduled: emulator
+          if [ "$EVENT" = "schedule" ]; then
+            HALF=emulator
+          else
+            HALF=""
+          fi
+
+          # Resolve TIERS_JSON from the downloaded artifact or use infra-failure fallback.
+          TIERS_JSON=""
+          if [ -f artifacts/tier-results.json ]; then
+            TIERS_JSON=$(cat artifacts/tier-results.json)
+          elif [ -f src/tier-results.json ]; then
+            TIERS_JSON=$(cat src/tier-results.json)
+          fi
+
+          # Fallback: if no tiers ran (build/boot failure), report a synthetic infra tier.
+          if [ -z "$TIERS_JSON" ] || [ "$TIERS_JSON" = "[]" ]; then
+            FAILED_STEP="build-or-boot-failed"
+            if [ "$E2E_RESULT" = "failure" ]; then
+              FAILED_STEP="emulator-job-failed"
+            elif [ "$E2E_RESULT" = "cancelled" ]; then
+              FAILED_STEP="emulator-job-cancelled"
+            fi
+            TIERS_JSON="[{\"name\":\"infra\",\"passed\":0,\"failed\":1,\"total\":1,\"failed_flows\":\"${FAILED_STEP}\"}]"
+          fi
+
+          # Resolve commit message (fall back to "n/a" if e2e was skipped/failed before clone).
+          COMMIT_MSG="${{ needs.e2e.outputs.commit_msg }}"
+          COMMIT_MSG="${COMMIT_MSG:-n/a}"
+
+          # Run publish script — fail loud, no || true.
+          SUITE_ID="$SUITE_ID" \
+          HALF="$HALF" \
+          COMMIT_SHA="$COMMIT_SHA" \
+          COMMIT_MSG="$COMMIT_MSG" \
+          RUN_URL="$RUN_URL" \
+          TIERS_JSON="$TIERS_JSON" \
+            python3 src/ci/publish-results.py
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Forgejo commit status callback for repository_dispatch (push-to-main bridge).
+  # Reports emulator result back to the Forgejo commit status API.
+  # ──────────────────────────────────────────────────────────────────────────
+  forgejo-status:
+    needs: [e2e]
+    if: always() && github.event_name == 'repository_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Report commit status to Forgejo
+        env:
+          HOST: ${{ secrets.FORGEJO_HOST }}
+          STATUS_TOKEN: ${{ secrets.FORGEJO_STATUS_TOKEN }}
+          E2E_RESULT: ${{ needs.e2e.result }}
+          COMMIT_SHA: ${{ github.event.client_payload.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -eu
+          echo "::add-mask::$STATUS_TOKEN"
+
+          # Map GitHub job result to Forgejo commit status state.
+          case "$E2E_RESULT" in
+            success)   STATE=success ;;
+            failure)   STATE=failure ;;
+            cancelled) STATE=error   ;;
+            *)         STATE=error   ;;
+          esac
+
+          DESCRIPTION="Emulator E2E: $STATE"
+
+          curl -sf -X POST \
+            "https://${HOST}/api/v1/repos/hiten/RadioShake/statuses/${COMMIT_SHA}" \
+            -H "Authorization: token $STATUS_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"context\": \"github/emulator-e2e\",
+              \"state\": \"${STATE}\",
+              \"target_url\": \"${RUN_URL}\",
+              \"description\": \"${DESCRIPTION}\"
+            }"
+          echo "Posted commit status: $STATE for $COMMIT_SHA"
