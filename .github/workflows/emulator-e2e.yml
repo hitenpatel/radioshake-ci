@@ -81,6 +81,7 @@ jobs:
             "https://${HOST}/api/v1/repos/hiten/RadioShake/branches/main" \
             2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin)['commit']['id'])" \
             2>/dev/null) || fail_open "Forgejo HEAD lookup"
+          export FORGEJO_HEAD
           echo "Forgejo HEAD: $FORGEJO_HEAD"
 
           # Query dashboard for recent suites.
@@ -403,7 +404,8 @@ jobs:
           E2E_INGEST_URL:  ${{ secrets.E2E_INGEST_URL }}
           E2E_INGEST_TOKEN: ${{ secrets.E2E_INGEST_TOKEN }}
           E2E_WORKFLOW: maestro-nightly-emulator
-          COMMIT_SHA: ${{ needs.e2e.outputs.commit_sha || github.sha }}
+          COMMIT_SHA: ${{ needs.e2e.outputs.commit_sha || 'unknown' }}
+          COMMIT_MSG: ${{ needs.e2e.outputs.commit_msg }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           E2E_RESULT: ${{ needs.e2e.result }}
           EVENT: ${{ github.event_name }}
@@ -466,7 +468,6 @@ jobs:
           fi
 
           # Resolve commit message (fall back to "n/a" if e2e was skipped/failed before clone).
-          COMMIT_MSG="${{ needs.e2e.outputs.commit_msg }}"
           COMMIT_MSG="${COMMIT_MSG:-n/a}"
 
           # Run publish script — fail loud, no || true.
