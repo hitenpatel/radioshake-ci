@@ -202,8 +202,16 @@ jobs:
       - name: Build debug APK + androidTest APK
         id: build
         working-directory: src
+        env:
+          PODCAST_INDEX_API_KEY: ${{ secrets.PODCAST_INDEX_API_KEY }}
+          PODCAST_INDEX_API_SECRET: ${{ secrets.PODCAST_INDEX_API_SECRET }}
         run: |
           printf 'sdk.dir=%s\n' "$ANDROID_HOME" > local.properties
+          # Inject Podcast Index credentials so podcast-dependent Maestro flows can
+          # authenticate via the proxy. Values come from repository secrets and are
+          # written through env vars (never inline ${{ secrets.* }} in run bodies).
+          printf 'podcastIndex.apiKey=%s\n' "$PODCAST_INDEX_API_KEY" >> local.properties
+          printf 'podcastIndex.apiSecret=%s\n' "$PODCAST_INDEX_API_SECRET" >> local.properties
           # assembleDebugAndroidTest implies assembleDebug; both tasks run in one invocation.
           ./gradlew :app:assembleDebug :app:assembleDebugAndroidTest
           echo "apk_path=app/build/outputs/apk/debug/app-debug.apk" >> "$GITHUB_OUTPUT"
@@ -418,29 +426,40 @@ jobs:
           fi
 
           # HALF:
-          #   - dispatch events: omit (ungrouped or explicit sha run)
-          #   - scheduled: emulator
-          if [ "$EVENT" = "schedule" ]; then
+          #   - scheduled runs or forced suite_id (verification dispatches): emulator
+          #   - all other dispatch events: omit (ungrouped or explicit sha run)
+          if [ "$EVENT" = "schedule" ] || [ -n "${SUITE_ID:-}" ]; then
             HALF=emulator
           else
             HALF=""
           fi
 
           # Resolve TIERS_JSON from the downloaded artifact or use infra-failure fallback.
+          # The upload-artifact action uses the least-common-ancestor of all upload paths as
+          # the root (here: /home/runner, because ~/.maestro/** and src/tier-results.json
+          # share that ancestor). After download into artifacts/, the file lands at a nested
+          # path — use find to locate it robustly regardless of the extracted layout.
           TIERS_JSON=""
-          if [ -f artifacts/tier-results.json ]; then
-            TIERS_JSON=$(cat artifacts/tier-results.json)
-          elif [ -f src/tier-results.json ]; then
-            TIERS_JSON=$(cat src/tier-results.json)
+          TIER_FILE=$(find artifacts -name tier-results.json 2>/dev/null | head -1)
+          if [ -n "$TIER_FILE" ]; then
+            TIERS_JSON=$(cat "$TIER_FILE")
+            echo "::notice::tier-results.json resolved at: $TIER_FILE"
           fi
 
           # Fallback: if no tiers ran (build/boot failure), report a synthetic infra tier.
+          # If the e2e job succeeded but no tier-results.json was found, that is an infra
+          # bug — publish the synthetic record AND exit 1 so the run is visibly red.
+          MISSING_AFTER_SUCCESS=false
           if [ -z "$TIERS_JSON" ] || [ "$TIERS_JSON" = "[]" ]; then
             FAILED_STEP="build-or-boot-failed"
             if [ "$E2E_RESULT" = "failure" ]; then
               FAILED_STEP="emulator-job-failed"
             elif [ "$E2E_RESULT" = "cancelled" ]; then
               FAILED_STEP="emulator-job-cancelled"
+            elif [ "$E2E_RESULT" = "success" ]; then
+              FAILED_STEP="tier-results-missing-after-success"
+              MISSING_AFTER_SUCCESS=true
+              echo "::error::e2e job succeeded but tier-results.json was not found in the downloaded artifact — infra bug"
             fi
             # failed_flows must be a JSON array (API validates type=list).
             TIERS_JSON="[{\"name\":\"infra\",\"passed\":0,\"failed\":1,\"total\":1,\"failed_flows\":[\"${FAILED_STEP}\"]}]"
@@ -458,6 +477,12 @@ jobs:
           RUN_URL="$RUN_URL" \
           TIERS_JSON="$TIERS_JSON" \
             python3 src/ci/publish-results.py
+
+          # Fail loud: a green e2e run that produced no tier results is an infra bug.
+          if [ "$MISSING_AFTER_SUCCESS" = "true" ]; then
+            echo "::error::Publish succeeded but tier results were missing — exiting non-zero"
+            exit 1
+          fi
 
   # ──────────────────────────────────────────────────────────────────────────
   # Forgejo commit status callback for repository_dispatch (push-to-main bridge).
