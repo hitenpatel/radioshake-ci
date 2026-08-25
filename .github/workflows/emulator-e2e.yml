@@ -83,8 +83,13 @@ jobs:
       # android-emulator-runner boots the emulator, waits for it to be ready,
       # then runs the `script` with the emulator still alive. CWD for `script`
       # is the runner workspace, not the matrix directory, so we cd into src/.
+      # TIER is passed via env (not interpolated into `script:`) to prevent
+      # command injection — type:choice is not enforced for API-triggered
+      # workflow_dispatch calls.
       - name: Run tier on emulator
         uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2
+        env:
+          TIER: ${{ inputs.tier }}
         with:
           api-level: 35
           arch: x86_64
@@ -92,10 +97,12 @@ jobs:
           profile: pixel_6
           disable-animations: true
           emulator-options: -no-snapshot -no-window -gpu swiftshader_indirect -no-boot-anim -camera-back none
-          script: cd src && bash ci/emulator-tier.sh "${{ inputs.tier }}"
+          script: cd src && bash ci/emulator-tier.sh "$TIER"
 
       # Upload Maestro run logs and tier-results.json.
       # local.properties, gradle caches, and raw logcat dumps are NOT included.
+      # r8check-logcat.txt is deleted by emulator-tier.sh before this step runs;
+      # the exclude below is belt-and-braces in case the script exits early.
       - name: Upload results
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -105,4 +112,5 @@ jobs:
             ~/.maestro/tests/**
             src/tier-results.json
             src/maestro-results/**
+            !src/maestro-results/r8check-logcat.txt
           if-no-files-found: warn
