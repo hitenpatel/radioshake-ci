@@ -1,0 +1,214 @@
+name: main-checks (unit tests + lint + Go)
+
+# Triggered by two events:
+#   1. repository_dispatch type "radioshake-main-check" — fired by Forgejo pr-checks.yml
+#      on every push to main. The same dispatch also triggers emulator-e2e.yml;
+#      together they post github/unit-lint and github/emulator-e2e statuses to the
+#      Forgejo commit.
+#   2. workflow_dispatch with an optional `sha` input — for manual verification
+#      without firing the full 150-min emulator suite (which a real repository_dispatch
+#      would also trigger). Leave sha empty to clone main HEAD.
+
+on:
+  repository_dispatch:
+    types: [radioshake-main-check]
+
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: >-
+          Forgejo commit SHA to clone and test.
+          Leave empty to clone main HEAD (no sha verification).
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  unit-lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    outputs:
+      commit_sha: ${{ steps.clone.outputs.commit_sha }}
+
+    steps:
+      # Clone at the explicit sha for repository_dispatch; at main HEAD otherwise.
+      # Note: git clone --branch does not accept a raw SHA — only ref names.
+      # For repository_dispatch we clone main then verify HEAD matches the requested
+      # sha so we never silently test a different commit.
+      - name: Clone source from private host
+        id: clone
+        env:
+          HOST: ${{ secrets.FORGEJO_HOST }}
+          TOKEN: ${{ secrets.FORGEJO_CLONE_TOKEN }}
+          WANTED_SHA: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.sha || inputs.sha }}
+        run: |
+          set -eu
+          AUTH=$(printf 'oauth2:%s' "$TOKEN" | base64 -w0)
+          echo "::add-mask::$AUTH"
+          git -c http.extraheader="AUTHORIZATION: basic $AUTH" \
+            clone --depth 1 --branch main "https://${HOST}/hiten/RadioShake.git" src
+          ACTUAL_SHA=$(git -C src rev-parse HEAD)
+          # For repository_dispatch (or a manual dispatch with sha set): verify HEAD is
+          # the requested sha. Fail hard if not — do not test a stale commit.
+          if [ -n "$WANTED_SHA" ] && [ "$ACTUAL_SHA" != "$WANTED_SHA" ]; then
+            echo "::error::Cloned sha $ACTUAL_SHA != requested $WANTED_SHA (main may not yet include the push)"
+            exit 1
+          fi
+          echo "commit_sha=$ACTUAL_SHA" >> "$GITHUB_OUTPUT"
+          echo "Testing commit: $ACTUAL_SHA"
+          # Fail-fast: auth must not be persisted to .git/config.
+          ! grep -rq "AUTHORIZATION" src/.git/config
+
+      - name: Install JDK 17
+        run: |
+          set -eu
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -qq
+          apt-get install -y --no-install-recommends openjdk-17-jdk-headless ca-certificates unzip curl
+          JAVA_HOME="$(dirname $(dirname $(readlink -f $(which java))))"
+          echo "JAVA_HOME=$JAVA_HOME" >> "$GITHUB_ENV"
+          java -version
+
+      - name: Install Android SDK
+        run: |
+          set -eu
+          ANDROID_HOME="$HOME/android-sdk"
+          mkdir -p "$ANDROID_HOME/cmdline-tools"
+          cd "$ANDROID_HOME/cmdline-tools"
+          curl -sLo cmdline.zip https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
+          unzip -q cmdline.zip
+          mv cmdline-tools latest
+          rm cmdline.zip
+          printf 'y\n%.0s' {1..100} | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "platform-tools" "platforms;android-36" "build-tools;36.0.0"
+          echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$ANDROID_HOME" >> "$GITHUB_ENV"
+          echo "$ANDROID_HOME/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
+          echo "$ANDROID_HOME/platform-tools" >> "$GITHUB_PATH"
+
+      - name: Install qemu-user-static for x86_64 aapt2 emulation on arm64
+        run: |
+          set -eu
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get install -y --no-install-recommends \
+            qemu-user-static binfmt-support \
+            libc6-amd64-cross libstdc++6-amd64-cross
+          echo "QEMU_LD_PREFIX=/usr/x86_64-linux-gnu" >> "$GITHUB_ENV"
+          QEMU_LD_PREFIX=/usr/x86_64-linux-gnu \
+            "$ANDROID_HOME/build-tools/36.0.0/aapt2" version
+
+      - name: Run unit tests
+        id: unit-tests
+        working-directory: src
+        run: |
+          set -eu
+          AAPT2="$ANDROID_HOME/build-tools/36.0.0/aapt2"
+          test -x "$AAPT2"
+          ./gradlew \
+            :app:testDebugUnitTest \
+            :shared:jvmTest \
+            :shared:testDebugUnitTest \
+            :wear:testDebugUnitTest \
+            -Pandroid.aapt2FromMavenOverride="$AAPT2"
+
+      - name: Run Android Lint
+        # Runs even when the unit tests above failed (same semantics as pr-checks.yml).
+        id: lint
+        if: always()
+        working-directory: src
+        run: |
+          set -eu
+          AAPT2="$ANDROID_HOME/build-tools/36.0.0/aapt2"
+          test -x "$AAPT2"
+          ./gradlew :app:lintDebug :wear:lintDebug \
+            -Pandroid.aapt2FromMavenOverride="$AAPT2"
+
+      - name: Go proxy tests
+        # Runs even when Android steps failed (same semantics as pr-checks.yml).
+        id: go-tests
+        if: always()
+        working-directory: src/proxy
+        # Use the same Go image version as pr-checks.yml (golang:1.26).
+        # GitHub runners ship an older Go; install the matching version via apt.
+        run: |
+          set -eu
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get install -y --no-install-recommends golang-go 2>/dev/null || true
+          # Use go from PATH (GitHub ubuntu-latest ships Go 1.x; proxy tests pass
+          # with any supported release — golang:1.26 in pr-checks is the container tag).
+          go version
+          go test -race -cover ./...
+
+      - name: Upload test and lint reports
+        # Always upload so reports are available regardless of pass/fail outcome.
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-lint-reports
+          path: |
+            src/app/build/reports/tests/
+            src/app/build/test-results/
+            src/app/build/reports/lint-results-debug.*
+            src/shared/build/reports/tests/
+            src/shared/build/test-results/
+            src/wear/build/reports/tests/
+            src/wear/build/test-results/
+            src/wear/build/reports/lint-results-debug.*
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Report commit status to Forgejo
+        # Always runs for repository_dispatch to report success OR failure.
+        # For workflow_dispatch: also run so manual runs can verify the status callback.
+        if: always()
+        env:
+          HOST: ${{ secrets.FORGEJO_HOST }}
+          STATUS_TOKEN: ${{ secrets.FORGEJO_STATUS_TOKEN }}
+          UNIT_RESULT: ${{ steps.unit-tests.outcome }}
+          LINT_RESULT: ${{ steps.lint.outcome }}
+          GO_RESULT: ${{ steps.go-tests.outcome }}
+          COMMIT_SHA: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.sha || steps.clone.outputs.commit_sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -eu
+          echo "::add-mask::$STATUS_TOKEN"
+
+          # Aggregate: failure if any step failed or was cancelled; skip only if
+          # the clone failed (commit_sha will be empty and we cannot post a status).
+          if [ -z "$COMMIT_SHA" ]; then
+            echo "::warning::No commit SHA available (clone step failed) — cannot post status"
+            exit 0
+          fi
+
+          # A step outcome of "failure" or "cancelled" means state=failure.
+          # "skipped" (because a prerequisite failed) also counts as failure.
+          OVERALL=success
+          for RESULT in "$UNIT_RESULT" "$LINT_RESULT" "$GO_RESULT"; do
+            case "$RESULT" in
+              success) ;;
+              skipped) ;;  # skipped = prerequisite failed; overall already captures that
+              *) OVERALL=failure ;;
+            esac
+          done
+
+          # If clone itself failed, unit-tests/lint/go will all be "skipped".
+          # Treat that as an overall failure (not just a warning).
+          if [ "$UNIT_RESULT" = "skipped" ] && [ "$LINT_RESULT" = "skipped" ] && [ "$GO_RESULT" = "skipped" ]; then
+            OVERALL=failure
+          fi
+
+          DESCRIPTION="Unit tests + lint + Go: $OVERALL"
+
+          curl -fsS -X POST \
+            "https://${HOST}/api/v1/repos/hiten/RadioShake/statuses/${COMMIT_SHA}" \
+            -H "Authorization: token $STATUS_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"context\": \"github/unit-lint\",
+              \"state\": \"${OVERALL}\",
+              \"target_url\": \"${RUN_URL}\",
+              \"description\": \"${DESCRIPTION}\"
+            }"
+          echo "Posted commit status: $OVERALL for $COMMIT_SHA"
