@@ -102,7 +102,13 @@ jobs:
         run: |
           set -eu
           yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "extras;google;auto" > /dev/null
-          sudo apt-get install -y -qq libasound2t64 libc++1 libc++abi1
+          # DHU still creates an SDL render surface even with --headless: with no
+          # display it bounds the window to a 1024-wide dummy screen and then dies
+          # with "SDL_CreateWindowRenderer failed: Couldn't find matching render
+          # driver". Xvfb at exactly 1920x1080 gives it a framebuffer AND fixes the
+          # capture resolution; mesa provides a software GL driver.
+          sudo apt-get install -y -qq libasound2t64 libc++1 libc++abi1 \
+            xvfb libgl1-mesa-dri libglx-mesa0 x11-utils
           DHU_HOME="$ANDROID_HOME/extras/google/auto"
           chmod +x "$DHU_HOME/desktop-head-unit"
           echo "DHU_HOME=$DHU_HOME" >> "$GITHUB_ENV"
