@@ -150,13 +150,17 @@ jobs:
       - name: Wait for peers to be reachable
         run: |
           set -eu
-          for host in 100.69.203.52 100.113.79.51; do
+          # Only the VM. The phone is deliberately NOT checked here: when it
+          # dozes on battery its Tailscale stops answering cold peers, so this
+          # would fail before ci/auto-screenshots.sh gets a chance to wake it
+          # through the VM's warm adb session.
+          for host in 100.113.79.51; do
             for i in $(seq 1 12); do
               if tailscale ping --c 1 --timeout 5s "$host" >/dev/null 2>&1; then
                 echo "$host reachable"; break
               fi
               if [ "$i" = 12 ]; then
-                echo "::error::$host unreachable over the tailnet — check the tag:ci ACL grant"
+                echo "::error::$host (lock host) unreachable over the tailnet — check the tag:ci ACL grant"
                 exit 1
               fi
               sleep 5
@@ -190,7 +194,6 @@ jobs:
           E2E_DEVICE: 100.69.203.52:5555
           OUT_DIR: build/auto-screenshots
           APK: ${{ github.workspace }}/apk-download/app-debug.apk
-          ADB_PIN: ${{ secrets.ADB_PIN }}
           LOCK_OWNER: radioshake-ci
           CAPTURED_SHA: ${{ steps.apk.outputs.sha }}
         run: |
