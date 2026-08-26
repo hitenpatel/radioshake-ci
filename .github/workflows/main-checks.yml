@@ -33,14 +33,6 @@ jobs:
       commit_sha: ${{ steps.clone.outputs.commit_sha }}
 
     steps:
-      - name: TASK-113 canary (temp)
-        env:
-          CANARY: ${{ secrets.CANARY }}
-        run: |
-          set -eu
-          DERIVED="canary-derived-${CANARY}"
-          echo "::add-mask::$DERIVED"
-          echo "derived: $DERIVED"
       # Clone at the explicit sha for repository_dispatch; at main HEAD otherwise.
       # Note: git clone --branch does not accept a raw SHA — only ref names.
       # For repository_dispatch we clone main then verify HEAD matches the requested
