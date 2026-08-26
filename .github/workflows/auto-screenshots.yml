@@ -86,6 +86,18 @@ jobs:
           distribution: temurin
           java-version: '21'
 
+      # ubuntu-latest ships the Android SDK but does NOT put platform-tools on
+      # PATH — emulator-e2e.yml only gets adb because android-emulator-runner
+      # adds it, and this workflow does not use that action. Without this step
+      # every adb call fails with "command not found" (exit 127), which reads
+      # like a device problem and is not.
+      - name: Install platform-tools and put adb on PATH
+        run: |
+          set -eu
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platform-tools" > /dev/null
+          echo "$ANDROID_HOME/platform-tools" >> "$GITHUB_PATH"
+          "$ANDROID_HOME/platform-tools/adb" version
+
       - name: Install DHU and its runtime deps
         run: |
           set -eu
