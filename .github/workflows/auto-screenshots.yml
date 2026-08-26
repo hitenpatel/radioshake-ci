@@ -1,0 +1,204 @@
+name: auto-screenshots
+
+# Captures Android Auto screenshots for the Play listing (TASK-122, unblocks
+# TASK-44) by driving the Desktop Head Unit against the shared Pixel over the
+# tailnet. DHU ships only for x86_64 hosts, which is why this lives on a GitHub
+# runner rather than the arm64 Oracle VM.
+#
+# Dispatch-only. The capture drives Hiten's daily-driver phone, protected by
+# TWO independent mechanisms: the real pixel-e2e-lock on hermes-vm (acquired by
+# ci/auto-screenshots.sh over SSH) and a 00:50-03:30 UTC refusal window in that
+# same script. Do not add a schedule: trigger without re-reading both.
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Source branch to clone
+        default: main
+      tag:
+        description: >-
+          Unique label for this dispatch, echoed into run-name so the dispatcher
+          can identify its own run instead of guessing "the newest one", which
+          races with any concurrent dispatch.
+        required: true
+
+run-name: auto-screenshots ${{ inputs.tag }}
+
+# One capture at a time. GitHub runs dispatches concurrently by default, and two
+# jobs racing for the device lock means one simply fails.
+concurrency:
+  group: pixel-device
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  capture:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      # Resolve the APK first so its sha can be recorded as provenance. Note we
+      # do NOT check that sha out: registry uploads happen only on scheduled
+      # emulator runs, so the registry sha predates the capture scripts and a
+      # detached checkout would fail at `bash ci/auto-screenshots.sh`. A
+      # screenshot script is not binary-coupled the way an E2E assertion is.
+      - name: Resolve the nightly APK from the Forgejo registry
+        id: apk
+        run: |
+          set -eu
+          PKG_BASE="https://git.hiten-patel.co.uk/api/packages/hiten/generic/radioshake-nightly"
+          LATEST_SHA=$(curl -sf --max-time 15 "${PKG_BASE}/latest/latest.sha" | tr -d '[:space:]')
+          if [ -z "$LATEST_SHA" ]; then
+            echo "::error::registry latest pointer is empty — the emulator nightly has not uploaded a build yet"
+            exit 1
+          fi
+          mkdir -p apk-download
+          curl -sfL --max-time 120 "${PKG_BASE}/${LATEST_SHA}/app-debug.apk" -o apk-download/app-debug.apk
+          curl -sf  --max-time 15  "${PKG_BASE}/${LATEST_SHA}/app-debug.apk.sha256" -o apk-download/app-debug.apk.sha256
+          echo "$(tr -d '[:space:]' < apk-download/app-debug.apk.sha256)  apk-download/app-debug.apk" | sha256sum -c -
+          echo "sha=$LATEST_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Clone source at branch HEAD
+        env:
+          HOST: ${{ secrets.FORGEJO_HOST }}
+          TOKEN: ${{ secrets.FORGEJO_CLONE_TOKEN }}
+          REF: ${{ inputs.ref }}
+        run: |
+          set -eu
+          AUTH=$(printf 'oauth2:%s' "$TOKEN" | base64 -w0)
+          echo "::add-mask::$AUTH"
+          git -c http.extraheader="AUTHORIZATION: basic $AUTH" \
+            clone --depth 1 --branch "$REF" "https://${HOST}/hiten/RadioShake.git" src
+          echo "source HEAD: $(git -C src rev-parse HEAD)"
+          # Fail-fast: auth must not be persisted to .git/config.
+          ! grep -rq "AUTHORIZATION" src/.git/config
+
+      - name: Shellcheck the capture scripts
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq shellcheck
+          shellcheck src/ci/auto-screenshots.sh
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Install DHU and its runtime deps
+        run: |
+          set -eu
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "extras;google;auto" > /dev/null
+          sudo apt-get install -y -qq libasound2t64 libc++1 libc++abi1
+          DHU_HOME="$ANDROID_HOME/extras/google/auto"
+          chmod +x "$DHU_HOME/desktop-head-unit"
+          echo "DHU_HOME=$DHU_HOME" >> "$GITHUB_ENV"
+          # The SDK package floats. Fail CLOSED on anything but the revision the
+          # flags, headless mode and stdin console were verified against — "2.*"
+          # would silently accept a future 2.1 with different behaviour.
+          REV=$(awk -F= '/^Pkg.Revision/{print $2}' "$DHU_HOME/source.properties" | tr -d ' ')
+          echo "DHU revision: $REV"
+          case "$REV" in
+            2.0) ;;
+            *) echo "::error::DHU revision $REV != 2.0 — re-verify --headless, --adb and the stdin console before raising this pin"; exit 1 ;;
+          esac
+
+      - name: Install Maestro (pinned)
+        env:
+          MAESTRO_VERSION: "2.8.0"
+        run: |
+          curl -fsSL "https://get.maestro.mobile.dev" | bash
+          echo "$HOME/.maestro/bin" >> "$GITHUB_PATH"
+          "$HOME/.maestro/bin/maestro" --version
+
+      - name: Restore the trusted ADB key and the VM lock key
+        env:
+          ADB_KEY: ${{ secrets.ADB_KEY }}
+          ADB_KEY_PUB: ${{ secrets.ADB_KEY_PUB }}
+          VM_SSH_KEY: ${{ secrets.VM_SSH_KEY }}
+        run: |
+          set -eu
+          mkdir -p "$HOME/.android"
+          printf '%s' "$ADB_KEY"     > "$HOME/.android/adbkey"
+          printf '%s' "$ADB_KEY_PUB" > "$HOME/.android/adbkey.pub"
+          chmod 600 "$HOME/.android/adbkey"
+          printf '%s' "$VM_SSH_KEY" > "$HOME/.vm-lock-key"
+          chmod 600 "$HOME/.vm-lock-key"
+
+      - name: Join the tailnet
+        uses: tailscale/github-action@6cae46e2d796f265265cfcf628b72a32b4d7cade # v3
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+
+      # Peer propagation is eventually consistent — do not assume the phone and
+      # the VM are reachable the instant this node comes up.
+      - name: Wait for peers to be reachable
+        run: |
+          set -eu
+          for host in 100.69.203.52 100.113.79.51; do
+            for i in $(seq 1 12); do
+              if tailscale ping --c 1 --timeout 5s "$host" >/dev/null 2>&1; then
+                echo "$host reachable"; break
+              fi
+              if [ "$i" = 12 ]; then
+                echo "::error::$host unreachable over the tailnet — check the tag:ci ACL grant"
+                exit 1
+              fi
+              sleep 5
+            done
+          done
+
+      - name: Capture Android Auto screenshots
+        working-directory: src
+        env:
+          E2E_DEVICE: 100.69.203.52:5555
+          OUT_DIR: build/auto-screenshots
+          APK: ${{ github.workspace }}/apk-download/app-debug.apk
+          ADB_PIN: ${{ secrets.ADB_PIN }}
+          LOCK_OWNER: radioshake-ci
+          CAPTURED_SHA: ${{ steps.apk.outputs.sha }}
+        run: |
+          set -eu
+          export VM_SSH_KEY_FILE="$HOME/.vm-lock-key"
+          bash ci/auto-screenshots.sh
+          printf 'captured from RadioShake sha %s\n' "$CAPTURED_SHA" \
+            > build/auto-screenshots/provenance.txt
+
+      # The bash trap is first-line cleanup, but a cancelled or timed-out job can
+      # be force-killed before it runs. This step is the backstop — and it touches
+      # the device ONLY if we still hold the lock.
+      - name: Release the device (backstop)
+        if: always()
+        run: |
+          set +e
+          [ -f "$HOME/.vm-lock-key" ] || exit 0
+          STATUS=$(ssh -i "$HOME/.vm-lock-key" -o StrictHostKeyChecking=accept-new \
+                     -o IdentitiesOnly=yes -o ConnectTimeout=15 \
+                     ubuntu@100.113.79.51 "status")
+          echo "lock status: $STATUS"
+          case "$STATUS" in
+            *radioshake-ci*)
+              adb -s 100.69.203.52:5555 shell am force-stop com.google.android.projection.gearhead
+              adb -s 100.69.203.52:5555 shell cmd notification set_dnd off
+              adb -s 100.69.203.52:5555 shell am broadcast -a com.android.systemui.demo -e command exit
+              adb -s 100.69.203.52:5555 shell settings put global sysui_demo_allowed 0
+              E2E_DEVICE=100.69.203.52:5555 bash src/ci/device-prep.sh restore 100.69.203.52:5555
+              ssh -i "$HOME/.vm-lock-key" -o IdentitiesOnly=yes -o ConnectTimeout=15 \
+                ubuntu@100.113.79.51 "release radioshake-ci"
+              ;;
+            *) echo "not our lock — leaving the device alone" ;;
+          esac
+
+      - name: Upload screenshots
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: android-auto-screenshots
+          path: src/build/auto-screenshots/
+          if-no-files-found: error
+          # Short retention limits the exposure window on a public repo. The real
+          # protection is the DND + demo-mode sanitisation applied before capture.
+          retention-days: 1
