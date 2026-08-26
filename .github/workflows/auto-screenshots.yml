@@ -119,12 +119,24 @@ jobs:
           VM_SSH_KEY: ${{ secrets.VM_SSH_KEY }}
         run: |
           set -eu
+          # printf '%s\n', NOT '%s'. GitHub strips the trailing newline from a
+          # secret, and OpenSSH refuses a private key that does not end in one
+          # ("Load key ...: error in libcrypto"). A duplicated trailing newline
+          # is harmless; a missing one is fatal.
           mkdir -p "$HOME/.android"
-          printf '%s' "$ADB_KEY"     > "$HOME/.android/adbkey"
-          printf '%s' "$ADB_KEY_PUB" > "$HOME/.android/adbkey.pub"
+          printf '%s\n' "$ADB_KEY"     > "$HOME/.android/adbkey"
+          printf '%s\n' "$ADB_KEY_PUB" > "$HOME/.android/adbkey.pub"
           chmod 600 "$HOME/.android/adbkey"
-          printf '%s' "$VM_SSH_KEY" > "$HOME/.vm-lock-key"
+          printf '%s\n' "$VM_SSH_KEY" > "$HOME/.vm-lock-key"
           chmod 600 "$HOME/.vm-lock-key"
+
+          # Preflight: prove both keys parse now, not four minutes into the run
+          # when the phone is already unlocked and mid-capture.
+          ssh-keygen -y -f "$HOME/.vm-lock-key" > /dev/null \
+            || { echo "::error::VM_SSH_KEY does not parse — re-set the secret from the private key file"; exit 1; }
+          ssh-keygen -y -f "$HOME/.android/adbkey" > /dev/null \
+            || { echo "::error::ADB_KEY does not parse — re-set the secret from ~/.android/adbkey"; exit 1; }
+          echo "both keys parse OK"
 
       - name: Join the tailnet
         uses: tailscale/github-action@6cae46e2d796f265265cfcf628b72a32b4d7cade # v3
