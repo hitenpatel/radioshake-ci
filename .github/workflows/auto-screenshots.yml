@@ -175,7 +175,9 @@ jobs:
         run: |
           set +e
           [ -f "$HOME/.vm-lock-key" ] || exit 0
-          STATUS=$(ssh -i "$HOME/.vm-lock-key" -o StrictHostKeyChecking=accept-new \
+          # Port 2222, not 22: tailscaled hijacks 22 (RunSSH=true) and Tailscale
+          # SSH bypasses authorized_keys, defeating the forced-command confinement.
+          STATUS=$(ssh -p 2222 -i "$HOME/.vm-lock-key" -o StrictHostKeyChecking=accept-new \
                      -o IdentitiesOnly=yes -o ConnectTimeout=15 \
                      ubuntu@100.113.79.51 "status")
           echo "lock status: $STATUS"
@@ -186,7 +188,7 @@ jobs:
               adb -s 100.69.203.52:5555 shell am broadcast -a com.android.systemui.demo -e command exit
               adb -s 100.69.203.52:5555 shell settings put global sysui_demo_allowed 0
               E2E_DEVICE=100.69.203.52:5555 bash src/ci/device-prep.sh restore 100.69.203.52:5555
-              ssh -i "$HOME/.vm-lock-key" -o IdentitiesOnly=yes -o ConnectTimeout=15 \
+              ssh -p 2222 -i "$HOME/.vm-lock-key" -o IdentitiesOnly=yes -o ConnectTimeout=15 \
                 ubuntu@100.113.79.51 "release radioshake-ci"
               ;;
             *) echo "not our lock — leaving the device alone" ;;
