@@ -15,6 +15,14 @@ on:
       ref:
         description: Source branch to clone
         default: main
+      dhu_config:
+        description: DHU head-unit geometry (config file name in extras/google/auto/config)
+        type: choice
+        options:
+          - default_1080p.ini
+          - default_720p.ini
+          - default_wide.ini
+        default: default_1080p.ini
       tag:
         description: >-
           Unique label for this dispatch, echoed into run-name so the dispatcher
@@ -213,6 +221,7 @@ jobs:
           OUT_DIR: build/auto-screenshots
           APK: ${{ github.workspace }}/apk-download/app-debug.apk
           LOCK_OWNER: radioshake-ci
+          DHU_CONFIG: ${{ inputs.dhu_config }}
           CAPTURED_SHA: ${{ steps.apk.outputs.sha }}
         run: |
           set -eu
