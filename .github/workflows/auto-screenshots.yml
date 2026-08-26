@@ -163,6 +163,27 @@ jobs:
             done
           done
 
+      # ci/device-prep.sh suppresses adb output, so a failure there cannot
+      # distinguish "TCP refused" from "device unauthorized". Probe explicitly.
+      - name: Probe the device over the tailnet
+        run: |
+          set +e
+          echo "--- tailscale ping ---"
+          tailscale ping --c 3 --timeout 5s 100.69.203.52
+          echo "--- TCP 5555 reachability ---"
+          timeout 10 bash -c 'cat < /dev/null > /dev/tcp/100.69.203.52/5555' \
+            && echo "TCP 5555 OPEN" || echo "TCP 5555 UNREACHABLE (rc=$?)"
+          echo "--- adb identity ---"
+          ls -l "$HOME/.android/"
+          adb start-server 2>&1 | tail -2
+          echo "--- adb connect ---"
+          adb connect 100.69.203.52:5555
+          sleep 3
+          adb devices -l
+          echo "--- adb shell probe ---"
+          timeout 20 adb -s 100.69.203.52:5555 shell getprop ro.product.model
+          echo "probe rc=$?"
+
       - name: Capture Android Auto screenshots
         working-directory: src
         env:
