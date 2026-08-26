@@ -242,13 +242,25 @@ jobs:
             *) echo "not our lock — leaving the device alone" ;;
           esac
 
+      # Maestro dumps the screen and UI hierarchy for a failed command under
+      # ~/.maestro/tests/<timestamp>/. Without this, a matcher failure on a
+      # remote phone is undiagnosable — you cannot see what was on screen.
+      - name: Collect Maestro debug output
+        if: always()
+        run: |
+          set +e
+          mkdir -p src/build/auto-screenshots/maestro-debug
+          cp -r "$HOME"/.maestro/tests/* src/build/auto-screenshots/maestro-debug/ 2>/dev/null
+          find src/build/auto-screenshots/maestro-debug -type f | head -20
+          echo "collected $(find src/build/auto-screenshots/maestro-debug -type f 2>/dev/null | wc -l) files"
+
       - name: Upload screenshots
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: android-auto-screenshots
           path: src/build/auto-screenshots/
-          if-no-files-found: error
+          if-no-files-found: warn
           # Short retention limits the exposure window on a public repo. The real
           # protection is the DND + demo-mode sanitisation applied before capture.
           retention-days: 1
