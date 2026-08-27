@@ -165,15 +165,59 @@ jobs:
           set -eu
           AUTH=$(printf 'oauth2:%s' "$TOKEN" | base64 -w0)
           echo "::add-mask::$AUTH"
-          git -c http.extraheader="AUTHORIZATION: basic $AUTH" \
-            clone --depth 1 --branch "$REF" "https://${HOST}/hiten/RadioShake.git" src
-          ACTUAL_SHA=$(git -C src rev-parse HEAD)
+
+          clone_repo() {
+            rm -rf src
+            git -c http.extraheader="AUTHORIZATION: basic $AUTH" \
+              clone --depth 1 --branch "$REF" "https://${HOST}/hiten/RadioShake.git" src
+            ACTUAL_SHA=$(git -C src rev-parse HEAD)
+          }
+
+          # Deepens the already-cloned src's history and checks whether WANTED_SHA
+          # is an ancestor of the current HEAD. set -eu safe: the merge-base exit
+          # status is only ever observed via the enclosing `if`, never left bare.
+          check_ancestor() {
+            git -C src -c http.extraheader="AUTHORIZATION: basic $AUTH" \
+              fetch --deepen 50 origin main
+            if git -C src merge-base --is-ancestor "$WANTED_SHA" HEAD; then
+              return 0
+            else
+              return 1
+            fi
+          }
+
+          clone_repo
+
           # For repository_dispatch: verify HEAD is the requested sha.
           # If the push triggered this workflow, main should already be at the wanted sha.
-          # Fail hard if not — do not test a stale commit.
+          # A mismatch can also mean the dispatch raced a later push — in that case
+          # WANTED_SHA is an ancestor of the newer HEAD and it's safe to test HEAD
+          # instead. Only fail hard once neither an exact match nor an ancestor
+          # relationship shows up after a few retries (main may just not have
+          # replicated the push yet).
           if [ -n "$WANTED_SHA" ] && [ "$ACTUAL_SHA" != "$WANTED_SHA" ]; then
-            echo "::error::Cloned sha $ACTUAL_SHA != requested $WANTED_SHA (main may not yet include the push)"
-            exit 1
+            RESOLVED=0
+            for ATTEMPT in 1 2 3; do
+              echo "Cloned sha $ACTUAL_SHA != requested $WANTED_SHA (attempt $ATTEMPT/3) — deepening to check ancestry"
+              if check_ancestor; then
+                echo "::notice::Requested sha $WANTED_SHA is an ancestor of HEAD $ACTUAL_SHA — testing the newer HEAD (dispatch raced a later push)"
+                RESOLVED=1
+                break
+              fi
+              if [ "$ATTEMPT" -lt 3 ]; then
+                echo "Not an ancestor yet; main may not have replicated the push. Retrying clone in 20s..."
+                sleep 20
+                clone_repo
+                if [ "$ACTUAL_SHA" = "$WANTED_SHA" ]; then
+                  RESOLVED=1
+                  break
+                fi
+              fi
+            done
+            if [ "$RESOLVED" -ne 1 ]; then
+              echo "::error::Cloned sha $ACTUAL_SHA != requested $WANTED_SHA after 3 attempts (main may not yet include the push)"
+              exit 1
+            fi
           fi
           COMMIT_MSG=$(git -C src log -1 --pretty=%s)
           echo "commit_sha=$ACTUAL_SHA" >> "$GITHUB_OUTPUT"
