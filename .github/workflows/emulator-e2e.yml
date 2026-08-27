@@ -271,7 +271,10 @@ jobs:
 
       # Compute SHA-256 of both APKs for immutable-upload verification.
       - name: Compute APK checksums
-        if: github.event_name == 'schedule'
+        # Must match the upload step's condition: the upload sends these .sha256
+        # files, so gating them differently makes a dispatch upload fail with
+        # curl exit 26 (cannot read local file).
+        if: github.event_name == 'schedule' || inputs.upload_apks
         id: apk-sha
         working-directory: src
         run: |
