@@ -30,6 +30,13 @@ on:
           Force a specific SUITE_ID (for pipeline verification runs only).
           Leave empty for normal ungrouped manual dispatches.
         default: ''
+      upload_apks:
+        description: >-
+          Also publish the built APKs to the Forgejo package registry, as the
+          23:30 cron does. Use to refresh the device nightly's `latest` pointer
+          on demand (e.g. after a registry-auth fix or a stale pointer).
+        type: boolean
+        default: false
 
   repository_dispatch:
     types: [radioshake-main-check]
@@ -306,7 +313,7 @@ jobs:
       # Immutable version per sha; if 409 (already exists), verify checksum.
       # Then update the `latest` pointer object.
       - name: Upload APKs to Forgejo package registry
-        if: github.event_name == 'schedule'
+        if: github.event_name == 'schedule' || inputs.upload_apks
         env:
           HOST: ${{ secrets.FORGEJO_HOST }}
           PKG_TOKEN: ${{ secrets.FORGEJO_PKG_TOKEN }}
