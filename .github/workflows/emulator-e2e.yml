@@ -4,6 +4,18 @@ on:
   schedule:
     # 23:30 UTC — the emulator nightly and the Forgejo device nightly (01:00 UTC)
     # both land on the same calendar date when SUITE_ID uses +6h offset.
+    #
+    # TASK-126: GitHub's own schedule cron is best-effort — of the last 3
+    # ticks (2026-08-26/27) one fired 15 min late, one fired 5 hours late,
+    # one never fired. The primary trigger is now a `radioshake-nightly`
+    # repository_dispatch sent by a Forgejo-scheduled workflow at 23:25 UTC
+    # (punctual VM cron; see nightly-emulator-dispatch.yml in
+    # RadioShake-promo). This schedule cron STAYS as a backup for when the
+    # Forgejo dispatch bridge itself fails — the skip-gate below already
+    # treats a late/duplicate schedule tick as a no-op once the newest
+    # dashboard suite has already passed both halves at the current Forgejo
+    # HEAD, so leaving this cron enabled is safe even when the dispatch
+    # fires correctly.
     - cron: '30 23 * * *'
 
   workflow_dispatch:
@@ -33,13 +45,22 @@ on:
       upload_apks:
         description: >-
           Also publish the built APKs to the Forgejo package registry, as the
-          23:30 cron does. Use to refresh the device nightly's `latest` pointer
-          on demand (e.g. after a registry-auth fix or a stale pointer).
+          23:30 cron (and the Forgejo-triggered radioshake-nightly dispatch)
+          does. Use to refresh the device nightly's `latest` pointer on
+          demand (e.g. after a registry-auth fix or a stale pointer).
         type: boolean
         default: false
 
   repository_dispatch:
-    types: [radioshake-main-check]
+    # radioshake-main-check: push-to-main bridge (dispatched by pr-checks.yml's
+    #   dispatch-to-github job in the Forgejo repo). Unchanged full-tier check;
+    #   posts a Forgejo commit status back (see the forgejo-status job below).
+    # radioshake-nightly: TASK-126 — Forgejo-scheduled nightly dispatch
+    #   (nightly-emulator-dispatch.yml in RadioShake-promo, 23:25 UTC). Treated
+    #   identically to the `schedule` event everywhere in this workflow (see
+    #   the NIGHTLY expression on the skip-gate/e2e/publish jobs below) EXCEPT
+    #   it does not trigger the forgejo-status push-check callback.
+    types: [radioshake-main-check, radioshake-nightly]
 
 permissions:
   contents: read
@@ -53,6 +74,14 @@ jobs:
   skip-gate:
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    # TASK-126: radioshake-nightly repository_dispatch behaves exactly like
+    # `schedule` for skip-gate purposes — whichever of the two fires second
+    # at the same Forgejo HEAD sees the newest suite already passed and
+    # skips. Plain workflow_dispatch and radioshake-main-check are excluded
+    # (they always run). github.event.action carries the event_type for
+    # repository_dispatch events.
+    env:
+      NIGHTLY: ${{ github.event_name == 'schedule' || (github.event_name == 'repository_dispatch' && github.event.action == 'radioshake-nightly') }}
     outputs:
       should_skip: ${{ steps.gate.outputs.should_skip }}
     steps:
@@ -66,10 +95,11 @@ jobs:
           EVENT: ${{ github.event_name }}
         run: |
           set -eu
-          # Non-schedule events always run — skip gate does not apply.
-          if [ "$EVENT" != "schedule" ]; then
+          # Only schedule and radioshake-nightly (NIGHTLY=true) evaluate the
+          # skip condition; all other events always run.
+          if [ "$NIGHTLY" != "true" ]; then
             echo "should_skip=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::event=$EVENT — skip-gate bypassed"
+            echo "::notice::event=$EVENT (nightly=$NIGHTLY) — skip-gate bypassed"
             exit 0
           fi
 
@@ -145,6 +175,14 @@ jobs:
     # 90 min for manual single-tier dispatches.
     timeout-minutes: ${{ (github.event_name == 'schedule' || github.event_name == 'repository_dispatch' || inputs.tier == 'nightly') && 150 || 90 }}
 
+    # TASK-126: single source of truth for "this run should behave like the
+    # nightly schedule tick" — true for the schedule cron itself and for the
+    # radioshake-nightly repository_dispatch, false for radioshake-main-check
+    # and plain workflow_dispatch. Used below wherever behaviour previously
+    # branched on github.event_name == 'schedule' alone.
+    env:
+      NIGHTLY: ${{ github.event_name == 'schedule' || (github.event_name == 'repository_dispatch' && github.event.action == 'radioshake-nightly') }}
+
     outputs:
       commit_sha: ${{ steps.clone.outputs.commit_sha }}
       commit_msg: ${{ steps.clone.outputs.commit_msg }}
@@ -161,6 +199,8 @@ jobs:
       # Note: git clone --branch does not accept a raw SHA — only ref names (branches/tags).
       # For repository_dispatch we clone main (default), then verify HEAD matches the
       # requested sha so we never silently test a different commit.
+      # TASK-126: radioshake-nightly reuses this unchanged — same event_name,
+      # same client_payload.sha shape as radioshake-main-check.
       - name: Clone source from private host
         id: clone
         env:
@@ -274,7 +314,7 @@ jobs:
         # Must match the upload step's condition: the upload sends these .sha256
         # files, so gating them differently makes a dispatch upload fail with
         # curl exit 26 (cannot read local file).
-        if: github.event_name == 'schedule' || inputs.upload_apks
+        if: env.NIGHTLY == 'true' || inputs.upload_apks
         id: apk-sha
         working-directory: src
         run: |
@@ -286,8 +326,9 @@ jobs:
           echo "test_checksum=$(cat app-debug-androidTest.apk.sha256)" >> "$GITHUB_OUTPUT"
 
       # Run the tier(s):
-      #   - scheduled / repository_dispatch → TIER=nightly (full emulator set)
-      #   - workflow_dispatch               → TIER=inputs.tier (single tier)
+      #   - scheduled / repository_dispatch (both radioshake-main-check and
+      #     radioshake-nightly, TASK-126) → TIER=nightly (full emulator set)
+      #   - workflow_dispatch                                → TIER=inputs.tier (single tier)
       - name: Run tier(s) on emulator
         id: run-tier
         uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2
@@ -316,7 +357,7 @@ jobs:
       # Immutable version per sha; if 409 (already exists), verify checksum.
       # Then update the `latest` pointer object.
       - name: Upload APKs to Forgejo package registry
-        if: github.event_name == 'schedule' || inputs.upload_apks
+        if: env.NIGHTLY == 'true' || inputs.upload_apks
         env:
           HOST: ${{ secrets.FORGEJO_HOST }}
           PKG_TOKEN: ${{ secrets.FORGEJO_PKG_TOKEN }}
@@ -413,7 +454,10 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: results-${{ github.event_name == 'schedule' && 'nightly' || (github.event_name == 'repository_dispatch' && 'main-check') || inputs.tier }}
+          # TASK-126: radioshake-nightly (env.NIGHTLY) labels its artifact
+          # 'nightly' just like the schedule tick; radioshake-main-check
+          # (the other repository_dispatch type) keeps 'main-check'.
+          name: results-${{ env.NIGHTLY == 'true' && 'nightly' || (github.event_name == 'repository_dispatch' && 'main-check') || inputs.tier }}
           path: |
             ~/.maestro/tests/**
             src/tier-results.json
@@ -430,6 +474,13 @@ jobs:
     if: always() && needs.skip-gate.outputs.should_skip != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
+
+    # TASK-126: same NIGHTLY notion as the e2e job — true for schedule and
+    # for the radioshake-nightly repository_dispatch, used below so nightly
+    # dispatch runs join the combined dashboard suite the same way schedule
+    # runs do.
+    env:
+      NIGHTLY: ${{ github.event_name == 'schedule' || (github.event_name == 'repository_dispatch' && github.event.action == 'radioshake-nightly') }}
 
     steps:
       - name: Clone CI scripts from source repo
@@ -463,17 +514,20 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           E2E_RESULT: ${{ needs.e2e.result }}
           EVENT: ${{ github.event_name }}
+          NIGHTLY: ${{ env.NIGHTLY }}
           DISPATCH_SHA: ${{ github.event.client_payload.sha }}
           SUITE_ID_INPUT: ${{ inputs.suite_id }}
         run: |
           set -eu
 
           # Resolve SUITE_ID:
-          #   - scheduled runs: date in +6h window (emulator at 23:30 + device at 01:00 share a date)
-          #   - repository_dispatch: "" (ungrouped — the sha drives the check)
+          #   - scheduled runs, and radioshake-nightly dispatch (TASK-126,
+          #     NIGHTLY=true): date in +6h window (emulator at 23:30/23:25 +
+          #     device at 01:00 share a date)
+          #   - radioshake-main-check dispatch: "" (ungrouped — the sha drives the check)
           #   - workflow_dispatch with suite_id input: use the forced value (for verification)
           #   - workflow_dispatch without suite_id: "" (ungrouped)
-          if [ "$EVENT" = "schedule" ]; then
+          if [ "$NIGHTLY" = "true" ]; then
             SUITE_ID=$(date -u -d '+6 hours' +%F)
           elif [ -n "${SUITE_ID_INPUT:-}" ]; then
             SUITE_ID="$SUITE_ID_INPUT"
@@ -482,9 +536,11 @@ jobs:
           fi
 
           # HALF:
-          #   - scheduled runs or forced suite_id (verification dispatches): emulator
-          #   - all other dispatch events: omit (ungrouped or explicit sha run)
-          if [ "$EVENT" = "schedule" ] || [ -n "${SUITE_ID:-}" ]; then
+          #   - scheduled runs, radioshake-nightly dispatch (NIGHTLY=true), or
+          #     forced suite_id (verification dispatches): emulator
+          #   - all other dispatch events (radioshake-main-check, plain
+          #     workflow_dispatch without suite_id): omit (ungrouped or explicit sha run)
+          if [ "$NIGHTLY" = "true" ] || [ -n "${SUITE_ID:-}" ]; then
             HALF=emulator
           else
             HALF=""
@@ -542,10 +598,18 @@ jobs:
   # ──────────────────────────────────────────────────────────────────────────
   # Forgejo commit status callback for repository_dispatch (push-to-main bridge).
   # Reports emulator result back to the Forgejo commit status API.
+  #
+  # Only radioshake-main-check posts a status here. TASK-126: radioshake-nightly
+  # is treated like `schedule` everywhere else in this workflow, and `schedule`
+  # never posts a commit status — so radioshake-nightly is excluded explicitly
+  # below, since both dispatch types share github.event_name == 'repository_dispatch'
+  # and job-level env (NIGHTLY) is not available in a job's own `if:`.
   # ──────────────────────────────────────────────────────────────────────────
   forgejo-status:
     needs: [e2e]
-    if: always() && github.event_name == 'repository_dispatch'
+    if: >-
+      always() && github.event_name == 'repository_dispatch' &&
+      github.event.action != 'radioshake-nightly'
     runs-on: ubuntu-latest
     timeout-minutes: 5
 
