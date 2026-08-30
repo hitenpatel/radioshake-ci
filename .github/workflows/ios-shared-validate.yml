@@ -1,0 +1,369 @@
+# iOS shared framework validation — TASK-7
+#
+# Runs on macOS ARM64 (Apple Silicon) to validate the Kotlin/Native iOS
+# framework targets that cannot be built or tested on Linux.
+#
+# Same pattern as main-checks.yml and emulator-e2e.yml: clones the private
+# Forgejo repo at runtime, runs validation, posts a commit status back,
+# and never persists source on GitHub.
+#
+# Triggered by:
+#   1. repository_dispatch type "radioshake-ios-validate" — fired by Forgejo
+#      ios-shared-validate-dispatch.yml on pushes to the iOS framework branch.
+#   2. workflow_dispatch with optional ref/sha inputs — for manual runs.
+#
+# What it validates (TASK-7 plan, Task 5 Steps 3–6):
+#   - macOS preflight: architecture, Xcode, SDKs, JDK 21, Gradle tasks
+#   - Links all 4 framework binaries (debug+release × arm64+simulator)
+#   - Audits Obj-C header: intended symbols present, deny-list absent
+#   - Swift typechecks the facade smoke test against the framework
+#   - Runs iOS simulator debug tests + release logging policy tests
+#   - Runs full JVM/Android/Wear regression suite
+#   - Posts github/ios-validate commit status to Forgejo
+
+name: ios-shared-validate
+
+on:
+  repository_dispatch:
+    types: [radioshake-ios-validate]
+
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Forgejo branch or tag to clone'
+        default: 'feat/task-7-ios-shared-framework'
+      sha:
+        description: >-
+          Expected HEAD SHA after clone.
+          Leave empty to skip SHA verification.
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  ios-validate:
+    runs-on: macos-latest
+    timeout-minutes: 45
+
+    steps:
+      # ── Clone source from private Forgejo host ──────────────────────
+      - name: Clone source from private host
+        id: clone
+        env:
+          HOST: ${{ secrets.FORGEJO_HOST }}
+          TOKEN: ${{ secrets.FORGEJO_CLONE_TOKEN }}
+          REF: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.ref || inputs.ref || 'feat/task-7-ios-shared-framework' }}
+          WANTED_SHA: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.sha || inputs.sha }}
+        run: |
+          set -eu
+          AUTH=$(printf 'oauth2:%s' "$TOKEN" | base64)
+          echo "::add-mask::$AUTH"
+
+          git -c http.extraheader="AUTHORIZATION: basic $AUTH" \
+            clone --depth 1 --branch "$REF" "https://${HOST}/hiten/RadioShake.git" src
+
+          ACTUAL_SHA=$(git -C src rev-parse HEAD)
+          echo "commit_sha=$ACTUAL_SHA" >> "$GITHUB_OUTPUT"
+          echo "Cloned $REF at $ACTUAL_SHA"
+
+          if [ -n "$WANTED_SHA" ] && [ "$ACTUAL_SHA" != "$WANTED_SHA" ]; then
+            echo "::error::Cloned sha $ACTUAL_SHA != requested $WANTED_SHA"
+            exit 1
+          fi
+
+          # Fail-fast: auth must not be persisted to .git/config.
+          ! grep -rq "AUTHORIZATION" src/.git/config
+
+      # ── macOS preflight ─────────────────────────────────────────────
+      - name: Verify macOS ARM64 environment
+        run: |
+          set -eu
+          echo "=== Architecture ==="
+          ARCH=$(uname -m)
+          echo "$ARCH"
+          if [ "$ARCH" != "arm64" ]; then
+            echo "::error::Expected arm64, got $ARCH"
+            exit 1
+          fi
+
+          echo "=== Xcode ==="
+          xcodebuild -version
+
+          echo "=== iOS SDK (device) ==="
+          xcrun --sdk iphoneos --show-sdk-path
+
+          echo "=== iOS SDK (simulator) ==="
+          xcrun --sdk iphonesimulator --show-sdk-path
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Verify JDK and Gradle
+        working-directory: src
+        run: |
+          java -version
+          ./gradlew --version
+
+      - name: Verify Gradle iOS tasks exist
+        working-directory: src
+        run: |
+          set -eu
+          ./gradlew :shared:tasks --all > /tmp/task7-shared-tasks.txt
+
+          for task in \
+            iosSimulatorArm64Test \
+            linkDebugFrameworkIosSimulatorArm64 \
+            linkReleaseFrameworkIosSimulatorArm64 \
+            linkDebugFrameworkIosArm64 \
+            linkReleaseFrameworkIosArm64 \
+            iosSimulatorArm64ReleasePolicyTest; do
+            if grep -q "$task" /tmp/task7-shared-tasks.txt; then
+              echo "✓ $task"
+            else
+              echo "::error::Missing expected task: $task"
+              exit 1
+            fi
+          done
+
+      # ── Link all four framework binaries ────────────────────────────
+      - name: Link all framework binaries
+        working-directory: src
+        run: |
+          ./gradlew --no-daemon \
+            :shared:linkDebugFrameworkIosSimulatorArm64 \
+            :shared:linkReleaseFrameworkIosSimulatorArm64 \
+            :shared:linkDebugFrameworkIosArm64 \
+            :shared:linkReleaseFrameworkIosArm64
+
+      - name: Verify Mach-O binaries
+        working-directory: src
+        run: |
+          set -eu
+          BINARIES=$(find shared/build/bin -path '*RadioShakeShared.framework/RadioShakeShared' -type f)
+          COUNT=$(echo "$BINARIES" | wc -l | tr -d ' ')
+          echo "Found $COUNT framework binaries:"
+          echo "$BINARIES"
+
+          if [ "$COUNT" -ne 4 ]; then
+            echo "::error::Expected 4 framework binaries, got $COUNT"
+            exit 1
+          fi
+
+          for bin in $BINARIES; do
+            FILE_INFO=$(file "$bin")
+            echo "$FILE_INFO"
+            if ! echo "$FILE_INFO" | grep -q "Mach-O"; then
+              echo "::error::$bin is not a Mach-O binary"
+              exit 1
+            fi
+          done
+
+      # ── Audit Obj-C header ──────────────────────────────────────────
+      - name: Audit framework header (allow/deny symbols)
+        id: header-audit
+        working-directory: src
+        run: |
+          set -eu
+          HEADER=$(find shared/build/bin \
+            -path '*iosSimulatorArm64/debugFramework/RadioShakeShared.framework/Headers/*.h' \
+            -type f | head -1)
+          echo "Inspecting header: $HEADER"
+
+          echo ""
+          echo "=== Allow-list check ==="
+          FAIL=0
+          for sym in IosSharedFacade IosStation IosCancellation IosErrorCode; do
+            if grep -q "$sym" "$HEADER"; then
+              echo "✓ $sym present"
+            else
+              echo "✗ $sym MISSING"
+              FAIL=1
+            fi
+          done
+
+          echo ""
+          echo "=== Deny-list check ==="
+          for sym in RadioBrowserApiService ShazamApiService StationDto \
+                     DatabaseDriverFactory FavouriteRepository StationRepository \
+                     SongLogRepository; do
+            if grep -q "$sym" "$HEADER"; then
+              echo "✗ $sym LEAKED into header"
+              FAIL=1
+            else
+              echo "✓ $sym absent"
+            fi
+          done
+
+          echo ""
+          echo "=== Unavoidable generated symbols (record, not block) ==="
+          grep -oE '\b(RadioShakeDatabase|FavouriteQueries|StationQueries|SongLogQueries)\b' \
+            "$HEADER" | sort -u | while read -r sym; do
+            echo "⚠ Generated symbol present: $sym (expected, unreachable from facade)"
+          done || true
+
+          if [ "$FAIL" -ne 0 ]; then
+            echo "::error::Header audit failed"
+            exit 1
+          fi
+
+          cp "$HEADER" /tmp/RadioShakeShared-header.h
+
+      # ── Swift typecheck ─────────────────────────────────────────────
+      - name: Swift typecheck against framework
+        working-directory: src
+        run: |
+          set -eu
+          cat > /tmp/Task7FacadeSmoke.swift << 'SWIFT'
+          import Foundation
+          import RadioShakeShared
+
+          @MainActor
+          final class StationsModel: ObservableObject {
+              @Published private(set) var stations: [IosStation] = []
+              @Published private(set) var error: IosErrorCode?
+              private let shared: IosSharedFacade
+              private var search: IosCancellation?
+              private var favourites: IosCancellation?
+
+              init(databasePath: String) {
+                  shared = IosSharedFacade(baseUrl: "https://de1.api.radio-browser.info",
+                      databasePath: databasePath, destructiveRecoveryEnabled: false)
+                  favourites = shared.observeFavourites { [weak self] in self?.stations = $0 }
+              }
+              func search(_ query: String) {
+                  search?.cancel()
+                  search = shared.searchStations(query: query, limit: 30) { [weak self] values, error in
+                      self?.stations = values; self?.error = error
+                  }
+              }
+              func setFavourite(_ station: IosStation, enabled: Bool) {
+                  _ = shared.setFavourite(station: station, isFavourite: enabled) { [weak self] in self?.error = $0 }
+              }
+              deinit { search?.cancel(); favourites?.cancel(); shared.close() }
+          }
+          SWIFT
+
+          SDK_PATH=$(xcrun --sdk iphonesimulator --show-sdk-path)
+          FRAMEWORK_PATH="shared/build/bin/iosSimulatorArm64/debugFramework"
+
+          xcrun swiftc -typecheck /tmp/Task7FacadeSmoke.swift \
+            -sdk "$SDK_PATH" \
+            -target arm64-apple-ios17.0-simulator \
+            -F "$FRAMEWORK_PATH" \
+            -framework RadioShakeShared
+
+          echo "✓ Swift typecheck passed"
+
+      # ── iOS simulator tests ─────────────────────────────────────────
+      - name: Run iOS simulator debug tests
+        id: ios-debug-tests
+        working-directory: src
+        run: ./gradlew --no-daemon :shared:iosSimulatorArm64Test
+
+      - name: Run iOS simulator release logging policy tests
+        id: ios-release-tests
+        if: always() && steps.ios-debug-tests.outcome != 'cancelled'
+        working-directory: src
+        run: ./gradlew --no-daemon :shared:iosSimulatorArm64ReleasePolicyTest
+
+      # ── Full regression suite ───────────────────────────────────────
+      - name: Ensure Android SDK 36 components
+        if: always() && steps.ios-release-tests.outcome != 'cancelled'
+        run: |
+          set -eu
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
+            "platforms;android-36" "build-tools;36.0.0" > /dev/null
+
+      - name: Run JVM + Android + Wear regression tests
+        id: regression-tests
+        if: always() && steps.ios-release-tests.outcome != 'cancelled'
+        working-directory: src
+        run: |
+          set -eu
+          printf 'sdk.dir=%s\n' "$ANDROID_HOME" > local.properties
+          ./gradlew --no-daemon \
+            :shared:jvmTest \
+            :shared:testDebugUnitTest \
+            :shared:testReleaseUnitTest \
+            :app:testDebugUnitTest \
+            :wear:testDebugUnitTest
+
+      # ── Record evidence ─────────────────────────────────────────────
+      - name: Record validation evidence
+        if: always()
+        working-directory: src
+        run: |
+          set -eu
+          echo "=== Validation Evidence ==="
+          echo "SHA: $(git rev-parse HEAD)"
+          echo "Runner: $(uname -a)"
+          echo "Xcode: $(xcodebuild -version | head -1)"
+          echo "SDK (device): $(xcrun --sdk iphoneos --show-sdk-path)"
+          echo "SDK (simulator): $(xcrun --sdk iphonesimulator --show-sdk-path)"
+          echo "Java: $(java -version 2>&1 | head -1)"
+          echo "Date: $(date -u)"
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ios-validate-evidence
+          retention-days: 14
+          path: |
+            /tmp/RadioShakeShared-header.h
+            /tmp/Task7FacadeSmoke.swift
+            src/shared/build/reports/
+          if-no-files-found: ignore
+          # NEVER upload source, local.properties, or gradle caches
+
+      # ── Report commit status to Forgejo ─────────────────────────────
+      - name: Report commit status to Forgejo
+        if: always()
+        env:
+          HOST: ${{ secrets.FORGEJO_HOST }}
+          STATUS_TOKEN: ${{ secrets.FORGEJO_STATUS_TOKEN }}
+          COMMIT_SHA: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.sha || steps.clone.outputs.commit_sha }}
+          IOS_DEBUG: ${{ steps.ios-debug-tests.outcome }}
+          IOS_RELEASE: ${{ steps.ios-release-tests.outcome }}
+          REGRESSION: ${{ steps.regression-tests.outcome }}
+          HEADER: ${{ steps.header-audit.outcome }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -eu
+          echo "::add-mask::$STATUS_TOKEN"
+
+          if [ -z "$COMMIT_SHA" ]; then
+            echo "::warning::No commit SHA available — cannot post status"
+            exit 0
+          fi
+
+          OVERALL=success
+          for RESULT in "$IOS_DEBUG" "$IOS_RELEASE" "$REGRESSION" "$HEADER"; do
+            case "$RESULT" in
+              success) ;;
+              skipped) ;;
+              *) OVERALL=failure ;;
+            esac
+          done
+
+          if [ "$IOS_DEBUG" = "skipped" ] && [ "$IOS_RELEASE" = "skipped" ] && [ "$REGRESSION" = "skipped" ]; then
+            OVERALL=failure
+          fi
+
+          DESCRIPTION="iOS shared framework: $OVERALL"
+
+          curl -fsS -X POST \
+            "https://${HOST}/api/v1/repos/hiten/RadioShake/statuses/${COMMIT_SHA}" \
+            -H "Authorization: token $STATUS_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"context\": \"github/ios-validate\",
+              \"state\": \"${OVERALL}\",
+              \"target_url\": \"${RUN_URL}\",
+              \"description\": \"${DESCRIPTION}\"
+            }"
+          echo "Posted commit status: $OVERALL for $COMMIT_SHA"
