@@ -102,6 +102,15 @@ jobs:
           distribution: temurin
           java-version: '21'
 
+      - name: Fix org.gradle.java.home for macOS
+        working-directory: src
+        run: |
+          # gradle.properties has a hardcoded Linux JDK path that breaks macOS.
+          # Replace it with the JAVA_HOME provided by setup-java.
+          sed -i.bak "s|^org.gradle.java.home=.*|org.gradle.java.home=$JAVA_HOME|" gradle.properties
+          echo "Set org.gradle.java.home=$JAVA_HOME"
+          cat gradle.properties
+
       - name: Verify JDK and Gradle
         working-directory: src
         run: |
