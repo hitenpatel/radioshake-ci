@@ -165,8 +165,8 @@ jobs:
           for bin in $BINARIES; do
             FILE_INFO=$(file "$bin")
             echo "$FILE_INFO"
-            if ! echo "$FILE_INFO" | grep -q "Mach-O"; then
-              echo "::error::$bin is not a Mach-O binary"
+            if ! echo "$FILE_INFO" | grep -qE "Mach-O|current ar archive"; then
+              echo "::error::$bin is not a Mach-O or ar archive binary"
               exit 1
             fi
           done
