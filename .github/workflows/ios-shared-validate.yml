@@ -263,7 +263,7 @@ jobs:
             exit 1
           fi
           manifest_actual=$(mktemp "${TMPDIR:-/tmp}/task7-source-manifest.XXXXXX")
-          git ls-files -z -- \
+          git ls-files -co --exclude-standard -z -- \
             shared/src/commonMain/kotlin/com/radioshake/shared/network \
             shared/src/commonMain/kotlin/com/radioshake/shared/database \
             shared/src/commonMain/kotlin/com/radioshake/shared/domain \

@@ -251,7 +251,7 @@ class IosSharedValidateWorkflowTest(unittest.TestCase):
         manifest_end = header_run.index('if ! diff -u', manifest_start)
         manifest_run = header_run[manifest_start:manifest_end]
         self.assertNotIn("rg ", manifest_run)
-        self.assertIn("git ls-files -z --", manifest_run)
+        self.assertIn("git ls-files -co --exclude-standard -z --", manifest_run)
         self.assertIn("while IFS= read -r -d '' source; do", manifest_run)
         self.assertIn('*/.*) continue ;;', manifest_run)
         self.assertIn('git check-ignore -q --no-index -- "$source"', manifest_run)
@@ -299,8 +299,8 @@ class IosSharedValidateWorkflowTest(unittest.TestCase):
         self.assertIn("xcrun simctl list runtimes available", toolchain_run)
         self.assertIn("iosSimulatorArm64ReleasePolicyTest", self.run_for("gradle_evidence"))
 
-    def test_source_manifest_uses_tracked_non_hidden_non_ignored_sources_without_rg(self):
-        """The source-derived manifest must use only tracked sources that rg would consider."""
+    def test_source_manifest_uses_non_hidden_non_ignored_sources_without_rg(self):
+        """The source-derived manifest must retain rg's tracked and untracked discovery behavior."""
         header_run = self.run_for("header_audit")
         manifest_block = re.search(
             r'''^\s*manifest_actual=\$\(mktemp "\$\{TMPDIR:-/tmp\}/task7-source-manifest\.XXXXXX"\)$
@@ -311,13 +311,17 @@ class IosSharedValidateWorkflowTest(unittest.TestCase):
         if manifest_block is None:
             self.fail("source manifest derivation block was not found")
         self.assertNotIn("rg ", manifest_block.group())
+        self.assertIn(
+            "git ls-files -co --exclude-standard -z --", manifest_block.group()
+        )
 
         with tempfile.TemporaryDirectory() as temp_dir:
             source_root = Path(temp_dir)
             files = {
-                "network/Public.kt": "public class NetworkExport\n",
-                "network/.Hidden.kt": "class HiddenExport\n",
-                "database/Implicit.kt": "class DatabaseExport\n",
+                "network/Tracked.kt": "public class TrackedExport\n",
+                "database/Untracked.kt": "class UntrackedExport\n",
+                "domain/.Hidden.kt": "class HiddenExport\n",
+                "repository/Ignored.kt": "class IgnoredExport\n",
                 "domain/Data.kt": "data class DomainExport(val id: Int)\n",
                 "moderation/Object.kt": "object ModerationExport\n",
                 "recognition/Fun.kt": "fun recognitionExport() = Unit\n",
@@ -326,7 +330,6 @@ class IosSharedValidateWorkflowTest(unittest.TestCase):
                 "domain/NonKotlinSource.txt": "public class TextExport\n",
                 "network/Private.kt": "private class NotExported\n",
                 "database/Comment.kt": "// public class NotExported\n",
-                "repository/Ignored.kt": "class IgnoredExport\n",
             }
             expected_paths = []
             for relative_path, contents in files.items():
@@ -334,7 +337,7 @@ class IosSharedValidateWorkflowTest(unittest.TestCase):
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text(contents, encoding="utf-8")
                 if "NotExported" not in contents and relative_path not in (
-                    "network/.Hidden.kt",
+                    "domain/.Hidden.kt",
                     "repository/Ignored.kt",
                 ):
                     expected_paths.append(str(path.relative_to(source_root)))
@@ -344,7 +347,22 @@ class IosSharedValidateWorkflowTest(unittest.TestCase):
                 encoding="utf-8",
             )
             subprocess.run(["git", "init", "-q"], cwd=source_root, check=True)
-            subprocess.run(["git", "add", "-f", "shared", ".gitignore"], cwd=source_root, check=True)
+            tracked_sources = (
+                "shared/src/commonMain/kotlin/com/radioshake/shared/network/Tracked.kt",
+                "shared/src/commonMain/kotlin/com/radioshake/shared/domain/Data.kt",
+                "shared/src/commonMain/kotlin/com/radioshake/shared/moderation/Object.kt",
+                "shared/src/commonMain/kotlin/com/radioshake/shared/recognition/Fun.kt",
+                "shared/src/commonMain/kotlin/com/radioshake/shared/platform/Val.kt",
+                "shared/src/commonMain/kotlin/com/radioshake/shared/repository/Expect.kt",
+                "shared/src/commonMain/kotlin/com/radioshake/shared/domain/NonKotlinSource.txt",
+                "shared/src/commonMain/kotlin/com/radioshake/shared/network/Private.kt",
+                "shared/src/commonMain/kotlin/com/radioshake/shared/database/Comment.kt",
+            )
+            subprocess.run(
+                ["git", "add", ".gitignore", *tracked_sources],
+                cwd=source_root,
+                check=True,
+            )
 
             tool_path = source_root / "tool-path"
             tool_path.mkdir()
