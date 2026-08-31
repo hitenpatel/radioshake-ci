@@ -3,6 +3,7 @@
 from pathlib import Path
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -250,9 +251,12 @@ class IosSharedValidateWorkflowTest(unittest.TestCase):
         manifest_end = header_run.index('if ! diff -u', manifest_start)
         manifest_run = header_run[manifest_start:manifest_end]
         self.assertNotIn("rg ", manifest_run)
-        self.assertIn("find \\", manifest_run)
-        self.assertIn("-type f", manifest_run)
-        self.assertIn("-exec grep -El", manifest_run)
+        self.assertIn("git ls-files -z --", manifest_run)
+        self.assertIn("while IFS= read -r -d '' source; do", manifest_run)
+        self.assertIn('*/.*) continue ;;', manifest_run)
+        self.assertIn('git check-ignore -q --no-index -- "$source"', manifest_run)
+        self.assertIn('[ -f "$source" ] && [ ! -L "$source" ]', manifest_run)
+        self.assertIn("grep -El", manifest_run)
         self.assertIn("| sort > \"$manifest_actual\"", manifest_run)
         for source_dir in (
             "network",
@@ -295,8 +299,8 @@ class IosSharedValidateWorkflowTest(unittest.TestCase):
         self.assertIn("xcrun simctl list runtimes available", toolchain_run)
         self.assertIn("iosSimulatorArm64ReleasePolicyTest", self.run_for("gradle_evidence"))
 
-    def test_source_manifest_uses_portable_discovery_and_filtering_without_rg(self):
-        """The source-derived manifest must run with only macOS-standard find, grep, and sort."""
+    def test_source_manifest_uses_tracked_non_hidden_non_ignored_sources_without_rg(self):
+        """The source-derived manifest must use only tracked sources that rg would consider."""
         header_run = self.run_for("header_audit")
         manifest_block = re.search(
             r'''^\s*manifest_actual=\$\(mktemp "\$\{TMPDIR:-/tmp\}/task7-source-manifest\.XXXXXX"\)$
@@ -312,6 +316,7 @@ class IosSharedValidateWorkflowTest(unittest.TestCase):
             source_root = Path(temp_dir)
             files = {
                 "network/Public.kt": "public class NetworkExport\n",
+                "network/.Hidden.kt": "class HiddenExport\n",
                 "database/Implicit.kt": "class DatabaseExport\n",
                 "domain/Data.kt": "data class DomainExport(val id: Int)\n",
                 "moderation/Object.kt": "object ModerationExport\n",
@@ -321,19 +326,39 @@ class IosSharedValidateWorkflowTest(unittest.TestCase):
                 "domain/NonKotlinSource.txt": "public class TextExport\n",
                 "network/Private.kt": "private class NotExported\n",
                 "database/Comment.kt": "// public class NotExported\n",
+                "repository/Ignored.kt": "class IgnoredExport\n",
             }
             expected_paths = []
             for relative_path, contents in files.items():
                 path = source_root / "shared/src/commonMain/kotlin/com/radioshake/shared" / relative_path
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text(contents, encoding="utf-8")
-                if "NotExported" not in contents:
+                if "NotExported" not in contents and relative_path not in (
+                    "network/.Hidden.kt",
+                    "repository/Ignored.kt",
+                ):
                     expected_paths.append(str(path.relative_to(source_root)))
 
+            (source_root / ".gitignore").write_text(
+                "shared/src/commonMain/kotlin/com/radioshake/shared/repository/Ignored.kt\n",
+                encoding="utf-8",
+            )
+            subprocess.run(["git", "init", "-q"], cwd=source_root, check=True)
+            subprocess.run(["git", "add", "-f", "shared", ".gitignore"], cwd=source_root, check=True)
+
+            tool_path = source_root / "tool-path"
+            tool_path.mkdir()
+            for command in ("git", "grep", "sort", "mktemp", "wc", "tr"):
+                executable = shutil.which(command)
+                if executable is None:
+                    self.fail(f"required test command is unavailable: {command}")
+                (tool_path / command).symlink_to(executable)
+            self.assertIsNone(shutil.which("rg", path=str(tool_path)))
+
             result = subprocess.run(
-                ["bash", "-ceu", manifest_block.group().rsplit("\n", 1)[0]],
+                ["/bin/bash", "-ceu", manifest_block.group().rsplit("\n", 1)[0]],
                 cwd=source_root,
-                env=os.environ | {"PATH": "/usr/bin:/bin", "TMPDIR": temp_dir},
+                env=os.environ | {"PATH": str(tool_path), "TMPDIR": temp_dir},
                 text=True,
                 capture_output=True,
                 check=False,

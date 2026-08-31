@@ -263,7 +263,7 @@ jobs:
             exit 1
           fi
           manifest_actual=$(mktemp "${TMPDIR:-/tmp}/task7-source-manifest.XXXXXX")
-          find \
+          git ls-files -z -- \
             shared/src/commonMain/kotlin/com/radioshake/shared/network \
             shared/src/commonMain/kotlin/com/radioshake/shared/database \
             shared/src/commonMain/kotlin/com/radioshake/shared/domain \
@@ -271,8 +271,19 @@ jobs:
             shared/src/commonMain/kotlin/com/radioshake/shared/recognition \
             shared/src/commonMain/kotlin/com/radioshake/shared/platform \
             shared/src/commonMain/kotlin/com/radioshake/shared/repository \
-            -type f \
-            -exec grep -El '^(public )?(data class|class|interface|object|fun|val|expect (class|fun|val)) ' {} + \
+            | while IFS= read -r -d '' source; do
+                case "$source" in
+                  */.*) continue ;;
+                esac
+                if git check-ignore -q --no-index -- "$source"; then
+                  continue
+                fi
+                if [ -f "$source" ] && [ ! -L "$source" ]; then
+                  if grep -El '^(public )?(data class|class|interface|object|fun|val|expect (class|fun|val)) ' "$source"; then
+                    :
+                  fi
+                fi
+              done \
             | sort > "$manifest_actual"
           if [ "$(wc -l < "$manifest_actual" | tr -d ' ')" -ne 29 ]; then
             echo "::error::Source export manifest command no longer yields 29 paths"
