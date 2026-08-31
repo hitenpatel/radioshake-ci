@@ -284,7 +284,7 @@ jobs:
                   fi
                 fi
               done \
-            | sort > "$manifest_actual"
+            | LC_ALL=C sort > "$manifest_actual"
           if [ "$(wc -l < "$manifest_actual" | tr -d ' ')" -ne 29 ]; then
             echo "::error::Source export manifest command no longer yields 29 paths"
             rm -f -- "$manifest_actual"

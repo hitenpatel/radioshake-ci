@@ -257,7 +257,7 @@ class IosSharedValidateWorkflowTest(unittest.TestCase):
         self.assertIn('git check-ignore -q --no-index -- "$source"', manifest_run)
         self.assertIn('[ -f "$source" ] && [ ! -L "$source" ]', manifest_run)
         self.assertIn("grep -El", manifest_run)
-        self.assertIn("| sort > \"$manifest_actual\"", manifest_run)
+        self.assertIn("| LC_ALL=C sort > \"$manifest_actual\"", manifest_run)
         for source_dir in (
             "network",
             "database",
@@ -300,7 +300,7 @@ class IosSharedValidateWorkflowTest(unittest.TestCase):
         self.assertIn("iosSimulatorArm64ReleasePolicyTest", self.run_for("gradle_evidence"))
 
     def test_source_manifest_uses_non_hidden_non_ignored_sources_without_rg(self):
-        """The source-derived manifest must retain rg's tracked and untracked discovery behavior."""
+        """The source-derived manifest retains discovery and uses byte-stable ordering."""
         header_run = self.run_for("header_audit")
         manifest_block = re.search(
             r'''^\s*manifest_actual=\$\(mktemp "\$\{TMPDIR:-/tmp\}/task7-source-manifest\.XXXXXX"\)$
@@ -323,10 +323,16 @@ class IosSharedValidateWorkflowTest(unittest.TestCase):
                 "domain/.Hidden.kt": "class HiddenExport\n",
                 "repository/Ignored.kt": "class IgnoredExport\n",
                 "domain/Data.kt": "data class DomainExport(val id: Int)\n",
+                "domain/SongLogEntry.kt": "class SongLogEntry\n",
+                "domain/Station.kt": "class Station\n",
                 "moderation/Object.kt": "object ModerationExport\n",
                 "recognition/Fun.kt": "fun recognitionExport() = Unit\n",
                 "platform/Val.kt": "val platformExport = 1\n",
                 "repository/Expect.kt": "expect class RepositoryExport\n",
+                "network/dto/CountryDto.kt": "class CountryDto\n",
+                "network/dto/ShazamDto.kt": "class ShazamDto\n",
+                "network/dto/StationDto.kt": "class StationDto\n",
+                "network/dto/TagDto.kt": "class TagDto\n",
                 "domain/NonKotlinSource.txt": "public class TextExport\n",
                 "network/Private.kt": "private class NotExported\n",
                 "database/Comment.kt": "// public class NotExported\n",
@@ -350,10 +356,16 @@ class IosSharedValidateWorkflowTest(unittest.TestCase):
             tracked_sources = (
                 "shared/src/commonMain/kotlin/com/radioshake/shared/network/Tracked.kt",
                 "shared/src/commonMain/kotlin/com/radioshake/shared/domain/Data.kt",
+                "shared/src/commonMain/kotlin/com/radioshake/shared/domain/SongLogEntry.kt",
+                "shared/src/commonMain/kotlin/com/radioshake/shared/domain/Station.kt",
                 "shared/src/commonMain/kotlin/com/radioshake/shared/moderation/Object.kt",
                 "shared/src/commonMain/kotlin/com/radioshake/shared/recognition/Fun.kt",
                 "shared/src/commonMain/kotlin/com/radioshake/shared/platform/Val.kt",
                 "shared/src/commonMain/kotlin/com/radioshake/shared/repository/Expect.kt",
+                "shared/src/commonMain/kotlin/com/radioshake/shared/network/dto/CountryDto.kt",
+                "shared/src/commonMain/kotlin/com/radioshake/shared/network/dto/ShazamDto.kt",
+                "shared/src/commonMain/kotlin/com/radioshake/shared/network/dto/StationDto.kt",
+                "shared/src/commonMain/kotlin/com/radioshake/shared/network/dto/TagDto.kt",
                 "shared/src/commonMain/kotlin/com/radioshake/shared/domain/NonKotlinSource.txt",
                 "shared/src/commonMain/kotlin/com/radioshake/shared/network/Private.kt",
                 "shared/src/commonMain/kotlin/com/radioshake/shared/database/Comment.kt",
@@ -366,17 +378,34 @@ class IosSharedValidateWorkflowTest(unittest.TestCase):
 
             tool_path = source_root / "tool-path"
             tool_path.mkdir()
-            for command in ("git", "grep", "sort", "mktemp", "wc", "tr"):
+            for command in ("git", "grep", "mktemp", "wc", "tr"):
                 executable = shutil.which(command)
                 if executable is None:
                     self.fail(f"required test command is unavailable: {command}")
                 (tool_path / command).symlink_to(executable)
+            sort_executable = shutil.which("sort")
+            if sort_executable is None:
+                self.fail("required test command is unavailable: sort")
+            sort_locale = source_root / "sort-locale.txt"
+            fake_sort = tool_path / "sort"
+            fake_sort.write_text(
+                "#!/bin/sh\n"
+                'printf "%s\\n" "${LC_ALL-unset}" > "$TASK7_SORT_LOCALE"\n'
+                'exec "$TASK7_REAL_SORT" "$@"\n',
+                encoding="utf-8",
+            )
+            fake_sort.chmod(0o755)
             self.assertIsNone(shutil.which("rg", path=str(tool_path)))
 
             result = subprocess.run(
                 ["/bin/bash", "-ceu", manifest_block.group().rsplit("\n", 1)[0]],
                 cwd=source_root,
-                env=os.environ | {"PATH": str(tool_path), "TMPDIR": temp_dir},
+                env=os.environ | {
+                    "PATH": str(tool_path),
+                    "TMPDIR": temp_dir,
+                    "TASK7_REAL_SORT": sort_executable,
+                    "TASK7_SORT_LOCALE": str(sort_locale),
+                },
                 text=True,
                 capture_output=True,
                 check=False,
@@ -385,8 +414,9 @@ class IosSharedValidateWorkflowTest(unittest.TestCase):
             manifest_path = next(source_root.glob("task7-source-manifest.*"))
             self.assertEqual(
                 manifest_path.read_text(encoding="utf-8").splitlines(),
-                sorted(expected_paths),
+                sorted(expected_paths, key=lambda path: path.encode("utf-8")),
             )
+            self.assertEqual(sort_locale.read_text(encoding="utf-8"), "C\n")
 
     def test_release_followups_are_always_gated_by_prior_simulator_outcomes(self):
         """Release, SDK, and regression steps must retain their explicit outcome dependencies."""
