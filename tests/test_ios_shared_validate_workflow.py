@@ -140,12 +140,12 @@ class IosSharedValidateWorkflowTest(unittest.TestCase):
 \s*rm -rf -- "\$extract_dir"$
 \s*\}$
 \s*trap 'cleanup_extract_dir' EXIT HUP INT TERM$
-\s*members_file="\$extract_dir/members\.txt"$
-\s*ar -t "\$archive" > "\$members_file"$''',
+\s*members_file="\$extract_dir/members\.txt"$''',
         )
         self.assert_block(
             archive_run,
-            r'''^\s*if grep -vE '\^\(__\\\.SYMDEF\|__\.SYMDEF SORTED\)\$' "\$members_file" \| grep -Eq '\(\^\|/\)\\\.\\\.\?\(\\/\|\$\)\|\[\^A-Za-z0-9\._ -\]'; then$
+            r'''^\s*if unsafe_members=\$\(grep -vE '\^\(__\\\.SYMDEF\|__\.SYMDEF SORTED\)\$' "\$members_file" \| grep -E '\(\^\|/\)\\\.\\\.\?\(\\/\|\$\)\|\[\^A-Za-z0-9\._ -\]'\); then$
+\s*printf '%s\\n' "\$unsafe_members" \| tee -a "\$archive_report"$
 \s*echo .*Static archive contains an unsafe member name.*$
 \s*exit 1$
 \s*fi$
@@ -404,6 +404,24 @@ class IosSharedValidateWorkflowTest(unittest.TestCase):
         self.assertLess(trap, extract)
         self.assertLess(extract, cleanup)
         self.assertLess(cleanup, clear_trap)
+
+    def test_archive_member_diagnostic_is_persisted_before_rejection(self):
+        """A rejected archive member remains available in uploaded inspection evidence."""
+        archive_run = self.run_for("archive_validation")
+        self.assert_block(
+            archive_run,
+            r'''^\s*printf '%s\\n' "Archive members for \$archive:" \| tee -a "\$archive_report"$
+\s*ar -t "\$archive" \| tee -a "\$archive_report" > "\$members_file"$
+\s*if \[ ! -s "\$members_file" \]; then$''',
+        )
+        self.assert_block(
+            archive_run,
+            r'''^\s*if unsafe_members=\$\(grep -vE '\^\(__\\\.SYMDEF\|__\.SYMDEF SORTED\)\$' "\$members_file" \| grep -E '\(\^\|/\)\\\.\\\.\?\(\\/\|\$\)\|\[\^A-Za-z0-9\._ -\]'\); then$
+\s*printf '%s\\n' "\$unsafe_members" \| tee -a "\$archive_report"$
+\s*echo .*Static archive contains an unsafe member name.*$
+\s*exit 1$
+\s*fi$''',
+        )
 
 
 if __name__ == "__main__":
