@@ -172,7 +172,7 @@ jobs:
               echo "::error::Static archive has no members"
               exit 1
             fi
-            if unsafe_members=$(grep -vE '^(__\.SYMDEF|__.SYMDEF SORTED)$' "$members_file" | grep -E '(^|/)\.\.?(\/|$)|[^A-Za-z0-9._ -]'); then
+            if unsafe_members=$(grep -vE '^(__\.SYMDEF|__.SYMDEF SORTED)$' "$members_file" | grep -E '(^|/)\.\.?(\/|$)|[^A-Za-z0-9._: -]'); then
               printf '%s\n' "$unsafe_members" | tee -a "$archive_report"
               echo "::error::Static archive contains an unsafe member name"
               exit 1

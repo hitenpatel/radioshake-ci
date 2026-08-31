@@ -65,6 +65,37 @@ class IosSharedValidateWorkflowTest(unittest.TestCase):
         """Match a live, line-anchored shell block rather than disconnected text."""
         self.assertRegex(body, re.compile(pattern, re.MULTILINE))
 
+    @classmethod
+    def archive_member_validation_result(cls, member):
+        """Run the workflow's live member-rejection block against one archive member."""
+        archive_run = cls.run_for("archive_validation")
+        validation_block = re.search(
+            r'''^\s*if unsafe_members=\$\(grep -vE .*?^\s*fi$''',
+            archive_run,
+            re.MULTILINE | re.DOTALL,
+        )
+        if validation_block is None:
+            raise AssertionError("archive member validation block was not found")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            members_file = temp_path / "members.txt"
+            archive_report = temp_path / "archive-report.txt"
+            members_file.write_text(member + "\n", encoding="utf-8")
+            return subprocess.run(
+                [
+                    "bash",
+                    "-ceu",
+                    'members_file="$1"\narchive_report="$2"\n' + validation_block.group(),
+                    "archive-member-validation",
+                    str(members_file),
+                    str(archive_report),
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
     def test_dispatches_require_nonempty_ref_and_exact_sha(self):
         """A dispatch without an exact ref/SHA must not clone or report a different commit."""
         manual = self.on["workflow_dispatch"]["inputs"]
@@ -144,7 +175,7 @@ class IosSharedValidateWorkflowTest(unittest.TestCase):
         )
         self.assert_block(
             archive_run,
-            r'''^\s*if unsafe_members=\$\(grep -vE '\^\(__\\\.SYMDEF\|__\.SYMDEF SORTED\)\$' "\$members_file" \| grep -E '\(\^\|/\)\\\.\\\.\?\(\\/\|\$\)\|\[\^A-Za-z0-9\._ -\]'\); then$
+            r'''^\s*if unsafe_members=\$\(grep -vE '\^\(__\\\.SYMDEF\|__\.SYMDEF SORTED\)\$' "\$members_file" \| grep -E '\(\^\|/\)\\\.\\\.\?\(\\/\|\$\)\|\[\^A-Za-z0-9\._: -\]'\); then$
 \s*printf '%s\\n' "\$unsafe_members" \| tee -a "\$archive_report"$
 \s*echo .*Static archive contains an unsafe member name.*$
 \s*exit 1$
@@ -416,12 +447,29 @@ class IosSharedValidateWorkflowTest(unittest.TestCase):
         )
         self.assert_block(
             archive_run,
-            r'''^\s*if unsafe_members=\$\(grep -vE '\^\(__\\\.SYMDEF\|__\.SYMDEF SORTED\)\$' "\$members_file" \| grep -E '\(\^\|/\)\\\.\\\.\?\(\\/\|\$\)\|\[\^A-Za-z0-9\._ -\]'\); then$
+            r'''^\s*if unsafe_members=\$\(grep -vE '\^\(__\\\.SYMDEF\|__\.SYMDEF SORTED\)\$' "\$members_file" \| grep -E '\(\^\|/\)\\\.\\\.\?\(\\/\|\$\)\|\[\^A-Za-z0-9\._: -\]'\); then$
 \s*printf '%s\\n' "\$unsafe_members" \| tee -a "\$archive_report"$
 \s*echo .*Static archive contains an unsafe member name.*$
 \s*exit 1$
 \s*fi$''',
         )
+
+    def test_archive_member_validation_permits_kotlin_native_colons(self):
+        """Rejecting ':' breaks legitimate Kotlin/Native dependency archive members."""
+        result = self.archive_member_validation_result(
+            "libio.ktor:ktor-client-core-cache.a.o"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_archive_member_validation_rejects_traversal(self):
+        """Permitting ':' must not allow an extracted object to escape its temporary directory."""
+        result = self.archive_member_validation_result("../escape.o")
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_archive_member_validation_rejects_shell_control_character(self):
+        """Permitting ':' must not allow a member name with shell-significant control input."""
+        result = self.archive_member_validation_result("unsafe;member.o")
+        self.assertNotEqual(result.returncode, 0)
 
 
 if __name__ == "__main__":
