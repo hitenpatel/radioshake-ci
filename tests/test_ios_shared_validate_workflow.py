@@ -180,7 +180,13 @@ class IosSharedValidateWorkflowTest(unittest.TestCase):
 \s*echo .*Static archive contains an unsafe member name.*$
 \s*exit 1$
 \s*fi$
-\s*\(cd "\$extract_dir" && ar -x "\$archive"\)$
+\s*archive_dir=\$\(cd "\$\(dirname "\$archive"\)" && pwd -P\)$
+\s*archive_absolute="\$archive_dir/\$\(basename "\$archive"\)"$
+\s*case "\$archive_absolute" in
+[\s\S]*?^\s*esac$
+\s*if \[ ! -f "\$archive_absolute" \]; then$
+[\s\S]*?^\s*fi$
+\s*\(cd "\$extract_dir" && ar -x "\$archive_absolute"\)$
 \s*object_count=0$''',
         )
         self.assert_block(
@@ -426,7 +432,7 @@ class IosSharedValidateWorkflowTest(unittest.TestCase):
         validation_end = archive_run.index("esac", allocation)
         trap = archive_run.index("trap 'cleanup_extract_dir' EXIT HUP INT TERM")
         list_members = archive_run.index('ar -t "$archive"')
-        extract = archive_run.index('(cd "$extract_dir" && ar -x "$archive")')
+        extract = archive_run.index('(cd "$extract_dir" && ar -x "$archive_absolute")')
         cleanup = archive_run.index('rm -rf -- "$extract_dir"', extract)
         clear_trap = archive_run.index('trap - EXIT HUP INT TERM', cleanup)
         self.assertLess(allocation, trap)
@@ -435,6 +441,61 @@ class IosSharedValidateWorkflowTest(unittest.TestCase):
         self.assertLess(trap, extract)
         self.assertLess(extract, cleanup)
         self.assertLess(cleanup, clear_trap)
+
+    def test_archive_extraction_resolves_and_uses_a_validated_absolute_path(self):
+        """Extraction from its temp directory must not reuse a repository-relative path."""
+        archive_run = self.run_for("archive_validation")
+        extraction_block = re.search(
+            r'''^\s*archive_dir=\$\(cd "\$\(dirname "\$archive"\)" && pwd -P\)$
+\s*archive_absolute="\$archive_dir/\$\(basename "\$archive"\)"$
+\s*case "\$archive_absolute" in
+[\s\S]*?^\s*esac$
+\s*if \[ ! -f "\$archive_absolute" \]; then$
+[\s\S]*?^\s*fi$
+\s*\(cd "\$extract_dir" && ar -x "\$archive_absolute"\)$''',
+            archive_run,
+            re.MULTILINE,
+        )
+        if extraction_block is None:
+            self.fail("archive extraction does not resolve a validated absolute path")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            archive_path = temp_path / "build" / "RadioShakeShared"
+            archive_path.parent.mkdir()
+            archive_path.write_text("archive", encoding="utf-8")
+            extract_dir = temp_path / "extract"
+            extract_dir.mkdir()
+            invocation = temp_path / "ar-invocation.txt"
+            fake_ar = temp_path / "ar"
+            fake_ar.write_text(
+                '#!/bin/sh\nprintf "%s\\n" "$PWD" "$@" > "$TASK7_AR_INVOCATION"\n',
+                encoding="utf-8",
+            )
+            fake_ar.chmod(0o755)
+            result = subprocess.run(
+                [
+                    "bash",
+                    "-ceu",
+                    'archive="$1"\nextract_dir="$2"\n' + extraction_block.group(),
+                    "archive-extraction",
+                    str(archive_path.relative_to(temp_path)),
+                    str(extract_dir),
+                ],
+                cwd=temp_path,
+                env=os.environ | {
+                    "PATH": str(temp_path) + os.pathsep + os.environ["PATH"],
+                    "TASK7_AR_INVOCATION": str(invocation),
+                },
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(
+                invocation.read_text(encoding="utf-8").splitlines(),
+                [str(extract_dir), "-x", str(archive_path.resolve())],
+            )
 
     def test_archive_member_diagnostic_is_persisted_before_rejection(self):
         """A rejected archive member remains available in uploaded inspection evidence."""

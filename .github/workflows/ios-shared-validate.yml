@@ -177,7 +177,17 @@ jobs:
               echo "::error::Static archive contains an unsafe member name"
               exit 1
             fi
-            (cd "$extract_dir" && ar -x "$archive")
+            archive_dir=$(cd "$(dirname "$archive")" && pwd -P)
+            archive_absolute="$archive_dir/$(basename "$archive")"
+            case "$archive_absolute" in
+              /*) ;;
+              *) echo "::error::Static archive path is not absolute"; exit 1 ;;
+            esac
+            if [ ! -f "$archive_absolute" ]; then
+              echo "::error::Static archive path does not resolve to a file"
+              exit 1
+            fi
+            (cd "$extract_dir" && ar -x "$archive_absolute")
             object_count=0
             while IFS= read -r member; do
               case "$member" in
