@@ -246,15 +246,29 @@ class IosSharedValidateWorkflowTest(unittest.TestCase):
 \s*grep -oE 'RadioShakeDatabase\|FavouriteQueries\|StationQueries\|SongLogQueries' "\$HEADER" \| sort -u > "\$EVIDENCE_DIR/task7-generated-sqldelight-symbols\.txt" \|\| true$
 \s*if grep -Eq 'RadioShakeDatabase\|FavouriteQueries\|StationQueries\|SongLogQueries' "\$intended"; then$''',
         )
-        self.assert_block(
-            header_run,
-            r'''^\s*manifest_actual=\$\(mktemp "\$\{TMPDIR:-/tmp\}/task7-source-manifest\.XXXXXX"\)$
-\s*rg -l '\^\(public \)\?\(data class\|class\|interface\|object\|fun\|val\|expect \(class\|fun\|val\)\) ' \\
-[\s\S]*?shared/src/commonMain/kotlin/com/radioshake/shared/repository \| sort > "\$manifest_actual"$
-\s*if \[ "\$\(wc -l < "\$manifest_actual" \| tr -d ' '\)" -ne 29 \]; then$
-[\s\S]*?^\s*fi$
-\s*if ! diff -u docs/ios/swift-export-source-manifest\.txt "\$manifest_actual"; then$''',
-        )
+        manifest_start = header_run.index('manifest_actual=$(mktemp')
+        manifest_end = header_run.index('if ! diff -u', manifest_start)
+        manifest_run = header_run[manifest_start:manifest_end]
+        self.assertNotIn("rg ", manifest_run)
+        self.assertIn("find \\", manifest_run)
+        self.assertIn("-type f", manifest_run)
+        self.assertIn("-exec grep -El", manifest_run)
+        self.assertIn("| sort > \"$manifest_actual\"", manifest_run)
+        for source_dir in (
+            "network",
+            "database",
+            "domain",
+            "moderation",
+            "recognition",
+            "platform",
+            "repository",
+        ):
+            self.assertIn(
+                "shared/src/commonMain/kotlin/com/radioshake/shared/" + source_dir,
+                manifest_run,
+            )
+        self.assertIn('"$(wc -l < "$manifest_actual" | tr -d \' \')" -ne 29', manifest_run)
+        self.assertIn('if ! diff -u docs/ios/swift-export-source-manifest.txt "$manifest_actual"', header_run)
         self.assert_block(
             swift_run,
             r'''^\s*contract=docs/ios/shared-framework-contract\.md$
@@ -280,6 +294,56 @@ class IosSharedValidateWorkflowTest(unittest.TestCase):
         )
         self.assertIn("xcrun simctl list runtimes available", toolchain_run)
         self.assertIn("iosSimulatorArm64ReleasePolicyTest", self.run_for("gradle_evidence"))
+
+    def test_source_manifest_uses_portable_discovery_and_filtering_without_rg(self):
+        """The source-derived manifest must run with only macOS-standard find, grep, and sort."""
+        header_run = self.run_for("header_audit")
+        manifest_block = re.search(
+            r'''^\s*manifest_actual=\$\(mktemp "\$\{TMPDIR:-/tmp\}/task7-source-manifest\.XXXXXX"\)$
+[\s\S]*?^\s*if \[ "\$\(wc -l < "\$manifest_actual" \| tr -d ' '\)" -ne 29 \]; then$''',
+            header_run,
+            re.MULTILINE,
+        )
+        if manifest_block is None:
+            self.fail("source manifest derivation block was not found")
+        self.assertNotIn("rg ", manifest_block.group())
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source_root = Path(temp_dir)
+            files = {
+                "network/Public.kt": "public class NetworkExport\n",
+                "database/Implicit.kt": "class DatabaseExport\n",
+                "domain/Data.kt": "data class DomainExport(val id: Int)\n",
+                "moderation/Object.kt": "object ModerationExport\n",
+                "recognition/Fun.kt": "fun recognitionExport() = Unit\n",
+                "platform/Val.kt": "val platformExport = 1\n",
+                "repository/Expect.kt": "expect class RepositoryExport\n",
+                "domain/NonKotlinSource.txt": "public class TextExport\n",
+                "network/Private.kt": "private class NotExported\n",
+                "database/Comment.kt": "// public class NotExported\n",
+            }
+            expected_paths = []
+            for relative_path, contents in files.items():
+                path = source_root / "shared/src/commonMain/kotlin/com/radioshake/shared" / relative_path
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(contents, encoding="utf-8")
+                if "NotExported" not in contents:
+                    expected_paths.append(str(path.relative_to(source_root)))
+
+            result = subprocess.run(
+                ["bash", "-ceu", manifest_block.group().rsplit("\n", 1)[0]],
+                cwd=source_root,
+                env=os.environ | {"PATH": "/usr/bin:/bin", "TMPDIR": temp_dir},
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            manifest_path = next(source_root.glob("task7-source-manifest.*"))
+            self.assertEqual(
+                manifest_path.read_text(encoding="utf-8").splitlines(),
+                sorted(expected_paths),
+            )
 
     def test_release_followups_are_always_gated_by_prior_simulator_outcomes(self):
         """Release, SDK, and regression steps must retain their explicit outcome dependencies."""

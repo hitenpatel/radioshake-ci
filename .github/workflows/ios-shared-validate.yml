@@ -263,14 +263,17 @@ jobs:
             exit 1
           fi
           manifest_actual=$(mktemp "${TMPDIR:-/tmp}/task7-source-manifest.XXXXXX")
-          rg -l '^(public )?(data class|class|interface|object|fun|val|expect (class|fun|val)) ' \
+          find \
             shared/src/commonMain/kotlin/com/radioshake/shared/network \
             shared/src/commonMain/kotlin/com/radioshake/shared/database \
             shared/src/commonMain/kotlin/com/radioshake/shared/domain \
             shared/src/commonMain/kotlin/com/radioshake/shared/moderation \
             shared/src/commonMain/kotlin/com/radioshake/shared/recognition \
             shared/src/commonMain/kotlin/com/radioshake/shared/platform \
-            shared/src/commonMain/kotlin/com/radioshake/shared/repository | sort > "$manifest_actual"
+            shared/src/commonMain/kotlin/com/radioshake/shared/repository \
+            -type f \
+            -exec grep -El '^(public )?(data class|class|interface|object|fun|val|expect (class|fun|val)) ' {} + \
+            | sort > "$manifest_actual"
           if [ "$(wc -l < "$manifest_actual" | tr -d ' ')" -ne 29 ]; then
             echo "::error::Source export manifest command no longer yields 29 paths"
             rm -f -- "$manifest_actual"
