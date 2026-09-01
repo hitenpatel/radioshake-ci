@@ -301,7 +301,7 @@ jobs:
             -project RadioShake.xcodeproj \
             -scheme RadioShake \
             -configuration Debug \
-            -destination 'platform=iOS Simulator,OS=latest,name=iPhone 15' \
+            -destination 'platform=iOS Simulator,OS=latest,name=iPhone 17' \
             -derivedDataPath /tmp/derived-data \
             -resultBundlePath /tmp/ios-app-build.xcresult \
             CODE_SIGNING_ALLOWED=NO
@@ -327,7 +327,7 @@ jobs:
             -project RadioShake.xcodeproj \
             -scheme RadioShake \
             -configuration Debug \
-            -destination 'platform=iOS Simulator,OS=latest,name=iPhone 15' \
+            -destination 'platform=iOS Simulator,OS=latest,name=iPhone 17' \
             -derivedDataPath /tmp/derived-data \
             -resultBundlePath /tmp/ios-app-test.xcresult \
             CODE_SIGNING_ALLOWED=NO
