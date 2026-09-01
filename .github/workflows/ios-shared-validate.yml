@@ -158,8 +158,11 @@ jobs:
           for bin in $BINARIES; do
             FILE_INFO=$(file "$bin")
             echo "$FILE_INFO"
-            if ! echo "$FILE_INFO" | grep -q "Mach-O"; then
-              echo "::error::$bin is not a Mach-O binary"
+            # Static frameworks (isStatic = true) produce ar archives, not Mach-O.
+            # XCFramework aggregation from Kotlin 2.1 may report per-target binaries
+            # in either form. Accept both.
+            if ! echo "$FILE_INFO" | grep -qE "Mach-O|current ar archive|Mach-O universal"; then
+              echo "::error::$bin is neither Mach-O nor a static archive"
               exit 1
             fi
           done
