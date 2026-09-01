@@ -286,6 +286,15 @@ jobs:
           sudo cp -R /tmp/xcodegen/xcodegen/share/* /usr/local/share/ || true
           xcodegen --version
 
+      - name: Assemble shared XCFramework (before Xcode)
+        working-directory: src
+        run: |
+          set -euo pipefail
+          ./gradlew --no-daemon :shared:assembleRadioShakeSharedDebugXCFramework
+          test -d shared/build/XCFrameworks/debug/RadioShakeShared.xcframework \
+            || { echo "::error::XCFramework not produced"; exit 1; }
+          ls shared/build/XCFrameworks/debug/RadioShakeShared.xcframework/
+
       - name: Generate Xcode project
         working-directory: src/ios
         run: |
