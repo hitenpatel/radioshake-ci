@@ -315,16 +315,27 @@ jobs:
             -resultBundlePath /tmp/ios-app-build.xcresult \
             CODE_SIGNING_ALLOWED=NO
 
-      - name: Verify app is unsigned
+      - name: Verify app has no distribution signature
         run: |
           set -euo pipefail
           APP="/tmp/derived-data/Build/Products/Debug-iphonesimulator/RadioShake.app"
           test -d "$APP" || { echo "::error::app not found at $APP"; exit 1; }
-          if codesign -dv "$APP" 2>&1 | grep -q "code object is not signed"; then
-            echo "OK unsigned"
+          OUT=$(codesign -dv "$APP" 2>&1 || true)
+          echo "$OUT"
+          # Xcode 26 on Apple Silicon simulator adds an adhoc/linker-signed
+          # signature to every binary — this counts as unsigned for our
+          # purposes. The real invariant AC #5 protects is: no developer
+          # team identifier + no distribution signature.
+          if echo "$OUT" | grep -q "TeamIdentifier=not set" \
+             && ! echo "$OUT" | grep -q "^Authority="; then
+            if echo "$OUT" | grep -qE "code object is not signed|Signature=adhoc"; then
+              echo "OK — no team, no distribution signature"
+            else
+              echo "::error::signature is neither absent nor adhoc"
+              exit 1
+            fi
           else
-            codesign -dv "$APP" 2>&1
-            echo "::error::app should be unsigned but codesign reports otherwise"
+            echo "::error::app carries a team identifier or authority (distribution signature)"
             exit 1
           fi
 
