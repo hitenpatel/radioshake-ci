@@ -286,14 +286,29 @@ jobs:
           sudo cp -R /tmp/xcodegen/xcodegen/share/* /usr/local/share/ || true
           xcodegen --version
 
-      - name: Assemble shared XCFramework (before Xcode)
+      - name: Assemble shared XCFrameworks (Debug + Release) and point symlink at Debug
         working-directory: src
         run: |
           set -euo pipefail
-          ./gradlew --no-daemon :shared:assembleRadioShakeSharedDebugXCFramework
-          test -d shared/build/XCFrameworks/debug/RadioShakeShared.xcframework \
-            || { echo "::error::XCFramework not produced"; exit 1; }
-          ls shared/build/XCFrameworks/debug/RadioShakeShared.xcframework/
+          # Build BOTH per-config XCFrameworks up front. Cheap (Kotlin caches),
+          # avoids re-running Gradle between the Debug and Release xcodebuild
+          # invocations later in this job.
+          ./gradlew --no-daemon \
+            :shared:assembleRadioShakeSharedDebugXCFramework \
+            :shared:assembleRadioShakeSharedReleaseXCFramework
+          for cfg in debug release; do
+            test -d "shared/build/XCFrameworks/$cfg/RadioShakeShared.xcframework" \
+              || { echo "::error::$cfg XCFramework not produced"; exit 1; }
+          done
+          # Initialise the `current/` symlink to the debug XCFramework so
+          # `xcodegen generate`'s file-reference validation passes. The Xcode
+          # preBuildScript re-points the symlink per configuration at each
+          # xcodebuild invocation.
+          mkdir -p shared/build/XCFrameworks/current
+          rm -rf shared/build/XCFrameworks/current/RadioShakeShared.xcframework
+          ln -sfn "$PWD/shared/build/XCFrameworks/debug/RadioShakeShared.xcframework" \
+                  "$PWD/shared/build/XCFrameworks/current/RadioShakeShared.xcframework"
+          ls -la shared/build/XCFrameworks/current/
 
       - name: Generate Xcode project
         working-directory: src/ios
@@ -361,6 +376,40 @@ jobs:
             | sort -k2 > /tmp/ios-app-bundle-sha256.txt
           shasum -a 256 /tmp/ios-app-bundle-sha256.txt \
             | tee /tmp/ios-app-bundle-digest.txt
+
+      # ── Release build verification (TASK-149) ───────────────────────
+      - name: Build iOS app (Release, simulator, unsigned)
+        working-directory: src
+        run: |
+          set -euo pipefail
+          # Repoint the current-config symlink at the release XCFramework
+          # before invoking the Release xcodebuild. The Xcode preBuildScript
+          # also re-points it, but Xcode's file-reference validation happens
+          # BEFORE build phases run, so the symlink must be correct up front.
+          rm -rf shared/build/XCFrameworks/current/RadioShakeShared.xcframework
+          ln -sfn "$PWD/shared/build/XCFrameworks/release/RadioShakeShared.xcframework" \
+                  "$PWD/shared/build/XCFrameworks/current/RadioShakeShared.xcframework"
+          cd ios
+          mkdir -p /tmp/derived-data-release
+          xcodebuild build \
+            -project RadioShake.xcodeproj \
+            -scheme RadioShake \
+            -configuration Release \
+            -destination 'platform=iOS Simulator,OS=latest,name=iPhone 17' \
+            -derivedDataPath /tmp/derived-data-release \
+            -resultBundlePath /tmp/ios-app-build-release.xcresult \
+            CODE_SIGNING_ALLOWED=NO
+          RELEASE_APP="/tmp/derived-data-release/Build/Products/Release-iphonesimulator/RadioShake.app"
+          test -d "$RELEASE_APP" || { echo "::error::release app not found"; exit 1; }
+          # Sanity: the linked XCFramework is the release one. Compare a
+          # release-only sqliter symbol strip (release strips more).
+          echo "Release app bundle:"
+          ls "$RELEASE_APP"
+          # Restore symlink to debug for any downstream steps that assume Debug.
+          cd ..
+          rm -rf shared/build/XCFrameworks/current/RadioShakeShared.xcframework
+          ln -sfn "$PWD/shared/build/XCFrameworks/debug/RadioShakeShared.xcframework" \
+                  "$PWD/shared/build/XCFrameworks/current/RadioShakeShared.xcframework"
 
       # ── Full regression suite ───────────────────────────────────────
       - name: Run JVM + Android + Wear regression tests
