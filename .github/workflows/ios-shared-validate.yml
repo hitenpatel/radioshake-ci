@@ -391,6 +391,10 @@ jobs:
                   "$PWD/shared/build/XCFrameworks/current/RadioShakeShared.xcframework"
           cd ios
           mkdir -p /tmp/derived-data-release
+          # ARCHS=arm64 + ONLY_ACTIVE_ARCH=YES restrict Release simulator build
+          # to arm64. Kotlin XCFramework only ships iosSimulatorArm64 (no
+          # x86_64 slice), so x86_64 linkage fails with "symbols not found".
+          # This is fine — Apple Silicon macOS is the only supported runner.
           xcodebuild build \
             -project RadioShake.xcodeproj \
             -scheme RadioShake \
@@ -398,6 +402,9 @@ jobs:
             -destination 'platform=iOS Simulator,OS=latest,name=iPhone 17' \
             -derivedDataPath /tmp/derived-data-release \
             -resultBundlePath /tmp/ios-app-build-release.xcresult \
+            ARCHS=arm64 \
+            ONLY_ACTIVE_ARCH=YES \
+            EXCLUDED_ARCHS=x86_64 \
             CODE_SIGNING_ALLOWED=NO
           RELEASE_APP="/tmp/derived-data-release/Build/Products/Release-iphonesimulator/RadioShake.app"
           test -d "$RELEASE_APP" || { echo "::error::release app not found"; exit 1; }
