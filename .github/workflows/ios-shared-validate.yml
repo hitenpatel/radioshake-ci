@@ -38,7 +38,7 @@ env:
   # Deny-list: source-owned symbols that must NOT appear in the framework header
   HEADER_DENY: 'RadioBrowserApiService|ShazamApiService|StationDto|DatabaseDriverFactory|FavouriteRepository|StationRepository|SongLogRepository'
   # Allow-list: intended Swift-facing symbols that MUST appear
-  HEADER_ALLOW: 'IosSharedFacade|IosStation|IosCancellation|IosErrorCode'
+  HEADER_ALLOW: 'IosSharedFacade|IosStation|IosCancellation|IosErrorCode|IosSharedFacadeTestFactory'
 
 jobs:
   validate:
@@ -418,21 +418,24 @@ jobs:
           ln -sfn "$PWD/shared/build/XCFrameworks/debug/RadioShakeShared.xcframework" \
                   "$PWD/shared/build/XCFrameworks/current/RadioShakeShared.xcframework"
 
-      - name: Audit Release binary for debug-only symbols (TASK-136)
+      - name: Audit Release binary for debug-only symbols (TASK-136 + TASK-137)
         run: |
           set -euo pipefail
           APP="/tmp/derived-data-release/Build/Products/Release-iphonesimulator/RadioShake.app"
           test -d "$APP" || { echo "::error::release app not found"; exit 1; }
-          # Capture strings to a file first — piping into `grep -q` under
-          # `set -o pipefail` produces a false negative on SIGPIPE.
           strings "$APP/RadioShake" > /tmp/release-strings.txt
-          DENY='ui-test-reset-onboarding|ui-test-skip-onboarding|resetOnboardingForTesting|setCompletedForTesting|LaunchArguments|applyForTesting'
+          DENY='ui-test-reset-onboarding|ui-test-skip-onboarding|resetOnboardingForTesting|setCompletedForTesting|LaunchArguments|applyForTesting|ui-test-fixture-endpoints|ui-test-fake-player|FixtureURLProtocol|FixtureRouteTable|FixtureBundle|FakePlayerEngine|useFakeNetworkForTesting|usePlayerModeForTesting|IosSharedFacadeTestFactory|PlayerModeMarker|player-mode-marker'
           if grep -qE "$DENY" /tmp/release-strings.txt; then
-            echo "::error::Release binary contains debug-only launch-argument symbols:"
+            echo "::error::Release binary contains debug-only symbols:"
             grep -E "$DENY" /tmp/release-strings.txt
             exit 1
           fi
-          echo "OK — no debug-only launch-argument symbols in Release binary"
+          if find "$APP" \( -path '*Fixtures/*' -o -name 'top-stations-*.json' -o -name 'search-*.json' -o -name 'FixtureURLProtocol*' -o -name 'FakePlayerEngine*' \) | grep -q .; then
+            echo "::error::Release .app bundle contains test-only fixture files:"
+            find "$APP" \( -path '*Fixtures/*' -o -name 'top-stations-*.json' -o -name 'search-*.json' -o -name 'FixtureURLProtocol*' -o -name 'FakePlayerEngine*' \)
+            exit 1
+          fi
+          echo "OK — no debug-only symbols and no fixture files in Release binary/bundle"
 
       # ── Full regression suite ───────────────────────────────────────
       - name: Run JVM + Android + Wear regression tests
