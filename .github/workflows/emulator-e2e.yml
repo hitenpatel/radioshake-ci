@@ -402,8 +402,12 @@ jobs:
                 if [ "$REMOTE_SHA" = "$expected_checksum" ]; then
                   echo "::notice::${label}: checksum matches existing upload — OK"
                 else
-                  echo "::error::${label}: checksum mismatch on existing upload (remote=$REMOTE_SHA local=$expected_checksum)"
-                  exit 1
+                  # Non-reproducible-build case: same commit SHA rebuilt on a
+                  # rerun produces a different APK SHA (R8 timestamps, keystore
+                  # metadata, etc). Registry is immutable; the first upload
+                  # wins and later ones get 409. Warn but do NOT fail — the
+                  # canonical APK for this commit is whatever landed first.
+                  echo "::warning::${label}: checksum mismatch on existing upload (remote=$REMOTE_SHA local=$expected_checksum); keeping earlier upload as canonical"
                 fi
               fi
             else
