@@ -42,13 +42,17 @@ env:
 
 jobs:
   validate:
-    # GitHub-hosted macOS Apple Silicon runner
-    runs-on: macos-latest
-    timeout-minutes: 45
+    # TASK-141 AC #3: pin the runner image explicitly so Xcode / SDK / arch
+    # cannot silently drift. macos-26 = Apple Silicon (arm64) image.
+    runs-on: macos-26
+    timeout-minutes: 60
+    outputs:
+      head_sha: ${{ steps.clone.outputs.head_sha }}
 
     steps:
       # ── Clone source from private Forgejo host ──────────────────────
       - name: Clone source from private host
+        id: clone
         env:
           HOST: ${{ secrets.FORGEJO_HOST }}
           TOKEN: ${{ secrets.FORGEJO_CLONE_TOKEN }}
@@ -474,38 +478,6 @@ jobs:
           echo "=== Test Reports ==="
           find shared/build/reports -name '*.xml' -o -name '*.html' 2>/dev/null | head -20 || echo "(none)"
 
-      - name: Post status to Forgejo
-        if: always()
-        env:
-          HOST: ${{ secrets.FORGEJO_HOST }}
-          STATUS_TOKEN: ${{ secrets.FORGEJO_STATUS_TOKEN }}
-          HEAD_SHA: ${{ steps.clone.outputs.head_sha || '' }}
-          RESULT: ${{ job.status }}
-        run: |
-          set -eu
-          echo "::add-mask::$STATUS_TOKEN"
-          echo "::add-mask::$HOST"
-
-          # Derive SHA from src if output was missed
-          if [ -z "$HEAD_SHA" ]; then
-            HEAD_SHA=$(git -C src rev-parse HEAD 2>/dev/null || echo "")
-          fi
-          if [ -z "$HEAD_SHA" ]; then
-            echo "::warning::No HEAD SHA available for status callback"
-            exit 0
-          fi
-
-          STATE="success"
-          if [ "$RESULT" != "success" ]; then STATE="failure"; fi
-
-          curl --fail-with-body -sS \
-            -X POST \
-            -H "Authorization: token $STATUS_TOKEN" \
-            -H "Content-Type: application/json" \
-            "https://${HOST}/api/v1/repos/hiten/RadioShake/statuses/${HEAD_SHA}" \
-            -d "{\"state\":\"${STATE}\",\"target_url\":\"${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}\",\"description\":\"iOS shared framework validation\",\"context\":\"github/ios-validate\"}" \
-          || echo "::warning::Failed to post status to Forgejo"
-
       - name: Upload artifacts
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
@@ -521,3 +493,46 @@ jobs:
             /tmp/ios-app-bundle-sha256.txt
             /tmp/ios-app-bundle-digest.txt
           # NEVER upload source, local.properties, or gradle caches
+
+  # TASK-141 AC #6: the Forgejo status callback is a separate job that
+  # needs `validate`. It runs only after the whole job — including the
+  # artifact upload — has finished, so an upload failure flips
+  # needs.validate.result to failure and Forgejo sees red. When the
+  # callback was the penultimate step inside `validate`, a later
+  # artifact-upload failure could never influence the posted state.
+  report-status:
+    needs: validate
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Post status to Forgejo
+        env:
+          HOST: ${{ secrets.FORGEJO_HOST }}
+          STATUS_TOKEN: ${{ secrets.FORGEJO_STATUS_TOKEN }}
+          HEAD_SHA: ${{ needs.validate.outputs.head_sha || github.event.client_payload.sha || inputs.sha || '' }}
+          RESULT: ${{ needs.validate.result }}
+        run: |
+          set -eu
+          echo "::add-mask::$STATUS_TOKEN"
+          echo "::add-mask::$HOST"
+
+          if [ -z "$HEAD_SHA" ]; then
+            echo "::warning::No HEAD SHA available for status callback"
+            exit 0
+          fi
+
+          # needs.validate.result is success|failure|cancelled|skipped.
+          # Anything other than success is a red gate — an all-skipped
+          # or cancelled run is not a green run.
+          STATE="failure"
+          if [ "$RESULT" = "success" ]; then STATE="success"; fi
+
+          curl --fail-with-body -sS \
+            -X POST \
+            -H "Authorization: token $STATUS_TOKEN" \
+            -H "Content-Type: application/json" \
+            "https://${HOST}/api/v1/repos/hiten/RadioShake/statuses/${HEAD_SHA}" \
+            -d "{\"state\":\"${STATE}\",\"target_url\":\"${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}\",\"description\":\"iOS shared framework validation (job=${RESULT})\",\"context\":\"github/ios-validate\"}" \
+          || echo "::warning::Failed to post status to Forgejo"
