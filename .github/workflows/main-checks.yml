@@ -7,7 +7,8 @@ name: main-checks (unit tests + lint + Go)
 #      Forgejo commit.
 #   2. workflow_dispatch with an optional `sha` input — for manual verification
 #      without firing the full 150-min emulator suite (which a real repository_dispatch
-#      would also trigger). Leave sha empty to clone main HEAD.
+#      would also trigger). Leave sha empty to clone main HEAD. An optional `ref`
+#      input lets a manual run clone a non-main Forgejo branch instead.
 
 on:
   repository_dispatch:
@@ -20,6 +21,11 @@ on:
           Forgejo commit SHA to clone and test.
           Leave empty to clone main HEAD (no sha verification).
         default: ''
+      ref:
+        description: >-
+          Forgejo branch to clone (manual runs only). Defaults to main. Use for
+          canary branches that must prove the gate goes red without touching main.
+        default: 'main'
 
 permissions:
   contents: read
@@ -43,12 +49,13 @@ jobs:
           HOST: ${{ secrets.FORGEJO_HOST }}
           TOKEN: ${{ secrets.FORGEJO_CLONE_TOKEN }}
           WANTED_SHA: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.sha || inputs.sha }}
+          REF: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || 'main' }}
         run: |
           set -eu
           AUTH=$(printf 'oauth2:%s' "$TOKEN" | base64 -w0)
           echo "::add-mask::$AUTH"
           git -c http.extraheader="AUTHORIZATION: basic $AUTH" \
-            clone --depth 1 --branch main "https://${HOST}/hiten/RadioShake.git" src
+            clone --depth 1 --branch "${REF:-main}" "https://${HOST}/hiten/RadioShake.git" src
           ACTUAL_SHA=$(git -C src rev-parse HEAD)
           # For repository_dispatch (or a manual dispatch with sha set): verify HEAD is
           # the requested sha. Fail hard if not — do not test a stale commit.
