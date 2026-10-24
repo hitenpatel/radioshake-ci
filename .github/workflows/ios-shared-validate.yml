@@ -38,7 +38,7 @@ env:
   # Deny-list: source-owned symbols that must NOT appear in the framework header
   HEADER_DENY: 'RadioBrowserApiService|ShazamApiService|StationDto|DatabaseDriverFactory|FavouriteRepository|StationRepository|SongLogRepository'
   # Allow-list: intended Swift-facing symbols that MUST appear
-  HEADER_ALLOW: 'IosSharedFacade|IosStation|IosCancellation|IosErrorCode|IosSharedFacadeTestFactory'
+  HEADER_ALLOW: 'IosSharedFacade|IosStation|IosCancellation|IosErrorCode|IosSharedFacadeTestFactory|IosRegionStatus|IosRegionKind'
 
 jobs:
   validate:
@@ -80,6 +80,13 @@ jobs:
             echo "::error::HEAD $HEAD_SHA does not match expected $EXPECTED_SHA"
             exit 1
           fi
+
+      - name: Region tables are generated from pinned inputs
+        working-directory: src
+        run: |
+          set -euo pipefail
+          python3 -m unittest scripts/test_gen_region_tables.py scripts/test_check_xcstrings.py
+          python3 scripts/gen_region_tables.py --check
 
       # ── macOS preflight ─────────────────────────────────────────────
       - name: macOS preflight
@@ -183,7 +190,7 @@ jobs:
           echo ""
           echo "=== Allow-list check ==="
           ALLOW_FAIL=0
-          for sym in IosSharedFacade IosStation IosCancellation IosErrorCode; do
+          for sym in IosSharedFacade IosStation IosCancellation IosErrorCode IosRegionStatus IosRegionKind; do
             if grep -q "$sym" "$HEADER"; then
               echo "✓ $sym present"
             else
@@ -195,7 +202,7 @@ jobs:
           echo ""
           echo "=== Deny-list check ==="
           DENY_FAIL=0
-          for sym in RadioBrowserApiService ShazamApiService StationDto DatabaseDriverFactory FavouriteRepository StationRepository SongLogRepository; do
+          for sym in RadioBrowserApiService ShazamApiService StationDto DatabaseDriverFactory FavouriteRepository StationRepository SongLogRepository IosRegionResolver; do
             if grep -q "$sym" "$HEADER"; then
               echo "✗ $sym LEAKED into header"
               DENY_FAIL=1
@@ -334,6 +341,20 @@ jobs:
             -resultBundlePath /tmp/ios-app-build.xcresult \
             CODE_SIGNING_ALLOWED=NO
 
+      - name: String Catalog covers every source string and is fully translated
+        working-directory: src/ios
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/xcloc
+          xcodebuild -exportLocalizations \
+            -project RadioShake.xcodeproj \
+            -localizationPath /tmp/xcloc \
+            -exportLanguage de \
+            CODE_SIGNING_ALLOWED=NO
+          XLIFF=$(find /tmp/xcloc -name 'de.xliff' | head -1)
+          test -n "$XLIFF" || { echo "::error::no de.xliff exported"; exit 1; }
+          python3 ../scripts/check_xcstrings.py App/Localizable.xcstrings --xliff "$XLIFF"
+
       - name: Verify app has no distribution signature
         run: |
           set -euo pipefail
@@ -433,7 +454,7 @@ jobs:
           # It's on HEADER_ALLOW instead of DENY — the invariant is that
           # NO SWIFT CALLER references it in Release (all call sites are
           # inside #if DEBUG blocks in SharedContext.makeForTesting).
-          DENY='ui-test-reset-onboarding|ui-test-skip-onboarding|resetOnboardingForTesting|setCompletedForTesting|LaunchArguments|applyForTesting|ui-test-fixture-endpoints|ui-test-fake-player|FixtureURLProtocol|FixtureRouteTable|FixtureBundle|FakePlayerEngine|useFakeNetworkForTesting|usePlayerModeForTesting|PlayerModeMarker|player-mode-marker'
+          DENY='ui-test-reset-onboarding|ui-test-skip-onboarding|resetOnboardingForTesting|setCompletedForTesting|LaunchArguments|applyForTesting|ui-test-fixture-endpoints|ui-test-fake-player|FixtureURLProtocol|FixtureRouteTable|FixtureBundle|FakePlayerEngine|useFakeNetworkForTesting|usePlayerModeForTesting|PlayerModeMarker|player-mode-marker|RegionForceDetection|RegionDebugOverride'
           if grep -qE "$DENY" /tmp/release-strings.txt; then
             echo "::error::Release binary contains debug-only symbols:"
             grep -E "$DENY" /tmp/release-strings.txt
