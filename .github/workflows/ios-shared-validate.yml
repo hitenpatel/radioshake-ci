@@ -85,8 +85,8 @@ jobs:
         working-directory: src
         run: |
           set -euo pipefail
-          python3 -m unittest scripts/test_gen_region_tables.py scripts/test_check_xcstrings.py
           python3 scripts/gen_region_tables.py --check
+          python3 -m unittest scripts/test_gen_region_tables.py scripts/test_check_xcstrings.py
 
       # ── macOS preflight ─────────────────────────────────────────────
       - name: macOS preflight
