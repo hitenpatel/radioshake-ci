@@ -587,6 +587,13 @@ jobs:
             :shared:testReleaseUnitTest \
             :app:testDebugUnitTest \
             :wear:testDebugUnitTest
+          # Phase 1a: SQLDelight migrations must reproduce the latest schema
+          # (task exists only on commits with migration support).
+          if ./gradlew --no-daemon -q :shared:tasks --all | grep -q '^verifyCommonMainRadioShakeDatabaseMigration'; then
+            ./gradlew --no-daemon :shared:verifyCommonMainRadioShakeDatabaseMigration
+          else
+            echo "No SQLDelight migration verification task on this commit"
+          fi
 
       # ── Record evidence ─────────────────────────────────────────────
       - name: Record validation evidence
