@@ -563,7 +563,7 @@ jobs:
           # It's on HEADER_ALLOW instead of DENY — the invariant is that
           # NO SWIFT CALLER references it in Release (all call sites are
           # inside #if DEBUG blocks in SharedContext.makeForTesting).
-          DENY='ui-test-reset-onboarding|ui-test-skip-onboarding|resetOnboardingForTesting|setCompletedForTesting|LaunchArguments|applyForTesting|ui-test-fixture-endpoints|ui-test-fake-player|FixtureURLProtocol|FixtureRouteTable|FixtureBundle|FakePlayerEngine|useFakeNetworkForTesting|usePlayerModeForTesting|PlayerModeMarker|player-mode-marker|RegionForceDetection|RegionDebugOverride'
+          DENY='ui-test-reset-onboarding|ui-test-skip-onboarding|resetOnboardingForTesting|setCompletedForTesting|LaunchArguments|applyForTesting|ui-test-fixture-endpoints|ui-test-fake-player|FixtureURLProtocol|FixtureRouteTable|FixtureBundle|FakePlayerEngine|useFakeNetworkForTesting|usePlayerModeForTesting|PlayerModeMarker|player-mode-marker|RegionForceDetection|RegionDebugOverride|uiTestDatabaseName|RSForceColorScheme|RSDisableAnimations'
           if grep -qE "$DENY" /tmp/release-strings.txt; then
             echo "::error::Release binary contains debug-only symbols:"
             grep -E "$DENY" /tmp/release-strings.txt
