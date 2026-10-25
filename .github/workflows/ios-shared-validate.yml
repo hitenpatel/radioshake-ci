@@ -329,7 +329,7 @@ jobs:
               init(databasePath: String) {
                   shared = IosSharedFacade(baseUrl: "https://de1.api.radio-browser.info",
                       databasePath: databasePath, destructiveRecoveryEnabled: false)
-                  favourites = shared.observeFavourites { [weak self] in self?.stations = $0 }
+                  favourites = shared.observeFavourites(sort: .added) { [weak self] snapshot in self?.stations = snapshot.stations }
               }
               func search(_ query: String) {
                   search?.cancel()
@@ -587,12 +587,19 @@ jobs:
             :shared:testReleaseUnitTest \
             :app:testDebugUnitTest \
             :wear:testDebugUnitTest
-          # Phase 1a: SQLDelight migrations must reproduce the latest schema
-          # (task exists only on commits with migration support).
-          if ./gradlew --no-daemon -q :shared:tasks --all | grep -q '^verifyCommonMainRadioShakeDatabaseMigration'; then
+          # Phase 1a: SQLDelight migrations must reproduce the latest schema.
+          # Decided by the presence of the first migration file, never by grepping
+          # the task list alone: a missing task or a failing `tasks` run is an error.
+          set -euo pipefail
+          if [ -f shared/src/commonMain/sqldelight/com/radioshake/shared/db/1.sqm ]; then
+            ./gradlew --no-daemon -q :shared:tasks --all > /tmp/shared-tasks.txt
+            grep -q '^verifyCommonMainRadioShakeDatabaseMigration' /tmp/shared-tasks.txt || {
+              echo "::error::1.sqm exists but verifyCommonMainRadioShakeDatabaseMigration task not found"
+              exit 1
+            }
             ./gradlew --no-daemon :shared:verifyCommonMainRadioShakeDatabaseMigration
           else
-            echo "No SQLDelight migration verification task on this commit"
+            echo "No SQLDelight migrations on this commit (1.sqm absent); skipping verification"
           fi
 
       # ── Record evidence ─────────────────────────────────────────────
