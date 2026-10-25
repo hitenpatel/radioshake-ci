@@ -613,7 +613,7 @@ jobs:
           FORGEJO_CLONE_TOKEN: ${{ secrets.FORGEJO_CLONE_TOKEN }}
           FORGEJO_STATUS_TOKEN: ${{ secrets.FORGEJO_STATUS_TOKEN }}
         run: |
-          set -uo pipefail
+          set +e -u -o pipefail
           LEAKED=0
           SCANNED=0
           while IFS= read -r p; do
