@@ -35,6 +35,12 @@ permissions:
   contents: read
 
 env:
+  # TASK-141 AC #3: toolchain pinned to exact values present on the macos-26
+  # image (20261021.x: Xcode 26.6, iOS 26.5 simulator runtime). The preflight
+  # step fails loudly if either disappears, so image drift is a visible
+  # red run instead of a silent toolchain change.
+  XCODE_APP: /Applications/Xcode_26.6.app
+  SIM_OS: '26.5'
   # Deny-list: source-owned symbols that must NOT appear in the framework header
   HEADER_DENY: 'RadioBrowserApiService|ShazamApiService|StationDto|DatabaseDriverFactory|FavouriteRepository|StationRepository|SongLogRepository'
   # Allow-list: intended Swift-facing symbols that MUST appear
@@ -46,6 +52,22 @@ jobs:
     # cannot silently drift. macos-26 = Apple Silicon (arm64) image.
     runs-on: macos-26
     timeout-minutes: 60
+    env:
+      # Single source of truth for what gets uploaded: the secret scan and
+      # the upload step both read this list, so they cannot drift apart.
+      EVIDENCE_PATHS: |
+        /tmp/RadioShakeShared-header.h
+        /tmp/Task7FacadeSmoke.swift
+        src/shared/build/reports/
+        src/shared/build/test-results/
+        /tmp/ios-logs/
+        /tmp/ios-app-build.xcresult
+        /tmp/ios-app-test.xcresult
+        /tmp/ios-app-build-release.xcresult
+        /tmp/ios-app-bundle-sha256.txt
+        /tmp/ios-app-bundle-digest.txt
+        /tmp/ios-app-release-bundle-sha256.txt
+        /tmp/ios-app-release-bundle-digest.txt
     outputs:
       head_sha: ${{ steps.clone.outputs.head_sha }}
 
@@ -68,18 +90,55 @@ jobs:
           git -c http.extraheader="AUTHORIZATION: basic $AUTH" \
             clone --depth 1 --branch "$REF" "https://${HOST}/hiten/RadioShake.git" src
 
-          HEAD_SHA=$(git -C src rev-parse HEAD)
-          echo "head_sha=$HEAD_SHA" >> "$GITHUB_OUTPUT"
-          echo "Cloned $REF at $HEAD_SHA"
-
           # Verify auth was not persisted
-          ! grep -rq "AUTHORIZATION" src/.git/config
-
-          # Optional SHA check
-          if [ -n "$EXPECTED_SHA" ] && [ "$HEAD_SHA" != "$EXPECTED_SHA" ]; then
-            echo "::error::HEAD $HEAD_SHA does not match expected $EXPECTED_SHA"
+          if grep -rq "AUTHORIZATION" src/.git/config; then
+            echo "::error::auth header was persisted in src/.git/config"
             exit 1
           fi
+
+          HEAD_SHA=$(git -C src rev-parse HEAD)
+
+          # TASK-141 AC #4: when an expected SHA is given, the job must
+          # validate exactly that commit, not whatever the branch tip is now.
+          if [ -n "$EXPECTED_SHA" ]; then
+            if [ "$HEAD_SHA" != "$EXPECTED_SHA" ]; then
+              echo "Branch tip $HEAD_SHA != expected $EXPECTED_SHA; deepening history"
+              # Ancestry needs real history, so unshallow the branch first.
+              if [ "$(git -C src rev-parse --is-shallow-repository)" = "true" ]; then
+                git -C src -c http.extraheader="AUTHORIZATION: basic $AUTH" \
+                  fetch --unshallow origin "$REF" \
+                  || { echo "::error::could not fetch full history of $REF"; exit 1; }
+              fi
+              # If the SHA is still unknown locally, try fetching it directly
+              # (only succeeds when the server allows fetch-by-SHA).
+              if ! git -C src cat-file -e "${EXPECTED_SHA}^{commit}" 2>/dev/null; then
+                git -C src -c http.extraheader="AUTHORIZATION: basic $AUTH" \
+                  fetch --depth 1 origin "$EXPECTED_SHA" 2>/dev/null || true
+              fi
+              FULL_SHA=$(git -C src rev-parse --verify -q "${EXPECTED_SHA}^{commit}" || true)
+              if [ -z "$FULL_SHA" ]; then
+                echo "::error::expected SHA $EXPECTED_SHA does not exist in $REF"
+                exit 1
+              fi
+              # The SHA must belong to the branch, not just exist on the host.
+              if ! git -C src merge-base --is-ancestor "$FULL_SHA" "origin/$REF"; then
+                echo "::error::expected SHA $FULL_SHA is not an ancestor of origin/$REF"
+                exit 1
+              fi
+              git -C src checkout --detach "$FULL_SHA" \
+                || { echo "::error::could not check out $FULL_SHA"; exit 1; }
+              HEAD_SHA=$(git -C src rev-parse HEAD)
+            fi
+            if [ "$HEAD_SHA" != "$(git -C src rev-parse --verify "${EXPECTED_SHA}^{commit}")" ]; then
+              echo "::error::checked-out $HEAD_SHA does not match expected $EXPECTED_SHA"
+              exit 1
+            fi
+          fi
+
+          # Only record the SHA once it is verified, so report-status never
+          # posts a status against a commit the job did not validate.
+          echo "head_sha=$HEAD_SHA" >> "$GITHUB_OUTPUT"
+          echo "Cloned $REF at $HEAD_SHA"
 
       - name: Region tables are generated from pinned inputs
         working-directory: src
@@ -88,32 +147,51 @@ jobs:
           python3 scripts/gen_region_tables.py --check
           python3 -m unittest scripts/test_gen_region_tables.py scripts/test_check_xcstrings.py
 
-      # ── macOS preflight ─────────────────────────────────────────────
+      - name: Set up JDK 21
+        uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3  # v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      # ── macOS preflight (TASK-141 AC #3) ────────────────────────────
       - name: macOS preflight
         run: |
           set -euo pipefail
-          echo "=== Architecture ==="
-          uname -m
           ARCH=$(uname -m)
           if [ "$ARCH" != "arm64" ]; then
             echo "::error::Expected arm64, got $ARCH"
             exit 1
           fi
 
-          echo "=== Xcode ==="
-          xcodebuild -version
+          if [ ! -d "$XCODE_APP" ]; then
+            echo "::error::$XCODE_APP is missing; the macos-26 image changed. Installed:"
+            ls -d /Applications/Xcode*.app || true
+            exit 1
+          fi
+          sudo xcode-select -s "$XCODE_APP"
+          mkdir -p /tmp/ios-logs
 
+          echo "=== xcode-select -p ==="
+          xcode-select -p
+          echo "=== xcodebuild -version ==="
+          xcodebuild -version
+          echo "=== uname -m ==="
+          echo "$ARCH"
+          echo "=== java -version ==="
+          java -version
           echo "=== iOS SDK (device) ==="
           xcrun --sdk iphoneos --show-sdk-path
-
           echo "=== iOS SDK (simulator) ==="
           xcrun --sdk iphonesimulator --show-sdk-path
-
-      - name: Set up JDK 21
-        uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3  # v4
-        with:
-          distribution: temurin
-          java-version: '21'
+          echo "=== xcrun simctl list runtimes ==="
+          xcrun simctl list runtimes | tee /tmp/simctl-runtimes.txt
+          if ! grep -qF "iOS ${SIM_OS} (" /tmp/simctl-runtimes.txt; then
+            echo "::error::iOS ${SIM_OS} simulator runtime not installed"
+            exit 1
+          fi
+          echo "=== iPhone 17 simulator ==="
+          xcrun simctl list devices available | grep -F "iPhone 17 (" \
+            || { echo "::error::no iPhone 17 simulator available"; exit 1; }
 
       - name: Verify JDK and Gradle
         working-directory: src
@@ -331,15 +409,15 @@ jobs:
         working-directory: src/ios
         run: |
           set -euo pipefail
-          mkdir -p /tmp/derived-data
+          mkdir -p /tmp/derived-data /tmp/ios-logs
           xcodebuild build \
             -project RadioShake.xcodeproj \
             -scheme RadioShake \
             -configuration Debug \
-            -destination 'platform=iOS Simulator,OS=latest,name=iPhone 17' \
+            -destination "platform=iOS Simulator,OS=${SIM_OS},name=iPhone 17" \
             -derivedDataPath /tmp/derived-data \
             -resultBundlePath /tmp/ios-app-build.xcresult \
-            CODE_SIGNING_ALLOWED=NO
+            CODE_SIGNING_ALLOWED=NO 2>&1 | tee /tmp/ios-logs/debug-build.log
 
       - name: String Catalog covers every source string and is fully translated
         working-directory: src/ios
@@ -387,10 +465,27 @@ jobs:
             -project RadioShake.xcodeproj \
             -scheme RadioShake \
             -configuration Debug \
-            -destination 'platform=iOS Simulator,OS=latest,name=iPhone 17' \
+            -destination "platform=iOS Simulator,OS=${SIM_OS},name=iPhone 17" \
             -derivedDataPath /tmp/derived-data \
             -resultBundlePath /tmp/ios-app-test.xcresult \
-            CODE_SIGNING_ALLOWED=NO
+            CODE_SIGNING_ALLOWED=NO 2>&1 | tee /tmp/ios-logs/xctest.log
+
+      # TASK-141 AC #5 / TASK-174 follow-up: the StoreKit storefront test
+      # skips itself when the simulator has no storefront. On CI it must
+      # actually run; a skip here means the CI storefront was lost.
+      - name: StoreKit storefront test ran and was not skipped
+        run: |
+          set -euo pipefail
+          LOG=/tmp/ios-logs/xctest.log
+          if grep -E "Test Case '.*StoreKitStorefrontTests.*' skipped" "$LOG"; then
+            echo "::error::StoreKitStorefrontTests was skipped on CI (no simulator storefront)"
+            exit 1
+          fi
+          if ! grep -qE "Test Case '.*StoreKitStorefrontTests.*' passed" "$LOG"; then
+            echo "::error::StoreKitStorefrontTests did not run or did not pass"
+            exit 1
+          fi
+          echo "OK - StoreKitStorefrontTests ran and passed"
 
       - name: Record app bundle checksum
         run: |
@@ -415,7 +510,7 @@ jobs:
           ln -sfn "$PWD/shared/build/XCFrameworks/release/RadioShakeShared.xcframework" \
                   "$PWD/shared/build/XCFrameworks/current/RadioShakeShared.xcframework"
           cd ios
-          mkdir -p /tmp/derived-data-release
+          mkdir -p /tmp/derived-data-release /tmp/ios-logs
           # ARCHS=arm64 + ONLY_ACTIVE_ARCH=YES restrict Release simulator build
           # to arm64. Kotlin XCFramework only ships iosSimulatorArm64 (no
           # x86_64 slice), so x86_64 linkage fails with "symbols not found".
@@ -424,13 +519,13 @@ jobs:
             -project RadioShake.xcodeproj \
             -scheme RadioShake \
             -configuration Release \
-            -destination 'platform=iOS Simulator,OS=latest,name=iPhone 17' \
+            -destination "platform=iOS Simulator,OS=${SIM_OS},name=iPhone 17" \
             -derivedDataPath /tmp/derived-data-release \
             -resultBundlePath /tmp/ios-app-build-release.xcresult \
             ARCHS=arm64 \
             ONLY_ACTIVE_ARCH=YES \
             EXCLUDED_ARCHS=x86_64 \
-            CODE_SIGNING_ALLOWED=NO
+            CODE_SIGNING_ALLOWED=NO 2>&1 | tee /tmp/ios-logs/release-build.log
           RELEASE_APP="/tmp/derived-data-release/Build/Products/Release-iphonesimulator/RadioShake.app"
           test -d "$RELEASE_APP" || { echo "::error::release app not found"; exit 1; }
           # Sanity: the linked XCFramework is the release one. Compare a
@@ -442,6 +537,16 @@ jobs:
           rm -rf shared/build/XCFrameworks/current/RadioShakeShared.xcframework
           ln -sfn "$PWD/shared/build/XCFrameworks/debug/RadioShakeShared.xcframework" \
                   "$PWD/shared/build/XCFrameworks/current/RadioShakeShared.xcframework"
+
+      - name: Record Release app bundle checksum
+        run: |
+          set -euo pipefail
+          APP="/tmp/derived-data-release/Build/Products/Release-iphonesimulator/RadioShake.app"
+          test -d "$APP" || { echo "::error::release app not found at $APP"; exit 1; }
+          find "$APP" -type f -exec shasum -a 256 {} + \
+            | sort -k2 > /tmp/ios-app-release-bundle-sha256.txt
+          shasum -a 256 /tmp/ios-app-release-bundle-sha256.txt \
+            | tee /tmp/ios-app-release-bundle-digest.txt
 
       - name: Audit Release binary for debug-only symbols (TASK-136 + TASK-137)
         run: |
@@ -499,21 +604,52 @@ jobs:
           echo "=== Test Reports ==="
           find shared/build/reports -name '*.xml' -o -name '*.html' 2>/dev/null | head -20 || echo "(none)"
 
-      - name: Upload artifacts
+      # Nothing uploaded may contain the Forgejo tokens. Prints file names
+      # only, never the secret value.
+      - name: Secret scan of evidence artifacts
+        id: secret_scan
         if: always()
+        env:
+          FORGEJO_CLONE_TOKEN: ${{ secrets.FORGEJO_CLONE_TOKEN }}
+          FORGEJO_STATUS_TOKEN: ${{ secrets.FORGEJO_STATUS_TOKEN }}
+        run: |
+          set -uo pipefail
+          LEAKED=0
+          SCANNED=0
+          while IFS= read -r p; do
+            [ -n "$p" ] || continue
+            [ -e "$p" ] || continue
+            SCANNED=$((SCANNED + 1))
+            for NAME in FORGEJO_CLONE_TOKEN FORGEJO_STATUS_TOKEN; do
+              VALUE="${!NAME}"
+              [ -n "$VALUE" ] || continue
+              HITS=$(grep -rlF -- "$VALUE" "$p" 2>/dev/null)
+              RC=$?
+              if [ -n "$HITS" ]; then
+                echo "::error::$NAME value found in:"
+                echo "$HITS"
+                LEAKED=1
+              elif [ "$RC" -gt 1 ]; then
+                echo "::warning::grep could not fully scan $p for $NAME"
+              fi
+            done
+          done <<< "$EVIDENCE_PATHS"
+          echo "Scanned $SCANNED evidence paths"
+          if [ "$LEAKED" -ne 0 ]; then
+            echo "::error::secret scan failed; artifacts will not be uploaded"
+            exit 1
+          fi
+          echo "OK - no secret values in evidence artifacts"
+
+      - name: Upload artifacts
+        if: always() && steps.secret_scan.outcome == 'success'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
           name: ios-validate-evidence
           retention-days: 30
-          path: |
-            /tmp/RadioShakeShared-header.h
-            /tmp/Task7FacadeSmoke.swift
-            src/shared/build/reports/
-            /tmp/ios-app-build.xcresult
-            /tmp/ios-app-test.xcresult
-            /tmp/ios-app-bundle-sha256.txt
-            /tmp/ios-app-bundle-digest.txt
+          if-no-files-found: error
           # NEVER upload source, local.properties, or gradle caches
+          path: ${{ env.EVIDENCE_PATHS }}
 
   # TASK-141 AC #6: the Forgejo status callback is a separate job that
   # needs `validate`. It runs only after the whole job — including the
@@ -540,20 +676,33 @@ jobs:
           echo "::add-mask::$HOST"
 
           if [ -z "$HEAD_SHA" ]; then
-            echo "::warning::No HEAD SHA available for status callback"
-            exit 0
+            echo "::error::No HEAD SHA available for status callback"
+            exit 1
           fi
 
           # needs.validate.result is success|failure|cancelled|skipped.
-          # Anything other than success is a red gate — an all-skipped
+          # Anything other than success is a red gate: an all-skipped
           # or cancelled run is not a green run.
           STATE="failure"
           if [ "$RESULT" = "success" ]; then STATE="success"; fi
 
-          curl --fail-with-body -sS \
-            -X POST \
-            -H "Authorization: token $STATUS_TOKEN" \
-            -H "Content-Type: application/json" \
-            "https://${HOST}/api/v1/repos/hiten/RadioShake/statuses/${HEAD_SHA}" \
-            -d "{\"state\":\"${STATE}\",\"target_url\":\"${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}\",\"description\":\"iOS shared framework validation (job=${RESULT})\",\"context\":\"github/ios-validate\"}" \
-          || echo "::warning::Failed to post status to Forgejo"
+          # A status that never reaches Forgejo must fail this job, so a
+          # green GitHub run always means Forgejo saw the result.
+          POSTED=0
+          for ATTEMPT in 1 2 3; do
+            if curl --fail-with-body -sS \
+              -X POST \
+              -H "Authorization: token $STATUS_TOKEN" \
+              -H "Content-Type: application/json" \
+              "https://${HOST}/api/v1/repos/hiten/RadioShake/statuses/${HEAD_SHA}" \
+              -d "{\"state\":\"${STATE}\",\"target_url\":\"${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}\",\"description\":\"iOS shared framework validation (job=${RESULT})\",\"context\":\"github/ios-validate\"}"; then
+              POSTED=1
+              break
+            fi
+            echo "::warning::status POST attempt ${ATTEMPT}/3 failed"
+            if [ "$ATTEMPT" -lt 3 ]; then sleep 5; fi
+          done
+          if [ "$POSTED" -ne 1 ]; then
+            echo "::error::Failed to post status to Forgejo after 3 attempts"
+            exit 1
+          fi
