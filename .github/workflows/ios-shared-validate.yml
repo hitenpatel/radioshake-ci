@@ -136,7 +136,9 @@ jobs:
           fi
 
           # Only record the SHA once it is verified, so report-status never
-          # posts a status against a commit the job did not validate.
+          # posts success for, or substitutes the branch tip for, a commit
+          # the job did not validate (an unverified run leaves the output
+          # empty and report-status falls back to the requested SHA).
           echo "head_sha=$HEAD_SHA" >> "$GITHUB_OUTPUT"
           echo "Cloned $REF at $HEAD_SHA"
 
@@ -164,7 +166,7 @@ jobs:
           fi
 
           if [ ! -d "$XCODE_APP" ]; then
-            echo "::error::$XCODE_APP is missing; the macos-26 image changed. Installed:"
+            echo "::error::$XCODE_APP is missing; the macos-26 image changed. Update XCODE_APP / SIM_OS in workflow env to the image's versions. Installed:"
             ls -d /Applications/Xcode*.app || true
             exit 1
           fi
@@ -186,12 +188,14 @@ jobs:
           echo "=== xcrun simctl list runtimes ==="
           xcrun simctl list runtimes | tee /tmp/simctl-runtimes.txt
           if ! grep -qF "iOS ${SIM_OS} (" /tmp/simctl-runtimes.txt; then
-            echo "::error::iOS ${SIM_OS} simulator runtime not installed"
+            echo "::error::iOS ${SIM_OS} simulator runtime not installed; update XCODE_APP / SIM_OS in workflow env to the image's versions"
             exit 1
           fi
-          echo "=== iPhone 17 simulator ==="
-          xcrun simctl list devices available | grep -F "iPhone 17 (" \
-            || { echo "::error::no iPhone 17 simulator available"; exit 1; }
+          echo "=== iPhone 17 simulator under iOS ${SIM_OS} ==="
+          xcrun simctl list devices available \
+            | awk -v hdr="-- iOS ${SIM_OS} --" '$0 == hdr {f=1; next} /^-- /{f=0} f' \
+            | grep -F "iPhone 17 (" \
+            || { echo "::error::no iPhone 17 simulator under iOS ${SIM_OS}; update XCODE_APP / SIM_OS in workflow env to the image's versions"; exit 1; }
 
       - name: Verify JDK and Gradle
         working-directory: src
@@ -604,8 +608,11 @@ jobs:
           echo "=== Test Reports ==="
           find shared/build/reports -name '*.xml' -o -name '*.html' 2>/dev/null | head -20 || echo "(none)"
 
-      # Nothing uploaded may contain the Forgejo tokens. Prints file names
-      # only, never the secret value.
+      # Nothing uploaded may contain the Forgejo tokens (raw, or the base64
+      # basic-auth value the clone step builds). xcresult blobs are
+      # zstd-compressed, so every file is also scanned decompressed. Fails
+      # closed: unreadable files or a missing decompressor fail the step.
+      # Prints paths only, never a secret value.
       - name: Secret scan of evidence artifacts
         id: secret_scan
         if: always()
@@ -614,35 +621,81 @@ jobs:
           FORGEJO_STATUS_TOKEN: ${{ secrets.FORGEJO_STATUS_TOKEN }}
         run: |
           set +e -u -o pipefail
-          LEAKED=0
-          SCANNED=0
+          NEED_ZSTD=0
           while IFS= read -r p; do
-            [ -n "$p" ] || continue
-            [ -e "$p" ] || continue
-            SCANNED=$((SCANNED + 1))
-            for NAME in FORGEJO_CLONE_TOKEN FORGEJO_STATUS_TOKEN; do
-              VALUE="${!NAME}"
-              [ -n "$VALUE" ] || continue
-              HITS=$(grep -rlF -- "$VALUE" "$p" 2>/dev/null)
-              RC=$?
-              if [ -n "$HITS" ]; then
-                echo "::error::$NAME value found in:"
-                echo "$HITS"
-                LEAKED=1
-              elif [ "$RC" -gt 1 ]; then
-                echo "::warning::grep could not fully scan $p for $NAME"
-              fi
-            done
+            case "$p" in *.xcresult) [ -e "$p" ] && NEED_ZSTD=1 ;; esac
           done <<< "$EVIDENCE_PATHS"
-          echo "Scanned $SCANNED evidence paths"
-          if [ "$LEAKED" -ne 0 ]; then
-            echo "::error::secret scan failed; artifacts will not be uploaded"
-            exit 1
+          if [ "$NEED_ZSTD" = 1 ] && ! command -v zstd >/dev/null 2>&1; then
+            brew install zstd >/dev/null 2>&1
           fi
-          echo "OK - no secret values in evidence artifacts"
+          python3 - <<'PY'
+          import base64, os, subprocess, shutil, sys
+
+          needles = {}
+          for name in ("FORGEJO_CLONE_TOKEN", "FORGEJO_STATUS_TOKEN"):
+              v = os.environ.get(name, "")
+              if v:
+                  needles[name] = v.encode()
+          clone = os.environ.get("FORGEJO_CLONE_TOKEN", "")
+          if clone:
+              needles["CLONE_AUTH_BASE64"] = base64.b64encode(b"oauth2:" + clone.encode())
+
+          ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
+          zstd = shutil.which("zstd")
+          leaked, failed, scanned_files, scanned_paths, decompressed = [], [], 0, 0, 0
+
+          def hit(data):
+              return [n for n, v in needles.items() if v in data]
+
+          def check(label, data, path):
+              for n in hit(data):
+                  leaked.append((n, label))
+
+          for p in [x.strip() for x in os.environ["EVIDENCE_PATHS"].splitlines() if x.strip()]:
+              if not os.path.exists(p):
+                  continue
+              scanned_paths += 1
+              is_bundle = p.rstrip("/").endswith(".xcresult")
+              files = []
+              if os.path.isdir(p):
+                  for root, _, names in os.walk(p):
+                      files += [os.path.join(root, n) for n in names]
+              else:
+                  files = [p]
+              for f in files:
+                  label = p if is_bundle else f
+                  try:
+                      with open(f, "rb") as fh:
+                          data = fh.read()
+                  except OSError:
+                      failed.append(label)
+                      continue
+                  scanned_files += 1
+                  check(label, data, f)
+                  if data.startswith(ZSTD_MAGIC):
+                      if zstd is None:
+                          failed.append(label + " (zstd decompressor unavailable)")
+                          continue
+                      r = subprocess.run([zstd, "-dcq"], input=data, capture_output=True)
+                      if r.returncode != 0:
+                          failed.append(label + " (zstd decompress failed)")
+                          continue
+                      decompressed += 1
+                      check(label, r.stdout, f)
+
+          print(f"Scanned {scanned_paths} evidence paths, {scanned_files} files, {decompressed} zstd blobs decompressed; {len(needles)} needles")
+          for n, label in sorted(set(leaked)):
+              print(f"::error::{n} value found in {label}")
+          for label in sorted(set(failed)):
+              print(f"::error::could not scan {label}")
+          if leaked or failed:
+              print("::error::secret scan failed; artifacts will not be uploaded")
+              sys.exit(1)
+          print("OK - no secret values in evidence artifacts")
+          PY
 
       - name: Upload artifacts
-        if: always() && steps.secret_scan.outcome == 'success'
+        if: always() && steps.clone.outcome == 'success' && steps.secret_scan.outcome == 'success'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
           name: ios-validate-evidence
