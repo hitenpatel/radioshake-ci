@@ -472,7 +472,22 @@ jobs:
             -destination "platform=iOS Simulator,OS=${SIM_OS},name=iPhone 17" \
             -derivedDataPath /tmp/derived-data \
             -resultBundlePath /tmp/ios-app-test.xcresult \
+            -skip-testing:RadioShakeUITests/ScreenshotTourUITests \
             CODE_SIGNING_ALLOWED=NO 2>&1 | tee /tmp/ios-logs/xctest.log
+
+      # The screenshot tour attaches keepAlways screenshots to the result
+      # bundle, and this job uploads that bundle to a PUBLIC artifact. The
+      # tour runs only in ios-screenshots.yml, which encrypts its output.
+      - name: Screenshot tour did not run in the public job
+        run: |
+          set -euo pipefail
+          # Match executed test cases only: xcodebuild echoes its own command line,
+          # which contains the -skip-testing argument.
+          if grep -qE "Test Case '-\\[RadioShakeUITests\\.ScreenshotTourUITests" /tmp/ios-logs/xctest.log; then
+            echo "::error::ScreenshotTourUITests ran in the public job; its screenshots would be uploaded unencrypted"
+            exit 1
+          fi
+          echo "OK - no screenshot tour in the public result bundle"
 
       # TASK-141 AC #5 / TASK-174 follow-up: the StoreKit storefront test
       # skips itself when the simulator has no storefront. On CI it must
