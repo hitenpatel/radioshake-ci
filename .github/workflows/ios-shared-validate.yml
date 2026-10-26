@@ -423,26 +423,28 @@ jobs:
             -resultBundlePath /tmp/ios-app-build.xcresult \
             CODE_SIGNING_ALLOWED=NO 2>&1 | tee /tmp/ios-logs/debug-build.log
 
-      # Phase 1b: cleartext radio streams may load in AVFoundation only.
-      # The built Info.plist must allow media loads and must never carry the
-      # blanket NSAllowsArbitraryLoads exception.
-      - name: App Transport Security allows media only
+      # Phase 1b (owner decision 2026-10-26): cleartext radio streams must play (Android parity).
+      # The media-only key did not cover AVFoundation loads, so the app uses NSAllowsArbitraryLoads,
+      # which iOS silently ignores if ForMedia / InWebContent / NSAllowsLocalNetworking are present.
+      - name: App Transport Security allows cleartext streams
         run: |
           set -euo pipefail
           # Branches before Phase 1b (no user streams) are exempt.
           if [ ! -d src/shared/src/commonMain/kotlin/com/radioshake/shared/playlist ]; then
-            echo "No user-stream code on this commit; ATS media check skipped"; exit 0
+            echo "No user-stream code on this commit; ATS check skipped"; exit 0
           fi
           PLIST="/tmp/derived-data/Build/Products/Debug-iphonesimulator/RadioShake.app/Info.plist"
           test -f "$PLIST" || { echo "::error::Info.plist not found at $PLIST"; exit 1; }
-          MEDIA=$(/usr/libexec/PlistBuddy -c "Print :NSAppTransportSecurity:NSAllowsArbitraryLoadsForMedia" "$PLIST" 2>/dev/null || echo missing)
-          if [ "$MEDIA" != "true" ]; then
-            echo "::error::NSAllowsArbitraryLoadsForMedia is $MEDIA (expected true)"; exit 1
+          ANY=$(/usr/libexec/PlistBuddy -c "Print :NSAppTransportSecurity:NSAllowsArbitraryLoads" "$PLIST" 2>/dev/null || echo missing)
+          if [ "$ANY" != "true" ]; then
+            echo "::error::NSAllowsArbitraryLoads is $ANY (expected true)"; exit 1
           fi
-          if /usr/libexec/PlistBuddy -c "Print :NSAppTransportSecurity:NSAllowsArbitraryLoads" "$PLIST" >/dev/null 2>&1; then
-            echo "::error::NSAllowsArbitraryLoads must not be set"; exit 1
-          fi
-          echo "OK - media-only ATS exception"
+          for k in NSAllowsArbitraryLoadsForMedia NSAllowsArbitraryLoadsInWebContent NSAllowsLocalNetworking; do
+            if /usr/libexec/PlistBuddy -c "Print :NSAppTransportSecurity:$k" "$PLIST" >/dev/null 2>&1; then
+              echo "::error::$k is present, which makes iOS ignore NSAllowsArbitraryLoads"; exit 1
+            fi
+          done
+          echo "OK - cleartext streams allowed"
 
       - name: String Catalog covers every source string and is fully translated
         working-directory: src/ios
