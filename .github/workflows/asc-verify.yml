@@ -1,0 +1,96 @@
+name: asc-verify
+
+# Read-only App Store Connect API check (TASK-5): proves the API key secrets
+# authenticate and that the bundle IDs, app record and internal TestFlight
+# group exist. Logs are public, so it prints no secret values and no tester
+# identities, only counts.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Install PyJWT
+        run: pip install --quiet 'pyjwt[crypto]==2.10.1' requests
+
+      - name: Query App Store Connect
+        env:
+          ASC_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          ASC_KEY_B64: ${{ secrets.APP_STORE_CONNECT_PRIVATE_KEY_B64 }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        shell: python
+        run: |
+          import base64, os, sys, time
+          import jwt, requests
+
+          for name in ("ASC_KEY_ID", "ASC_ISSUER_ID", "ASC_KEY_B64", "APPLE_TEAM_ID"):
+              if not os.environ.get(name):
+                  sys.exit(f"missing secret for {name}")
+
+          key = base64.b64decode(os.environ["ASC_KEY_B64"]).decode()
+          now = int(time.time())
+          token = jwt.encode(
+              {"iss": os.environ["ASC_ISSUER_ID"], "iat": now, "exp": now + 600, "aud": "appstoreconnect-v1"},
+              key,
+              algorithm="ES256",
+              headers={"kid": os.environ["ASC_KEY_ID"], "typ": "JWT"},
+          )
+          api = "https://api.appstoreconnect.apple.com/v1"
+          s = requests.Session()
+          s.headers["Authorization"] = f"Bearer {token}"
+
+          def get(path, **params):
+              r = s.get(f"{api}/{path}", params=params, timeout=30)
+              if r.status_code != 200:
+                  sys.exit(f"GET {path} -> HTTP {r.status_code}: {r.text[:300]}")
+              return r.json()
+
+          out = []
+          failed = False
+          wanted = ["com.radioshake", "com.radioshake.debug"]
+          bundles = get("bundleIds", **{"filter[identifier]": ",".join(wanted), "include": "bundleIdCapabilities", "limit": 50})
+          caps = {c["id"]: c["attributes"]["capabilityType"] for c in bundles.get("included", [])}
+          found = {}
+          for b in bundles["data"]:
+              a = b["attributes"]
+              if a["identifier"] in wanted:
+                  ids = [x["id"] for x in b["relationships"]["bundleIdCapabilities"].get("data", [])]
+                  found[a["identifier"]] = a
+                  out.append(f"bundleId {a['identifier']} platform={a['platform']} "
+                             f"teamMatches={a['seedId'] == os.environ['APPLE_TEAM_ID']} "
+                             f"capabilities={sorted(caps.get(i, i) for i in ids) or 'none'}")
+          for w in wanted:
+              if w not in found:
+                  failed = True
+                  out.append(f"MISSING bundleId {w}")
+
+          apps = get("apps", **{"filter[bundleId]": "com.radioshake"})["data"]
+          if not apps:
+              failed = True
+              out.append("MISSING app record for com.radioshake")
+          for app in apps:
+              a = app["attributes"]
+              out.append(f"app name={a['name']!r} sku={a['sku']} bundleId={a['bundleId']} primaryLocale={a['primaryLocale']}")
+              groups = get(f"apps/{app['id']}/betaGroups")["data"]
+              internal = [g for g in groups if g["attributes"].get("isInternalGroup")]
+              if not internal:
+                  failed = True
+                  out.append("MISSING internal TestFlight group")
+              for g in groups:
+                  ga = g["attributes"]
+                  testers = get(f"betaGroups/{g['id']}/betaTesters", limit=200)["data"]
+                  out.append(f"betaGroup name={ga['name']!r} internal={ga.get('isInternalGroup')} "
+                             f"allBuilds={ga.get('hasAccessToAllBuilds')} testers={len(testers)}")
+
+          report = "\n".join(out)
+          print(report)
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+              f.write("```\n" + report + "\n```\n")
+          sys.exit(1 if failed else 0)
