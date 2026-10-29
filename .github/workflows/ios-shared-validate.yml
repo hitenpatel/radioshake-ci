@@ -560,7 +560,7 @@ jobs:
       - name: Build iOS app (Release, simulator, unsigned)
         # TASK-14: still run after a flaky UI test failure so the privacy audit always reports;
         # the job stays red because the failed test step already failed it.
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.clone.outcome == 'success' }}
         working-directory: src
         run: |
           set -euo pipefail
@@ -637,7 +637,7 @@ jobs:
       - name: Build iOS app (Release, device, unsigned) (TASK-14)
         # TASK-14: still run after a flaky UI test failure so the privacy audit always reports;
         # the job stays red because the failed test step already failed it.
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.clone.outcome == 'success' }}
         working-directory: src
         run: |
           set -euo pipefail
@@ -667,7 +667,7 @@ jobs:
       - name: iOS privacy binary audit (TASK-14)
         # TASK-14: still run after a flaky UI test failure so the privacy audit always reports;
         # the job stays red because the failed test step already failed it.
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.clone.outcome == 'success' }}
         working-directory: src
         env:
           PRIVACY_EXPLAIN: ${{ inputs.privacy_explain }}
@@ -682,7 +682,7 @@ jobs:
           if [ "${PRIVACY_EXPLAIN:-false}" = "true" ]; then
             # otool prints each function as a "_name:" line and each call to an
             # imported function as "bl 0x... ; symbol stub for: _name".
-            API='_(stat|fstat|fstatat|lstat|getattrlist|getattrlistbulk|fgetattrlist|getattrlistat|mach_absolute_time|statfs|statvfs|fstatfs|fstatvfs)$'
+            API='^_(stat|fstat|fstatat|lstat|getattrlist|getattrlistbulk|fgetattrlist|getattrlistat|mach_absolute_time|statfs|statvfs|fstatfs|fstatvfs)$'
             for APP in "$SIM" "$DEV"; do
               echo "== callers of required-reason C APIs in $APP"
               otool -tvV "$APP/RadioShake" > /tmp/privacy-disasm.txt
