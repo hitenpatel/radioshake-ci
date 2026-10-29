@@ -558,6 +558,9 @@ jobs:
 
       # ── Release build verification (TASK-149) ───────────────────────
       - name: Build iOS app (Release, simulator, unsigned)
+        # TASK-14: still run after a flaky UI test failure so the privacy audit always reports;
+        # the job stays red because the failed test step already failed it.
+        if: ${{ !cancelled() }}
         working-directory: src
         run: |
           set -euo pipefail
@@ -632,6 +635,9 @@ jobs:
           echo "OK — no debug-only symbols and no fixture files in Release binary/bundle"
 
       - name: Build iOS app (Release, device, unsigned) (TASK-14)
+        # TASK-14: still run after a flaky UI test failure so the privacy audit always reports;
+        # the job stays red because the failed test step already failed it.
+        if: ${{ !cancelled() }}
         working-directory: src
         run: |
           set -euo pipefail
@@ -659,6 +665,9 @@ jobs:
                   "$PWD/shared/build/XCFrameworks/current/RadioShakeShared.xcframework"
 
       - name: iOS privacy binary audit (TASK-14)
+        # TASK-14: still run after a flaky UI test failure so the privacy audit always reports;
+        # the job stays red because the failed test step already failed it.
+        if: ${{ !cancelled() }}
         working-directory: src
         env:
           PRIVACY_EXPLAIN: ${{ inputs.privacy_explain }}
