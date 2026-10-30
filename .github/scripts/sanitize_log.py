@@ -2,6 +2,13 @@
 """Print a log-safe digest of a build log for the public Actions log.
 
 Usage: sanitize_log.py LOGFILE [PROJECT_ROOT]
+       sanitize_log.py --export EXPORT_LOGFILE
+
+--export is for `xcodebuild -exportArchive` output: Apple tool messages (see EXPORT_KEEP) are
+shown, including the matching lines of the *.log files inside any IDEDistribution
+`*.xcdistributionlogs` folder the output names. Lines mentioning key material are dropped,
+absolute paths become <path>, runs of 20+ base64/hex-like characters are redacted (the listed
+Apple keywords such as NSLocalizedDescription are preserved), 200 characters per line, 20 lines.
 
 Only compiler diagnostics of the form `path:line:col: error: message` are shown, and:
   - the path must be an existing file under PROJECT_ROOT (shown relative); anything else
@@ -21,6 +28,18 @@ PATH = re.compile(r"(?<![\w.:])(?:file://)?(/[^\s:'\"()\[\],;]+)")
 REDACT = re.compile(r"[A-Za-z0-9+/=_-]{20,}")
 MAX_LINES = 40
 MAX_CHARS = 160
+
+# --export mode
+EXPORT_KEEP = re.compile(
+    r"^\s*error:|exportArchive:|\*\* EXPORT FAILED \*\*|IDEDistribution|Provisioning profile|"
+    r"signing certificate|No profiles|Error Domain=|NSLocalizedDescription|NSLocalizedRecoverySuggestion",
+    re.I)
+EXPORT_KEYWORDS = re.compile(r"(NSLocalizedDescription|NSLocalizedRecoverySuggestion|IDEDistribution|Domain=[A-Za-z]+)")
+EXPORT_DROP = re.compile(r"asc-key|AuthKey|\.p8\b|PRIVATE KEY|-authentication(?:Key|Issuer)|eyJ[A-Za-z0-9_-]{10,}", re.I)
+DIST_FOLDER = re.compile(r"(/[^\s'\"()]+\.xcdistributionlogs)")
+EXPORT_MAX_LINES = 20
+EXPORT_MAX_CHARS = 200
+MAX_DIST_LOG_BYTES = 2_000_000
 
 
 def sanitize(lines, root=""):
@@ -52,7 +71,61 @@ def sanitize(lines, root=""):
     return out
 
 
+def _redact_keeping_keywords(text):
+    parts = EXPORT_KEYWORDS.split(text)
+    return "".join(p if EXPORT_KEYWORDS.fullmatch(p) else REDACT.sub("<redacted>", p) for p in parts)
+
+
+def sanitize_export_lines(lines, limit=EXPORT_MAX_LINES, seen=None, out=None):
+    out = [] if out is None else out
+    seen = set() if seen is None else seen
+    for raw in lines:
+        line = raw.rstrip("\n")
+        if len(out) >= limit:
+            break
+        if not EXPORT_KEEP.search(line) or EXPORT_DROP.search(line):
+            continue
+        line = _redact_keeping_keywords(PATH.sub("<path>", line)).strip()[:EXPORT_MAX_CHARS]
+        if line and line not in seen:
+            seen.add(line)
+            out.append(line)
+    return out
+
+
+def export_digest(log_path):
+    """Sanitised Apple tool messages from the export output and its IDEDistribution log folders."""
+    with open(log_path, "r", encoding="utf-8", errors="replace") as fh:
+        text = fh.read()
+    out, seen = [], set()
+    sanitize_export_lines(text.splitlines(), out=out, seen=seen)
+    folders = []
+    for m in DIST_FOLDER.finditer(text):
+        folder = m.group(1)
+        if folder not in folders and ".." not in folder.split("/") and os.path.isdir(folder):
+            folders.append(folder)
+    for folder in folders:
+        try:
+            names = sorted(n for n in os.listdir(folder) if n.endswith(".log"))
+        except OSError:
+            continue
+        for name in names:
+            try:
+                with open(os.path.join(folder, name), "r", encoding="utf-8", errors="replace") as fh:
+                    sanitize_export_lines(fh.read(MAX_DIST_LOG_BYTES).splitlines(), out=out, seen=seen)
+            except OSError:
+                continue
+    return out
+
+
 def main():
+    if len(sys.argv) == 3 and sys.argv[1] == "--export":
+        try:
+            lines = export_digest(sys.argv[2])
+        except OSError:
+            print("(no export log captured)")
+            return 0
+        print("\n".join(lines) if lines else "(no Apple tool messages matched in the export output)")
+        return 0
     if len(sys.argv) < 2:
         print("usage: sanitize_log.py LOGFILE [ROOT]", file=sys.stderr)
         return 2

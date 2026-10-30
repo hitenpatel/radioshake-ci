@@ -267,6 +267,90 @@ class SanitizeTests(unittest.TestCase):
         self.assertEqual(out, ["<path>:1:1: error: x"])
 
 
+class ExportDigestTests(unittest.TestCase):
+    def setUp(self):
+        import sanitize_log as sl
+        self.s = sl
+        self.d = tempfile.mkdtemp()
+
+    def write(self, path, text):
+        with open(path, "w") as fh:
+            fh.write(text)
+
+    def test_apple_messages_kept_noise_and_key_material_dropped(self):
+        log = os.path.join(self.d, "export.log")
+        self.write(log, "\n".join([
+            "2026-10-30 xcodebuild chatter that should not appear",
+            "error: exportArchive: No signing certificate \"iOS Distribution\" found",
+            "Error Domain=IDEProvisioningErrorDomain Code=9 \"\" UserInfo={NSLocalizedDescription=Provisioning profile \"x\" missing, NSLocalizedRecoverySuggestion=Add a device}",
+            "** EXPORT FAILED **",
+            "No profiles for 'com.radioshake' were found",
+            "IDEDistribution: -[IDEDistributionLogging _createLoggingBundleAtPath:]: Created bundle at path /var/folders/zz/T/RadioShake.xcdistributionlogs",
+            "error: could not read /Users/runner/work/_temp/asc-key.p8",
+            "-authenticationKeyID SECRETKEYID1234567890",
+            "error: blob MIGTAgEAMBMGByqGSM49AgEGCCqGSM49AgEHBG0wawIBAQQg",
+            "  error: leading space is fine",
+        ]))
+        out = self.s.export_digest(log)
+        text = "\n".join(out)
+        self.assertIn("error: exportArchive: No signing certificate", text)
+        self.assertIn("Error Domain=IDEProvisioningErrorDomain Code=9", text)
+        self.assertIn("NSLocalizedDescription=Provisioning profile", text)
+        self.assertIn("NSLocalizedRecoverySuggestion=Add a device", text)   # keyword not redacted
+        self.assertIn("** EXPORT FAILED **", text)
+        self.assertIn("No profiles for 'com.radioshake'", text)
+        self.assertIn("error: leading space is fine", text)
+        self.assertNotIn("chatter", text)
+        self.assertNotIn("asc-key", text)
+        self.assertNotIn("SECRETKEYID", text)
+        self.assertNotIn("MIGTAgEAM", text)
+        self.assertNotIn("/var/folders", text)
+        self.assertIn("<path>", text)
+
+    def test_distribution_log_folder_lines_are_included(self):
+        folder = os.path.join(self.d, "RadioShake.xcdistributionlogs")
+        os.makedirs(folder)
+        self.write(os.path.join(folder, "IDEDistribution.standard.log"), "\n".join([
+            "noise line",
+            "2026 IDEDistribution: Provisioning profile for com.radioshake requires a registered device",
+            "error: Your team has no devices from which to generate a provisioning profile.",
+            "error: token " + "A1b2C3d4" * 6,
+        ]))
+        self.write(os.path.join(folder, "other.txt"), "error: not a .log file")
+        log = os.path.join(self.d, "export.log")
+        self.write(log, f"IDEDistribution logs at {folder}\n** EXPORT FAILED **\n")
+        text = "\n".join(self.s.export_digest(log))
+        self.assertIn("Your team has no devices", text)
+        self.assertIn("requires a registered device", text)
+        self.assertNotIn("noise line", text)
+        self.assertNotIn("not a .log file", text)
+        self.assertNotIn("A1b2C3d4" * 3, text)
+
+    def test_caps_and_dedup_and_traversal(self):
+        log = os.path.join(self.d, "export.log")
+        self.write(log, "\n".join(f"error: line {i}" for i in range(60)) + "\nerror: line 3\n"
+                   + "error: " + "word " * 100 + "\nIDEDistribution ../../etc.xcdistributionlogs\n")
+        out = self.s.export_digest(log)
+        self.assertEqual(len(out), 20)
+        self.assertEqual(len(set(out)), 20)
+        self.write(log, "error: " + "word " * 100 + "\n")
+        self.assertLessEqual(len(self.s.export_digest(log)[0]), 200)
+
+    def test_cli_export_mode(self):
+        import io, contextlib
+        log = os.path.join(self.d, "export.log")
+        self.write(log, "** EXPORT FAILED **\n")
+        buf = io.StringIO()
+        old = sys.argv
+        sys.argv = ["sanitize_log.py", "--export", log]
+        try:
+            with contextlib.redirect_stdout(buf):
+                self.assertEqual(self.s.main(), 0)
+        finally:
+            sys.argv = old
+        self.assertEqual(buf.getvalue().strip(), "** EXPORT FAILED **")
+
+
 class InputTests(unittest.TestCase):
     OK = {"SHA": "a" * 40, "VALIDATED_RUN": "123", "MODE": "release", "RESUME_BUILD": "", "RELEASE_RUN": "", "NOTES": "hi"}
 

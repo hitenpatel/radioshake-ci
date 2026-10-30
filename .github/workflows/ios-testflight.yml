@@ -490,19 +490,33 @@ jobs:
               > "$EXPORT_LOG" 2>&1
           }
 
-          # Fixed category only; the raw export log is never printed to the public log.
+          # Category from fixed patterns over the export output plus the sanitised digest (which
+          # includes the IDEDistribution log folder lines); only the digest is ever printed.
           classify_export_failure() {
-            if grep -Eiq 'already been used|bundle version must be higher|previously uploaded|INVALID\.DUPLICATE' "$EXPORT_LOG"; then
+            local f="$RUNNER_TEMP/export-class.txt"
+            cat "$EXPORT_LOG" "$RUNNER_TEMP/export-digest.txt" > "$f" 2>/dev/null || true
+            if grep -Eiq 'already been used|bundle version must be higher|previously uploaded|INVALID\.DUPLICATE' "$f"; then
               echo duplicate
-            elif grep -Eiq 'timed out|timeout|network|connection|could not connect|offline|internet' "$EXPORT_LOG"; then
+            elif grep -Eiq 'no devices|include any devices|currently selected device|register (a|your|the) device|at least one (registered )?device' "$f"; then
+              echo device
+            elif grep -Eiq 'agreement|program license|not a member|isn.t a member|team is not|invalid team' "$f"; then
+              echo agreement
+            elif grep -Eiq 'timed out|timeout|network|connection|could not connect|offline|internet' "$f"; then
               echo network
-            elif grep -Eiq 'signing|provisioning|certificate|codesign|profile' "$EXPORT_LOG"; then
+            elif grep -Eiq 'signing certificate|no profiles|provisioning profile|signing|certificate|codesign|profile' "$f"; then
               echo signing
-            elif grep -Eiq 'authenticat|unauthori[sz]ed|forbidden|credential|NOT_AUTHORIZED' "$EXPORT_LOG"; then
+            elif grep -Eiq 'authenticat|unauthori[sz]ed|forbidden|credential|NOT_AUTHORIZED' "$f"; then
               echo auth
             else
               echo other
             fi
+          }
+
+          # Apple tool messages only (see sanitize_log.py --export); never key material or env.
+          show_export_digest() {
+            python3 "$SAN" --export "$EXPORT_LOG" > "$RUNNER_TEMP/export-digest.txt" || : > "$RUNNER_TEMP/export-digest.txt"
+            echo "Apple export messages (sanitised):"
+            cat "$RUNNER_TEMP/export-digest.txt"
           }
 
           uploaded=false
@@ -538,6 +552,7 @@ jobs:
               echo "Uploaded build ${n} for sha ${SHA}"
               break
             fi
+            show_export_digest
             category=$(classify_export_failure)
             echo "Export/upload failed, category: ${category}"
             case "$category" in
@@ -560,9 +575,13 @@ jobs:
                 fi
                 fail "upload outcome is ambiguous (build ${n} not visible after 5 minutes). Check App Store Connect before dispatching again; a later dispatch allocates a higher number" ;;
               signing)
-                fail "signing or provisioning failed at export; see the runbook Recovery section" ;;
+                fail "signing or provisioning failed at export (no usable signing certificate or profile); see the runbook Recovery section" ;;
+              device)
+                fail "export signing needs a registered device (the signing path asked for one); see the runbook Recovery section" ;;
+              agreement)
+                fail "App Store Connect team or agreement problem at export (check the Apple Developer agreements and the team id); see the runbook Recovery section" ;;
               auth)
-                fail "App Store Connect authentication failed at export; run asc-verify and see the runbook Recovery section" ;;
+                fail "App Store Connect upload authentication failed at export; run asc-verify and see the runbook Recovery section" ;;
             esac
           done
           [ "$uploaded" = true ] || fail "no build was uploaded"
