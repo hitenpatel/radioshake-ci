@@ -18,6 +18,11 @@ on:
       sha:
         description: 'Expected HEAD SHA (leave empty to skip check)'
         default: ''
+      device:
+        description: 'Simulator device name for the tour, e.g. "iPhone SE (3rd generation)" for the small-screen check'
+        required: false
+        default: 'iPhone 17'
+        type: string
 
 permissions:
   contents: read
@@ -147,13 +152,25 @@ jobs:
         run: xcodegen generate --spec project.yml
 
       - name: Boot simulator with a fixed status bar
+        env:
+          # Default keeps the tour on iPhone 17; the small-screen check passes
+          # "iPhone SE (3rd generation)" (375x667 pt, same as the SE 2nd gen).
+          DEVICE: ${{ inputs.device || 'iPhone 17' }}
         run: |
           set -euo pipefail
+          if ! printf '%s' "$DEVICE" | grep -Eq '^[A-Za-z0-9 ()-]{1,60}$'; then
+            echo "::error::device must match ^[A-Za-z0-9 ()-]{1,60}$"
+            exit 1
+          fi
           UDID=$(xcrun simctl list devices available -j | python3 -c '
           import json, os, sys
           d = json.load(sys.stdin)["devices"]
           key = "com.apple.CoreSimulator.SimRuntime.iOS-" + os.environ["SIM_OS"].replace(".", "-")
-          print(next(x["udid"] for x in d.get(key, []) if x["name"] == "iPhone 17"))')
+          name = os.environ["DEVICE"]
+          match = [x["udid"] for x in d.get(key, []) if x["name"] == name]
+          if not match:
+              sys.exit("no simulator named " + name + " under iOS " + os.environ["SIM_OS"])
+          print(match[0])')
           echo "UDID=$UDID" >> "$GITHUB_ENV"
           xcrun simctl boot "$UDID" || true
           xcrun simctl bootstatus "$UDID" -b

@@ -1,0 +1,605 @@
+# iOS TestFlight pipeline (RadioShake TASK-142 / TASK-143).
+# Spec: docs/superpowers/specs/2026-10-30-ios-testflight-pipeline-design.md (private repo).
+#
+# This repo is public, so these logs are public. Rules this workflow keeps:
+#  - The four App Store Connect secrets live only in the `testflight`
+#    environment (required reviewer = owner, main-only). The `gate` job has no
+#    environment and cannot read them; only `testflight` declares the
+#    environment, so the secrets exist only after the owner approves the run.
+#  - Inputs reach shell only through env: and are validated with anchored regexes.
+#  - Build, export and Gradle output goes to files in $RUNNER_TEMP; the log shows
+#    sanitised status and error lines only. No set -x. No artifacts are uploaded.
+#  - The API key file is mode 600 and removed in an always() step.
+#
+# Dispatch (from main only):
+#   gh workflow run ios-testflight.yml -R hitenpatel/radioshake-ci \
+#     -f sha=<40-hex> -f validated_run=<ios-shared-validate run id> \
+#     [-f notes='What to Test'] [-f mode=release|archive_only|resume] [-f resume_build=<n>]
+
+name: ios-testflight
+
+on:
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: 'Forgejo main commit to release (full 40-character hex)'
+        required: true
+        type: string
+      validated_run:
+        description: 'Run id of a successful ios-shared-validate run that cloned main at this sha'
+        required: true
+        type: string
+      notes:
+        description: 'What to Test (optional, max 4000 characters)'
+        required: false
+        default: ''
+        type: string
+      mode:
+        description: 'release = archive+upload+distribute, archive_only = signed archive, no upload, resume = poll and distribute an already uploaded build'
+        required: false
+        default: release
+        type: choice
+        options:
+          - release
+          - archive_only
+          - resume
+      resume_build:
+        description: 'Build number to resume (required for mode=resume)'
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-testflight
+  cancel-in-progress: false
+
+env:
+  # Same pin as ios-shared-validate.yml; the preflight fails loudly on drift.
+  XCODE_APP: /Applications/Xcode_26.6.app
+  BUNDLE_ID: com.radioshake
+  INTERNAL_GROUP: Internal
+
+jobs:
+  # ── Gate: runs without the testflight environment, so no App Store Connect
+  # secret exists here. It only holds the Forgejo read-only clone token (the
+  # same repo-level secret ios-shared-validate uses) to prove ancestry on main.
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: Require a dispatch from main
+        env:
+          REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          if [ "$REF" != "refs/heads/main" ]; then
+            echo "::error::ios-testflight must be dispatched from main"
+            exit 1
+          fi
+
+      - name: Check out CI helper scripts
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          path: ci
+          sparse-checkout: .github/scripts
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - name: Validate inputs
+        env:
+          SHA: ${{ inputs.sha }}
+          VALIDATED_RUN: ${{ inputs.validated_run }}
+          MODE: ${{ inputs.mode }}
+          RESUME_BUILD: ${{ inputs.resume_build }}
+          NOTES: ${{ inputs.notes }}
+        run: python3 ci/.github/scripts/validate_inputs.py
+
+      - name: validated_run is a successful ios-shared-validate run of this SHA
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ inputs.sha }}
+          VALIDATED_RUN: ${{ inputs.validated_run }}
+        run: |
+          set -euo pipefail
+          run=$(gh api "repos/${REPO}/actions/runs/${VALIDATED_RUN}")
+          status=$(jq -r '.status // ""' <<<"$run")
+          conclusion=$(jq -r '.conclusion // ""' <<<"$run")
+          workflow_id=$(jq -r '.workflow_id // ""' <<<"$run")
+          run_repo=$(jq -r '.repository.full_name // ""' <<<"$run")
+          [ "$run_repo" = "$REPO" ] || { echo "::error::validated_run belongs to another repository"; exit 1; }
+          [[ "$workflow_id" =~ ^[0-9]+$ ]] || { echo "::error::validated_run has no workflow id"; exit 1; }
+          workflow_path=$(gh api "repos/${REPO}/actions/workflows/${workflow_id}" --jq '.path')
+          if [ "$workflow_path" != ".github/workflows/ios-shared-validate.yml" ]; then
+            echo "::error::validated_run is not an ios-shared-validate run"
+            exit 1
+          fi
+          if [ "$status" != "completed" ] || [ "$conclusion" != "success" ]; then
+            echo "::error::validated_run is not a completed successful run (status=${status}, conclusion=${conclusion})"
+            exit 1
+          fi
+
+          jobs=$(gh api --paginate "repos/${REPO}/actions/runs/${VALIDATED_RUN}/jobs?per_page=100" --jq '.jobs[]' | jq -s '.')
+          count=$(jq '[.[] | select(.name == "validate")] | length' <<<"$jobs")
+          [ "$count" = "1" ] || { echo "::error::expected exactly one validate job in the run, found ${count}"; exit 1; }
+          job_id=$(jq -r '.[] | select(.name == "validate") | .id' <<<"$jobs")
+          job_conclusion=$(jq -r '.[] | select(.name == "validate") | .conclusion // ""' <<<"$jobs")
+          [ "$job_conclusion" = "success" ] || { echo "::error::validate job conclusion is ${job_conclusion}"; exit 1; }
+          [[ "$job_id" =~ ^[0-9]+$ ]] || { echo "::error::bad validate job id"; exit 1; }
+
+          # The validate workflow echoes exactly "Cloned <ref> at <verified sha>" after it
+          # has proven HEAD == the requested sha. Require the main variant, anchored.
+          gh api "repos/${REPO}/actions/jobs/${job_id}/logs" | tr -d '\r' > "$RUNNER_TEMP/validate-job.log"
+          if ! grep -Eq "^([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z )?Cloned main at ${SHA}$" "$RUNNER_TEMP/validate-job.log"; then
+            echo "::error::the validate job log does not contain the exact line 'Cloned main at ${SHA}'"
+            exit 1
+          fi
+          echo "validated_run ${VALIDATED_RUN} validated main at ${SHA}"
+
+      - name: SHA is on Forgejo main (merged code only)
+        env:
+          HOST: ${{ secrets.FORGEJO_HOST }}
+          TOKEN: ${{ secrets.FORGEJO_CLONE_TOKEN }}
+          SHA: ${{ inputs.sha }}
+        run: |
+          set -euo pipefail
+          AUTH=$(printf 'oauth2:%s' "$TOKEN" | base64 -w0)
+          echo "::add-mask::$AUTH"
+          echo "::add-mask::$TOKEN"
+          echo "::add-mask::$HOST"
+          # Commits only (tree:0 filter, ignored by servers that do not support it):
+          # ancestry needs no file contents.
+          git -c http.extraheader="AUTHORIZATION: basic $AUTH" \
+            clone --bare --single-branch --branch main --filter=tree:0 \
+            "https://${HOST}/hiten/RadioShake.git" "$RUNNER_TEMP/gate.git" >/dev/null 2>&1 \
+            || { echo "::error::could not clone Forgejo main"; exit 1; }
+          if grep -q "AUTHORIZATION" "$RUNNER_TEMP/gate.git/config"; then
+            echo "::error::auth header was persisted in the clone config"
+            exit 1
+          fi
+          git -C "$RUNNER_TEMP/gate.git" cat-file -e "${SHA}^{commit}" 2>/dev/null \
+            || { echo "::error::${SHA} is not a commit on Forgejo main"; exit 1; }
+          git -C "$RUNNER_TEMP/gate.git" merge-base --is-ancestor "$SHA" refs/heads/main \
+            || { echo "::error::${SHA} is not an ancestor of (or equal to) Forgejo main"; exit 1; }
+          rm -rf "$RUNNER_TEMP/gate.git"
+          echo "${SHA} is on main"
+
+  testflight:
+    needs: gate
+    # Only this job reads the App Store Connect secrets, and only after the
+    # owner approves the run in the `testflight` environment.
+    environment: testflight
+    runs-on: macos-26
+    timeout-minutes: 180
+    permissions:
+      contents: read
+    steps:
+      - name: Require a dispatch from main
+        env:
+          REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          if [ "$REF" != "refs/heads/main" ]; then
+            echo "::error::ios-testflight must be dispatched from main"
+            exit 1
+          fi
+
+      - name: Check out CI helper scripts
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          path: ci
+          sparse-checkout: .github/scripts
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - name: Validate inputs
+        env:
+          SHA: ${{ inputs.sha }}
+          VALIDATED_RUN: ${{ inputs.validated_run }}
+          MODE: ${{ inputs.mode }}
+          RESUME_BUILD: ${{ inputs.resume_build }}
+          NOTES: ${{ inputs.notes }}
+        run: python3 ci/.github/scripts/validate_inputs.py
+
+      - name: Clone source at the gated SHA
+        id: clone
+        env:
+          HOST: ${{ secrets.FORGEJO_HOST }}
+          TOKEN: ${{ secrets.FORGEJO_CLONE_TOKEN }}
+          SHA: ${{ inputs.sha }}
+        run: |
+          set -euo pipefail
+          AUTH=$(printf 'oauth2:%s' "$TOKEN" | base64)
+          echo "::add-mask::$AUTH"
+          echo "::add-mask::$TOKEN"
+          echo "::add-mask::$HOST"
+
+          git -c http.extraheader="AUTHORIZATION: basic $AUTH" \
+            clone --depth 1 --branch main "https://${HOST}/hiten/RadioShake.git" src
+
+          if grep -rq "AUTHORIZATION" src/.git/config; then
+            echo "::error::auth header was persisted in src/.git/config"
+            exit 1
+          fi
+
+          HEAD_SHA=$(git -C src rev-parse HEAD)
+          if [ "$HEAD_SHA" != "$SHA" ]; then
+            echo "main tip $HEAD_SHA != requested $SHA; deepening history"
+            if [ "$(git -C src rev-parse --is-shallow-repository)" = "true" ]; then
+              git -C src -c http.extraheader="AUTHORIZATION: basic $AUTH" \
+                fetch --unshallow origin main \
+                || { echo "::error::could not fetch full history of main"; exit 1; }
+            fi
+            git -C src cat-file -e "${SHA}^{commit}" 2>/dev/null \
+              || { echo "::error::${SHA} does not exist on main"; exit 1; }
+            git -C src merge-base --is-ancestor "$SHA" origin/main \
+              || { echo "::error::${SHA} is not an ancestor of origin/main"; exit 1; }
+            git -C src checkout --detach "$SHA" \
+              || { echo "::error::could not check out ${SHA}"; exit 1; }
+          fi
+          [ "$(git -C src rev-parse HEAD)" = "$SHA" ] \
+            || { echo "::error::checked-out commit does not match ${SHA}"; exit 1; }
+
+          # Marketing version: exactly one MARKETING_VERSION line in ios/project.yml.
+          VERSION=$(sed -nE 's/^[[:space:]]+MARKETING_VERSION:[[:space:]]*"([0-9]+\.[0-9]+(\.[0-9]+)?)"[[:space:]]*$/\1/p' src/ios/project.yml)
+          if [ "$(printf '%s\n' "$VERSION" | grep -c .)" != "1" ]; then
+            echo "::error::expected exactly one MARKETING_VERSION in ios/project.yml"
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Checked out main at ${SHA}, marketing version ${VERSION}"
+
+      - name: Set up JDK 21
+        if: ${{ inputs.mode != 'resume' }}
+        uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3  # v4.9.1
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: macOS preflight
+        if: ${{ inputs.mode != 'resume' }}
+        run: |
+          set -euo pipefail
+          ARCH=$(uname -m)
+          if [ "$ARCH" != "arm64" ]; then
+            echo "::error::Expected arm64, got $ARCH"
+            exit 1
+          fi
+          if [ ! -d "$XCODE_APP" ]; then
+            echo "::error::$XCODE_APP is missing; the macos-26 image changed. Update XCODE_APP (same value as ios-shared-validate.yml). Installed:"
+            ls -d /Applications/Xcode*.app || true
+            exit 1
+          fi
+          sudo xcode-select -s "$XCODE_APP"
+          xcode-select -p
+          xcodebuild -version
+          echo "$ARCH"
+          java -version
+          xcrun --sdk iphoneos --show-sdk-path
+
+      - name: Install XcodeGen (pinned)
+        if: ${{ inputs.mode != 'resume' }}
+        run: |
+          set -euo pipefail
+          VERSION="2.42.0"
+          curl -fsSL -o /tmp/xcodegen.zip \
+            "https://github.com/yonaskolb/XcodeGen/releases/download/${VERSION}/xcodegen.zip"
+          unzip -q /tmp/xcodegen.zip -d /tmp/xcodegen
+          sudo mv /tmp/xcodegen/xcodegen/bin/xcodegen /usr/local/bin/xcodegen
+          sudo cp -R /tmp/xcodegen/xcodegen/share/* /usr/local/share/ || true
+          xcodegen --version
+
+      - name: Python environment for the App Store Connect helper
+        run: |
+          set -euo pipefail
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/python" -m pip install --quiet --disable-pip-version-check \
+            'pyjwt==2.10.1' 'cryptography==50.0.2' 'requests==2.34.2'
+
+      - name: Build the Release XCFramework
+        if: ${{ inputs.mode != 'resume' }}
+        working-directory: src
+        run: |
+          set -euo pipefail
+          SAN="$GITHUB_WORKSPACE/ci/.github/scripts/sanitize_log.py"
+          if ! ./gradlew --no-daemon :shared:assembleRadioShakeSharedReleaseXCFramework \
+              > "$RUNNER_TEMP/gradle.log" 2>&1; then
+            echo "::error::Gradle Release XCFramework build failed (filtered error lines follow)"
+            python3 "$SAN" "$RUNNER_TEMP/gradle.log" "$GITHUB_WORKSPACE/src"
+            exit 1
+          fi
+          test -d shared/build/XCFrameworks/release/RadioShakeShared.xcframework \
+            || { echo "::error::release XCFramework not produced"; exit 1; }
+          # The Xcode preBuildScript re-points this per configuration, but Xcode's
+          # file-reference validation runs first, so it must be correct up front.
+          mkdir -p shared/build/XCFrameworks/current
+          rm -rf shared/build/XCFrameworks/current/RadioShakeShared.xcframework
+          ln -sfn "$PWD/shared/build/XCFrameworks/release/RadioShakeShared.xcframework" \
+                  "$PWD/shared/build/XCFrameworks/current/RadioShakeShared.xcframework"
+          echo "Release XCFramework ready"
+
+      - name: Generate Xcode project
+        if: ${{ inputs.mode != 'resume' }}
+        working-directory: src/ios
+        run: |
+          set -euo pipefail
+          xcodegen generate --spec project.yml > "$RUNNER_TEMP/xcodegen.log" 2>&1 \
+            || { echo "::error::xcodegen failed"; python3 "$GITHUB_WORKSPACE/ci/.github/scripts/sanitize_log.py" "$RUNNER_TEMP/xcodegen.log" "$GITHUB_WORKSPACE/src"; exit 1; }
+          echo "Xcode project generated"
+
+      - name: Prepare App Store Connect key
+        env:
+          ASC_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          ASC_KEY_B64: ${{ secrets.APP_STORE_CONNECT_PRIVATE_KEY_B64 }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          for name in ASC_KEY_ID ASC_ISSUER_ID ASC_KEY_B64 APPLE_TEAM_ID; do
+            if [ -z "${!name}" ]; then
+              echo "::error::${name} is empty: the testflight environment secret is missing"
+              exit 1
+            fi
+          done
+          [[ "$APPLE_TEAM_ID" =~ ^[A-Z0-9]{10}$ ]] \
+            || { echo "::error::APPLE_TEAM_ID is not a 10-character team id"; exit 1; }
+          KEY="$RUNNER_TEMP/asc-key.p8"
+          umask 077
+          python3 - "$KEY" <<'PY'
+          import base64, os, sys
+          fd = os.open(sys.argv[1], os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+          with os.fdopen(fd, "wb") as fh:
+              fh.write(base64.b64decode(os.environ["ASC_KEY_B64"], validate=False))
+          PY
+          chmod 600 "$KEY"
+          openssl pkey -in "$KEY" -noout 2>/dev/null \
+            || { echo "::error::the decoded App Store Connect key is not a valid private key"; exit 1; }
+          echo "App Store Connect key prepared (mode 600)"
+
+      - name: Archive, verify, export and upload
+        id: archive
+        if: ${{ inputs.mode != 'resume' }}
+        working-directory: src/ios
+        env:
+          ASC_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          TEAM: ${{ secrets.APPLE_TEAM_ID }}
+          MODE: ${{ inputs.mode }}
+          VERSION: ${{ steps.clone.outputs.version }}
+        run: |
+          set -euo pipefail
+          SCRIPTS="$GITHUB_WORKSPACE/ci/.github/scripts"
+          SAN="$SCRIPTS/sanitize_log.py"
+          PY="$RUNNER_TEMP/venv/bin/python"
+          export ASC_KEY_PATH="$RUNNER_TEMP/asc-key.p8"
+          ARCHIVE="$RUNNER_TEMP/RadioShake.xcarchive"
+          EXPORT_DIR="$RUNNER_TEMP/export"
+          OPTIONS="$RUNNER_TEMP/ExportOptions.plist"
+          APP="$ARCHIVE/Products/Applications/RadioShake.app"
+
+          fail() { echo "::error::$1"; exit 1; }
+          show() { python3 "$SAN" "$1" "$GITHUB_WORKSPACE/src"; }
+
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]] || fail "bad marketing version"
+
+          TEAM="$TEAM" python3 - "$OPTIONS" <<'PY'
+          import os, plistlib, sys
+          with open(sys.argv[1], "wb") as fh:
+              plistlib.dump({
+                  "method": "app-store-connect",
+                  "destination": "upload",
+                  "teamID": os.environ["TEAM"],
+                  "signingStyle": "automatic",
+                  "uploadSymbols": True,
+                  "manageAppVersionAndBuildNumber": False,
+              }, fh)
+          PY
+
+          auth_flags=(-allowProvisioningUpdates -authenticationKeyPath "$ASC_KEY_PATH"
+                      -authenticationKeyID "$ASC_KEY_ID" -authenticationKeyIssuerID "$ASC_ISSUER_ID")
+
+          allocate() {
+            local n
+            n=$("$PY" "$SCRIPTS/asc_testflight.py" allocate) || return 1
+            [[ "$n" =~ ^[1-9][0-9]{0,8}$ ]] || return 1
+            printf '%s' "$n"
+          }
+
+          do_archive() {
+            rm -rf "$ARCHIVE"
+            xcodebuild archive \
+              -project RadioShake.xcodeproj -scheme RadioShake -configuration Release \
+              -destination 'generic/platform=iOS' -archivePath "$ARCHIVE" \
+              "${auth_flags[@]}" \
+              DEVELOPMENT_TEAM="$TEAM" CODE_SIGN_STYLE=Automatic \
+              CODE_SIGN_IDENTITY="Apple Development" \
+              CODE_SIGNING_ALLOWED=YES CODE_SIGNING_REQUIRED=YES \
+              CURRENT_PROJECT_VERSION="$1" \
+              > "$RUNNER_TEMP/archive.log" 2>&1
+          }
+
+          # Mach-O or dSYM bundle -> sorted "UUID arch" lines.
+          uuids() { dwarfdump --uuid "$1" 2>/dev/null | awk '/^UUID:/ {print $2 " " $3}' | sort; }
+
+          verify_archive() {
+            local n="$1" plist actual bin dsym fw_bin fw_dsym sym_count
+            plist="$APP/Info.plist"
+            [ -f "$plist" ] || fail "archive has no app Info.plist"
+            pb() { /usr/libexec/PlistBuddy -c "Print :$1" "$plist"; }
+            [ "$(pb CFBundleIdentifier)" = "$BUNDLE_ID" ] || fail "archived bundle id is not $BUNDLE_ID"
+            [ "$(pb CFBundleShortVersionString)" = "$VERSION" ] || fail "archived marketing version differs from $VERSION"
+            [ "$(pb CFBundleVersion)" = "$n" ] || fail "archived build number differs from $n"
+            [ "$(pb ITSAppUsesNonExemptEncryption)" = "false" ] || fail "ITSAppUsesNonExemptEncryption is not false"
+
+            bin="$APP/RadioShake"
+            dsym="$ARCHIVE/dSYMs/RadioShake.app.dSYM"
+            [ -f "$bin" ] || fail "archive has no app executable"
+            [ -d "$dsym" ] || fail "archive has no app dSYM"
+            actual=$(uuids "$bin")
+            [ -n "$actual" ] || fail "could not read the app binary UUID"
+            [ "$actual" = "$(uuids "$dsym")" ] || fail "app dSYM UUID does not match the app binary"
+            echo "app dSYM present, UUID matches the binary"
+
+            fw_bin="$APP/Frameworks/RadioShakeShared.framework/RadioShakeShared"
+            fw_dsym="$ARCHIVE/dSYMs/RadioShakeShared.framework.dSYM"
+            if [ -f "$fw_bin" ]; then
+              [ -d "$fw_dsym" ] || fail "embedded RadioShakeShared has no dSYM in the archive"
+              [ "$(uuids "$fw_bin")" = "$(uuids "$fw_dsym")" ] || fail "RadioShakeShared dSYM UUID does not match its binary"
+              echo "RadioShakeShared dSYM present, UUID matches the binary"
+            else
+              # isStatic = true in shared/build.gradle.kts: the Kotlin framework is linked into the
+              # app executable, so its symbols are covered by the app dSYM checked above.
+              sym_count=$(nm "$bin" 2>/dev/null | grep -c 'kfun' || true)
+              echo "RadioShakeShared is statically linked into the app (UUID covered by the app dSYM; Kotlin symbols in binary: ${sym_count})"
+              if [ -d "$fw_dsym" ]; then
+                [ -n "$(uuids "$fw_dsym")" ] || fail "RadioShakeShared dSYM has no UUID"
+                echo "standalone RadioShakeShared dSYM also present"
+              fi
+            fi
+          }
+
+          do_export() {
+            rm -rf "$EXPORT_DIR"
+            xcodebuild -exportArchive -archivePath "$ARCHIVE" -exportPath "$EXPORT_DIR" \
+              -exportOptionsPlist "$OPTIONS" "${auth_flags[@]}" \
+              > "$RUNNER_TEMP/export.log" 2>&1
+          }
+
+          uploaded=false
+          n=""
+          for attempt in 1 2; do
+            n=$(allocate) || fail "could not allocate a build number from App Store Connect"
+            echo "Attempt ${attempt}: archiving ${VERSION} (${n})"
+            if ! do_archive "$n"; then
+              echo "::error::xcodebuild archive failed (filtered error lines follow)"
+              show "$RUNNER_TEMP/archive.log"
+              exit 1
+            fi
+            echo "Archive built"
+            verify_archive "$n"
+            echo "build_number=$n" >> "$GITHUB_OUTPUT"
+
+            if [ "$MODE" = "archive_only" ]; then
+              echo "archive_only: stopping before export and upload"
+              echo "uploaded=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+
+            fresh=$(allocate) || fail "could not re-check the build number"
+            if [ "$fresh" != "$n" ]; then
+              echo "Build number ${n} went stale (next free is ${fresh})"
+              [ "$attempt" = 1 ] && continue
+              fail "build number went stale twice"
+            fi
+
+            if do_export; then
+              uploaded=true
+              grep -Eo 'EXPORT SUCCEEDED|Upload succeeded|Uploaded [A-Za-z]+' "$RUNNER_TEMP/export.log" | sort -u || true
+              break
+            fi
+            if grep -Eiq 'already been used|bundle version must be higher|previously uploaded|INVALID\.DUPLICATE' "$RUNNER_TEMP/export.log" && [ "$attempt" = 1 ]; then
+              echo "Duplicate build number reported by App Store Connect; retrying once with a fresh number"
+              continue
+            fi
+            echo "::error::xcodebuild -exportArchive failed (filtered error lines follow)"
+            show "$RUNNER_TEMP/export.log"
+            exit 1
+          done
+          [ "$uploaded" = true ] || fail "no build was uploaded"
+          echo "uploaded=true" >> "$GITHUB_OUTPUT"
+          echo "Uploaded ${VERSION} (${n})"
+
+      - name: Process and distribute
+        id: distribute
+        if: ${{ inputs.mode != 'archive_only' }}
+        env:
+          ASC_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          VERSION: ${{ steps.clone.outputs.version }}
+          BUILD: ${{ inputs.mode == 'resume' && inputs.resume_build || steps.archive.outputs.build_number }}
+          NOTES: ${{ inputs.notes }}
+        run: |
+          set -euo pipefail
+          [[ "$BUILD" =~ ^[1-9][0-9]{0,8}$ ]] || { echo "::error::no valid build number to distribute"; exit 1; }
+          export ASC_KEY_PATH="$RUNNER_TEMP/asc-key.p8"
+          export ASC_BUNDLE_ID="$BUNDLE_ID"
+          args=(distribute --version "$VERSION" --build "$BUILD" --group "$INTERNAL_GROUP" --wait-minutes 60)
+          if [ -n "$NOTES" ]; then
+            printf '%s' "$NOTES" > "$RUNNER_TEMP/notes.txt"
+            args+=(--notes-file "$RUNNER_TEMP/notes.txt")
+          fi
+          "$RUNNER_TEMP/venv/bin/python" "$GITHUB_WORKSPACE/ci/.github/scripts/asc_testflight.py" "${args[@]}"
+
+      - name: Remove the App Store Connect key and build products
+        if: ${{ always() }}
+        run: |
+          rm -f "$RUNNER_TEMP/asc-key.p8" "$RUNNER_TEMP/notes.txt"
+          rm -rf "$RUNNER_TEMP/export" "$RUNNER_TEMP/RadioShake.xcarchive" "$RUNNER_TEMP/ExportOptions.plist"
+          if [ -e "$RUNNER_TEMP/asc-key.p8" ]; then
+            echo "::error::key file still exists"
+            exit 1
+          fi
+          echo "key and build products removed"
+
+      - name: Release record
+        if: ${{ always() }}
+        env:
+          JOB_STATUS: ${{ job.status }}
+          MODE: ${{ inputs.mode }}
+          SHA: ${{ inputs.sha }}
+          VALIDATED_RUN: ${{ inputs.validated_run }}
+          VERSION: ${{ steps.clone.outputs.version }}
+          BUILD: ${{ inputs.mode == 'resume' && inputs.resume_build || steps.archive.outputs.build_number }}
+          ASC_BUILD_ID: ${{ steps.distribute.outputs.asc_build_id }}
+          STATE: ${{ steps.distribute.outputs.state }}
+          BETA_STATE: ${{ steps.distribute.outputs.beta_state }}
+          IN_GROUP: ${{ steps.distribute.outputs.in_group }}
+          WHATS_NEW: ${{ steps.distribute.outputs.whats_new }}
+          UPLOADED: ${{ steps.archive.outputs.uploaded }}
+        run: |
+          set -euo pipefail
+          # Every value below is either a workflow input already validated by validate_inputs.py
+          # or a constrained token written by this workflow's own steps. Nothing here is secret.
+          safe() { printf '%s' "${1:-}" | tr -c 'A-Za-z0-9_.:-' '?' | cut -c1-80; }
+          val() { if [ -n "${1:-}" ]; then safe "$1"; else printf '%s' "$2"; fi; }
+          {
+            echo "## iOS TestFlight release record"
+            echo
+            echo "| Field | Value |"
+            echo "|---|---|"
+            echo "| Job result | $(safe "$JOB_STATUS") |"
+            echo "| Mode | $(safe "$MODE") |"
+            echo "| Version | $(safe "$VERSION") |"
+            echo "| Build number | $(val "$BUILD" 'not allocated') |"
+            echo "| App Store Connect build id | $(val "$ASC_BUILD_ID" 'not found') |"
+            echo "| Commit SHA | \`$(safe "$SHA")\` |"
+            echo "| Validated run | [${VALIDATED_RUN}](https://github.com/${GITHUB_REPOSITORY}/actions/runs/$(safe "$VALIDATED_RUN")) |"
+            echo "| This run | [${GITHUB_RUN_ID}](https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}) |"
+            echo "| Uploaded this run | $(val "$UPLOADED" 'no') |"
+            echo "| Processing state | $(val "$STATE" 'n/a') |"
+            echo "| Internal build state | $(val "$BETA_STATE" 'n/a') |"
+            echo "| In internal group | $(val "$IN_GROUP" 'n/a') |"
+            echo "| What to Test | $(val "$WHATS_NEW" 'n/a') |"
+            echo "| Export options | method app-store-connect, destination upload, signingStyle automatic, uploadSymbols true, manageAppVersionAndBuildNumber false |"
+            echo
+            if [ "${STATE:-}" = "PENDING" ]; then
+              echo "**Processing is still pending.** Rerun with mode=resume and resume_build=$(safe "$BUILD") (same sha and validated_run) to poll and distribute the existing build."
+              echo
+            fi
+            echo "### Not verifiable by CI (device-only limitations)"
+            echo
+            echo "- Audible output"
+            echo "- Background playback"
+            echo "- Hardware routes including AirPlay"
+            echo "- Interruptions (calls, alarms, other audio)"
+            echo "- Real lock screen and Control Centre"
+            echo "- Small-screen layout on the owner's iPhone SE (2nd generation)"
+            echo
+            echo "Go/no-go decision: pending, to be recorded by the owner in the runbook's TestFlight release record."
+          } >> "$GITHUB_STEP_SUMMARY"

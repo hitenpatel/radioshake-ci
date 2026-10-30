@@ -13,6 +13,9 @@ permissions:
 
 jobs:
   verify:
+    # The App Store Connect secrets live only in the `testflight` environment
+    # (owner approval per run, main-only), so this job must declare it.
+    environment: testflight
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
