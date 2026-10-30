@@ -3,41 +3,47 @@
 
 Usage: sanitize_log.py LOGFILE [PROJECT_ROOT]
 
-Keeps only error-looking lines, rewrites absolute paths (project paths become
-relative, everything else becomes <path>), drops any line resembling a key or
-token, truncates lines and caps the output.
+Only compiler diagnostics of the form `path:line:col: error: message` are shown, and:
+  - the path must be an existing file under PROJECT_ROOT (shown relative); anything else
+    becomes <path>, so build output cannot smuggle text through the path position
+  - absolute paths inside the message are rewritten (project-relative or <path>)
+  - every run of 20 or more base64/hex-like characters ([A-Za-z0-9+/=_-]) is redacted
+  - each line is capped at 160 characters, at most 40 lines, duplicates dropped
+All other log text (including Gradle, Xcode and export chatter) is deliberately not
+printed: callers print their own fixed messages.
 """
+import os
 import re
 import sys
 
-KEEP = re.compile(r"error:|^e: |\*\* (ARCHIVE|EXPORT|BUILD) FAILED|FAILURE: |What went wrong|^error", re.I)
-# Checked on the raw line (secret-looking markers) and on the path-rewritten line (long opaque runs,
-# so that ordinary long paths are not mistaken for tokens).
-DROP_RAW = re.compile(r"PRIVATE KEY|eyJ[A-Za-z0-9_-]{10,}|AuthKey|\.p8\b|-authentication(Key|Issuer)", re.I)
-DROP_REWRITTEN = re.compile(r"[A-Za-z0-9+/=_-]{60,}")
+ERROR = re.compile(r"^(?P<path>[^\s:]+):(?P<line>[0-9]+):(?P<col>[0-9]+): error: (?P<msg>.*)$")
 PATH = re.compile(r"(?<![\w.:])(?:file://)?(/[^\s:'\"()\[\],;]+)")
+REDACT = re.compile(r"[A-Za-z0-9+/=_-]{20,}")
 MAX_LINES = 40
-MAX_CHARS = 300
+MAX_CHARS = 160
 
 
 def sanitize(lines, root=""):
     root = root.rstrip("/")
     out, seen = [], set()
 
-    def repl(match):
-        path = match.group(1)
+    def rel_if_project_file(path):
         if root and path.startswith(root + "/"):
-            return path[len(root) + 1:]
-        return "<path>"
+            rel = path[len(root) + 1:]
+            if ".." not in rel.split("/") and os.path.isfile(os.path.join(root, rel)):
+                return rel
+        return None
 
-    for line in lines:
-        line = line.rstrip("\n")
-        if not KEEP.search(line) or DROP_RAW.search(line):
+    def repl(match):
+        return rel_if_project_file(match.group(1)) or "<path>"
+
+    for raw in lines:
+        m = ERROR.match(raw.rstrip("\n"))
+        if not m:
             continue
-        line = PATH.sub(repl, line)
-        if DROP_REWRITTEN.search(line):
-            continue
-        line = line[:MAX_CHARS]
+        shown = rel_if_project_file(m.group("path")) or "<path>"
+        msg = PATH.sub(repl, m.group("msg"))
+        line = f"{shown}:{m.group('line')}:{m.group('col')}: error: {REDACT.sub('<redacted>', msg)}"[:MAX_CHARS]
         if line not in seen:
             seen.add(line)
             out.append(line)
@@ -56,7 +62,7 @@ def main():
     except OSError:
         print("(no log captured)")
         return 0
-    print("\n".join(lines) if lines else "(no error lines found in the log)")
+    print("\n".join(lines) if lines else "(no compiler error lines in the log; see the failing step name above)")
     return 0
 
 

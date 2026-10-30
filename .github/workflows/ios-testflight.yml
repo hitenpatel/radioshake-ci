@@ -14,7 +14,8 @@
 # Dispatch (from main only):
 #   gh workflow run ios-testflight.yml -R hitenpatel/radioshake-ci \
 #     -f sha=<40-hex> -f validated_run=<ios-shared-validate run id> \
-#     [-f notes='What to Test'] [-f mode=release|archive_only|resume] [-f resume_build=<n>]
+#     [-f notes='What to Test'] [-f mode=release|archive_only|resume] \
+#     [-f resume_build=<n> -f release_run=<id of the run that uploaded it>]
 
 name: ios-testflight
 
@@ -48,6 +49,11 @@ on:
           - resume
       resume_build:
         description: 'Build number to resume (required for mode=resume)'
+        required: false
+        default: ''
+        type: string
+      release_run:
+        description: 'Run id of the ios-testflight release run that uploaded resume_build (required for mode=resume)'
         required: false
         default: ''
         type: string
@@ -100,10 +106,11 @@ jobs:
           VALIDATED_RUN: ${{ inputs.validated_run }}
           MODE: ${{ inputs.mode }}
           RESUME_BUILD: ${{ inputs.resume_build }}
+          RELEASE_RUN: ${{ inputs.release_run }}
           NOTES: ${{ inputs.notes }}
         run: python3 ci/.github/scripts/validate_inputs.py
 
-      - name: validated_run is a successful ios-shared-validate run of this SHA
+      - name: Verify the validated run (trusted validator revision, first clone line)
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
@@ -111,39 +118,33 @@ jobs:
           VALIDATED_RUN: ${{ inputs.validated_run }}
         run: |
           set -euo pipefail
-          run=$(gh api "repos/${REPO}/actions/runs/${VALIDATED_RUN}")
-          status=$(jq -r '.status // ""' <<<"$run")
-          conclusion=$(jq -r '.conclusion // ""' <<<"$run")
-          workflow_id=$(jq -r '.workflow_id // ""' <<<"$run")
-          run_repo=$(jq -r '.repository.full_name // ""' <<<"$run")
-          [ "$run_repo" = "$REPO" ] || { echo "::error::validated_run belongs to another repository"; exit 1; }
-          [[ "$workflow_id" =~ ^[0-9]+$ ]] || { echo "::error::validated_run has no workflow id"; exit 1; }
-          workflow_path=$(gh api "repos/${REPO}/actions/workflows/${workflow_id}" --jq '.path')
-          if [ "$workflow_path" != ".github/workflows/ios-shared-validate.yml" ]; then
-            echo "::error::validated_run is not an ios-shared-validate run"
-            exit 1
-          fi
-          if [ "$status" != "completed" ] || [ "$conclusion" != "success" ]; then
-            echo "::error::validated_run is not a completed successful run (status=${status}, conclusion=${conclusion})"
-            exit 1
-          fi
+          SCRIPTS="$GITHUB_WORKSPACE/ci/.github/scripts"
+          # shellcheck source=/dev/null
+          . "$SCRIPTS/fetch_run_evidence.sh"
+          fetch_run_evidence "$VALIDATED_RUN" validated validate
+          python3 "$SCRIPTS/gate_check.py" validate --repo "$REPO" --sha "$SHA" \
+            --run "$RUNNER_TEMP/validated-run.json" --workflow "$RUNNER_TEMP/validated-workflow.json" \
+            --compare "$RUNNER_TEMP/validated-compare.json" --jobs "$RUNNER_TEMP/validated-jobs.json" \
+            --log "$RUNNER_TEMP/validated-log.txt"
 
-          jobs=$(gh api --paginate "repos/${REPO}/actions/runs/${VALIDATED_RUN}/jobs?per_page=100" --jq '.jobs[]' | jq -s '.')
-          count=$(jq '[.[] | select(.name == "validate")] | length' <<<"$jobs")
-          [ "$count" = "1" ] || { echo "::error::expected exactly one validate job in the run, found ${count}"; exit 1; }
-          job_id=$(jq -r '.[] | select(.name == "validate") | .id' <<<"$jobs")
-          job_conclusion=$(jq -r '.[] | select(.name == "validate") | .conclusion // ""' <<<"$jobs")
-          [ "$job_conclusion" = "success" ] || { echo "::error::validate job conclusion is ${job_conclusion}"; exit 1; }
-          [[ "$job_id" =~ ^[0-9]+$ ]] || { echo "::error::bad validate job id"; exit 1; }
-
-          # The validate workflow echoes exactly "Cloned <ref> at <verified sha>" after it
-          # has proven HEAD == the requested sha. Require the main variant, anchored.
-          gh api "repos/${REPO}/actions/jobs/${job_id}/logs" | tr -d '\r' > "$RUNNER_TEMP/validate-job.log"
-          if ! grep -Eq "^([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z )?Cloned main at ${SHA}$" "$RUNNER_TEMP/validate-job.log"; then
-            echo "::error::the validate job log does not contain the exact line 'Cloned main at ${SHA}'"
-            exit 1
-          fi
-          echo "validated_run ${VALIDATED_RUN} validated main at ${SHA}"
+      - name: Verify the release run that uploaded the build (resume provenance)
+        if: ${{ inputs.mode == 'resume' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ inputs.sha }}
+          RELEASE_RUN: ${{ inputs.release_run }}
+          RESUME_BUILD: ${{ inputs.resume_build }}
+        run: |
+          set -euo pipefail
+          SCRIPTS="$GITHUB_WORKSPACE/ci/.github/scripts"
+          # shellcheck source=/dev/null
+          . "$SCRIPTS/fetch_run_evidence.sh"
+          fetch_run_evidence "$RELEASE_RUN" release testflight
+          python3 "$SCRIPTS/gate_check.py" release --repo "$REPO" --sha "$SHA" --build "$RESUME_BUILD" \
+            --run "$RUNNER_TEMP/release-run.json" --workflow "$RUNNER_TEMP/release-workflow.json" \
+            --compare "$RUNNER_TEMP/release-compare.json" --jobs "$RUNNER_TEMP/release-jobs.json" \
+            --log "$RUNNER_TEMP/release-log.txt"
 
       - name: SHA is on Forgejo main (merged code only)
         env:
@@ -207,6 +208,7 @@ jobs:
           VALIDATED_RUN: ${{ inputs.validated_run }}
           MODE: ${{ inputs.mode }}
           RESUME_BUILD: ${{ inputs.resume_build }}
+          RELEASE_RUN: ${{ inputs.release_run }}
           NOTES: ${{ inputs.notes }}
         run: python3 ci/.github/scripts/validate_inputs.py
 
@@ -291,8 +293,15 @@ jobs:
         run: |
           set -euo pipefail
           VERSION="2.42.0"
+          # Reviewed digest of the 2.42.0 release zip (first recorded 2026-10-30, reproduced twice).
+          EXPECTED_SHA256="a760b4bf97460341316a2c00d8c87b2946c6c2729eb57e9a72abb3ef7bc0ef82"
           curl -fsSL -o /tmp/xcodegen.zip \
             "https://github.com/yonaskolb/XcodeGen/releases/download/${VERSION}/xcodegen.zip"
+          ACTUAL_SHA256=$(shasum -a 256 /tmp/xcodegen.zip | awk '{print $1}')
+          if [ "$ACTUAL_SHA256" != "$EXPECTED_SHA256" ]; then
+            echo "::error::XcodeGen ${VERSION} zip digest does not match the reviewed value"
+            exit 1
+          fi
           unzip -q /tmp/xcodegen.zip -d /tmp/xcodegen
           sudo mv /tmp/xcodegen/xcodegen/bin/xcodegen /usr/local/bin/xcodegen
           sudo cp -R /tmp/xcodegen/xcodegen/share/* /usr/local/share/ || true
@@ -303,7 +312,8 @@ jobs:
           set -euo pipefail
           python3 -m venv "$RUNNER_TEMP/venv"
           "$RUNNER_TEMP/venv/bin/python" -m pip install --quiet --disable-pip-version-check \
-            'pyjwt==2.10.1' 'cryptography==50.0.2' 'requests==2.34.2'
+            --require-hashes --only-binary=:all: \
+            -r "$GITHUB_WORKSPACE/ci/.github/scripts/requirements-asc.txt"
 
       - name: Build the Release XCFramework
         if: ${{ inputs.mode != 'resume' }}
@@ -313,7 +323,7 @@ jobs:
           SAN="$GITHUB_WORKSPACE/ci/.github/scripts/sanitize_log.py"
           if ! ./gradlew --no-daemon :shared:assembleRadioShakeSharedReleaseXCFramework \
               > "$RUNNER_TEMP/gradle.log" 2>&1; then
-            echo "::error::Gradle Release XCFramework build failed (filtered error lines follow)"
+            echo "::error::Gradle Release XCFramework build failed (compiler diagnostics only follow)"
             python3 "$SAN" "$RUNNER_TEMP/gradle.log" "$GITHUB_WORKSPACE/src"
             exit 1
           fi
@@ -333,7 +343,7 @@ jobs:
         run: |
           set -euo pipefail
           xcodegen generate --spec project.yml > "$RUNNER_TEMP/xcodegen.log" 2>&1 \
-            || { echo "::error::xcodegen failed"; python3 "$GITHUB_WORKSPACE/ci/.github/scripts/sanitize_log.py" "$RUNNER_TEMP/xcodegen.log" "$GITHUB_WORKSPACE/src"; exit 1; }
+            || { echo "::error::xcodegen failed (details are not printed to the public log)"; python3 "$GITHUB_WORKSPACE/ci/.github/scripts/sanitize_log.py" "$RUNNER_TEMP/xcodegen.log" "$GITHUB_WORKSPACE/src"; exit 1; }
           echo "Xcode project generated"
 
       - name: Prepare App Store Connect key
@@ -365,7 +375,7 @@ jobs:
             || { echo "::error::the decoded App Store Connect key is not a valid private key"; exit 1; }
           echo "App Store Connect key prepared (mode 600)"
 
-      - name: Archive, verify, export and upload
+      - name: Archive (unsigned), verify, export (signed) and upload
         id: archive
         if: ${{ inputs.mode != 'resume' }}
         working-directory: src/ios
@@ -374,6 +384,7 @@ jobs:
           ASC_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
           TEAM: ${{ secrets.APPLE_TEAM_ID }}
           MODE: ${{ inputs.mode }}
+          SHA: ${{ inputs.sha }}
           VERSION: ${{ steps.clone.outputs.version }}
         run: |
           set -euo pipefail
@@ -384,12 +395,14 @@ jobs:
           ARCHIVE="$RUNNER_TEMP/RadioShake.xcarchive"
           EXPORT_DIR="$RUNNER_TEMP/export"
           OPTIONS="$RUNNER_TEMP/ExportOptions.plist"
+          EXPORT_LOG="$RUNNER_TEMP/export.log"
           APP="$ARCHIVE/Products/Applications/RadioShake.app"
 
           fail() { echo "::error::$1"; exit 1; }
           show() { python3 "$SAN" "$1" "$GITHUB_WORKSPACE/src"; }
 
           [[ "$VERSION" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]] || fail "bad marketing version"
+          [[ "$SHA" =~ ^[0-9a-f]{40}$ ]] || fail "bad sha"
 
           TEAM="$TEAM" python3 - "$OPTIONS" <<'PY'
           import os, plistlib, sys
@@ -404,12 +417,15 @@ jobs:
               }, fh)
           PY
 
-          auth_flags=(-allowProvisioningUpdates -authenticationKeyPath "$ASC_KEY_PATH"
-                      -authenticationKeyID "$ASC_KEY_ID" -authenticationKeyIssuerID "$ASC_ISSUER_ID")
+          # Signing happens only at export (cloud-managed distribution signing through the API
+          # key), so no development provisioning or registered device is needed.
+          export_flags=(-allowProvisioningUpdates -authenticationKeyPath "$ASC_KEY_PATH"
+                        -authenticationKeyID "$ASC_KEY_ID" -authenticationKeyIssuerID "$ASC_ISSUER_ID")
 
+          # allocate <greater-than>: next free number, strictly above the given rejected number.
           allocate() {
             local n
-            n=$("$PY" "$SCRIPTS/asc_testflight.py" allocate) || return 1
+            n=$("$PY" "$SCRIPTS/asc_testflight.py" allocate --greater-than "$1") || return 1
             [[ "$n" =~ ^[1-9][0-9]{0,8}$ ]] || return 1
             printf '%s' "$n"
           }
@@ -419,10 +435,7 @@ jobs:
             xcodebuild archive \
               -project RadioShake.xcodeproj -scheme RadioShake -configuration Release \
               -destination 'generic/platform=iOS' -archivePath "$ARCHIVE" \
-              "${auth_flags[@]}" \
-              DEVELOPMENT_TEAM="$TEAM" CODE_SIGN_STYLE=Automatic \
-              CODE_SIGN_IDENTITY="Apple Development" \
-              CODE_SIGNING_ALLOWED=YES CODE_SIGNING_REQUIRED=YES \
+              DEVELOPMENT_TEAM="$TEAM" CODE_SIGN_STYLE=Automatic CODE_SIGNING_ALLOWED=NO \
               CURRENT_PROJECT_VERSION="$1" \
               > "$RUNNER_TEMP/archive.log" 2>&1
           }
@@ -431,7 +444,7 @@ jobs:
           uuids() { dwarfdump --uuid "$1" 2>/dev/null | awk '/^UUID:/ {print $2 " " $3}' | sort; }
 
           verify_archive() {
-            local n="$1" plist actual bin dsym fw_bin fw_dsym sym_count
+            local n="$1" plist actual bin dsym fw_bin fw_dsym fw_uuids sym_count
             plist="$APP/Info.plist"
             [ -f "$plist" ] || fail "archive has no app Info.plist"
             pb() { /usr/libexec/PlistBuddy -c "Print :$1" "$plist"; }
@@ -453,13 +466,16 @@ jobs:
             fw_dsym="$ARCHIVE/dSYMs/RadioShakeShared.framework.dSYM"
             if [ -f "$fw_bin" ]; then
               [ -d "$fw_dsym" ] || fail "embedded RadioShakeShared has no dSYM in the archive"
-              [ "$(uuids "$fw_bin")" = "$(uuids "$fw_dsym")" ] || fail "RadioShakeShared dSYM UUID does not match its binary"
+              fw_uuids=$(uuids "$fw_bin")
+              [ -n "$fw_uuids" ] || fail "could not read the RadioShakeShared binary UUID"
+              [ "$fw_uuids" = "$(uuids "$fw_dsym")" ] || fail "RadioShakeShared dSYM UUID does not match its binary"
               echo "RadioShakeShared dSYM present, UUID matches the binary"
             else
               # isStatic = true in shared/build.gradle.kts: the Kotlin framework is linked into the
-              # app executable, so its symbols are covered by the app dSYM checked above.
+              # app executable. The app dSYM UUID check above proves the dSYM belongs to this binary;
+              # it does not prove Kotlin debug info survived linking (check a crash report once).
               sym_count=$(nm "$bin" 2>/dev/null | grep -c 'kfun' || true)
-              echo "RadioShakeShared is statically linked into the app (UUID covered by the app dSYM; Kotlin symbols in binary: ${sym_count})"
+              echo "RadioShakeShared is statically linked into the app (UUID coverage only; kfun symbols in binary: ${sym_count})"
               if [ -d "$fw_dsym" ]; then
                 [ -n "$(uuids "$fw_dsym")" ] || fail "RadioShakeShared dSYM has no UUID"
                 echo "standalone RadioShakeShared dSYM also present"
@@ -470,17 +486,33 @@ jobs:
           do_export() {
             rm -rf "$EXPORT_DIR"
             xcodebuild -exportArchive -archivePath "$ARCHIVE" -exportPath "$EXPORT_DIR" \
-              -exportOptionsPlist "$OPTIONS" "${auth_flags[@]}" \
-              > "$RUNNER_TEMP/export.log" 2>&1
+              -exportOptionsPlist "$OPTIONS" "${export_flags[@]}" \
+              > "$EXPORT_LOG" 2>&1
+          }
+
+          # Fixed category only; the raw export log is never printed to the public log.
+          classify_export_failure() {
+            if grep -Eiq 'already been used|bundle version must be higher|previously uploaded|INVALID\.DUPLICATE' "$EXPORT_LOG"; then
+              echo duplicate
+            elif grep -Eiq 'timed out|timeout|network|connection|could not connect|offline|internet' "$EXPORT_LOG"; then
+              echo network
+            elif grep -Eiq 'signing|provisioning|certificate|codesign|profile' "$EXPORT_LOG"; then
+              echo signing
+            elif grep -Eiq 'authenticat|unauthori[sz]ed|forbidden|credential|NOT_AUTHORIZED' "$EXPORT_LOG"; then
+              echo auth
+            else
+              echo other
+            fi
           }
 
           uploaded=false
+          rejected=0
           n=""
           for attempt in 1 2; do
-            n=$(allocate) || fail "could not allocate a build number from App Store Connect"
-            echo "Attempt ${attempt}: archiving ${VERSION} (${n})"
+            n=$(allocate "$rejected") || fail "could not allocate a build number from App Store Connect"
+            echo "Attempt ${attempt}: archiving ${VERSION} (${n}) unsigned"
             if ! do_archive "$n"; then
-              echo "::error::xcodebuild archive failed (filtered error lines follow)"
+              echo "::error::xcodebuild archive failed (compiler diagnostics only follow)"
               show "$RUNNER_TEMP/archive.log"
               exit 1
             fi
@@ -494,8 +526,8 @@ jobs:
               exit 0
             fi
 
-            fresh=$(allocate) || fail "could not re-check the build number"
-            if [ "$fresh" != "$n" ]; then
+            fresh=$(allocate "$rejected") || fail "could not re-check the build number"
+            if [ "$fresh" -gt "$n" ]; then
               echo "Build number ${n} went stale (next free is ${fresh})"
               [ "$attempt" = 1 ] && continue
               fail "build number went stale twice"
@@ -503,20 +535,38 @@ jobs:
 
             if do_export; then
               uploaded=true
-              grep -Eo 'EXPORT SUCCEEDED|Upload succeeded|Uploaded [A-Za-z]+' "$RUNNER_TEMP/export.log" | sort -u || true
+              echo "Uploaded build ${n} for sha ${SHA}"
               break
             fi
-            if grep -Eiq 'already been used|bundle version must be higher|previously uploaded|INVALID\.DUPLICATE' "$RUNNER_TEMP/export.log" && [ "$attempt" = 1 ]; then
-              echo "Duplicate build number reported by App Store Connect; retrying once with a fresh number"
-              continue
-            fi
-            echo "::error::xcodebuild -exportArchive failed (filtered error lines follow)"
-            show "$RUNNER_TEMP/export.log"
-            exit 1
+            category=$(classify_export_failure)
+            echo "Export/upload failed, category: ${category}"
+            case "$category" in
+              duplicate)
+                if [ "$attempt" = 1 ]; then
+                  # The rejected number may not be visible through the builds API yet, so the
+                  # retry must be strictly greater than it.
+                  rejected="$n"
+                  echo "Duplicate build number ${n}; retrying once with a strictly greater number"
+                  continue
+                fi
+                fail "App Store Connect rejected a second build number as a duplicate; wait for any in-flight upload to finish and dispatch again" ;;
+              network|other)
+                # The upload may have succeeded even though xcodebuild reported a failure.
+                if "$PY" "$SCRIPTS/asc_testflight.py" exists --version "$VERSION" --build "$n" --wait-minutes 5; then
+                  uploaded=true
+                  echo "Build ${n} is visible in App Store Connect despite the export failure"
+                  echo "Uploaded build ${n} for sha ${SHA}"
+                  break
+                fi
+                fail "upload outcome is ambiguous (build ${n} not visible after 5 minutes). Check App Store Connect before dispatching again; a later dispatch allocates a higher number" ;;
+              signing)
+                fail "signing or provisioning failed at export; see the runbook Recovery section" ;;
+              auth)
+                fail "App Store Connect authentication failed at export; run asc-verify and see the runbook Recovery section" ;;
+            esac
           done
           [ "$uploaded" = true ] || fail "no build was uploaded"
           echo "uploaded=true" >> "$GITHUB_OUTPUT"
-          echo "Uploaded ${VERSION} (${n})"
 
       - name: Process and distribute
         id: distribute
@@ -563,6 +613,8 @@ jobs:
           STATE: ${{ steps.distribute.outputs.state }}
           BETA_STATE: ${{ steps.distribute.outputs.beta_state }}
           IN_GROUP: ${{ steps.distribute.outputs.in_group }}
+          READINESS: ${{ steps.distribute.outputs.readiness }}
+          RELEASE_RUN: ${{ inputs.release_run }}
           WHATS_NEW: ${{ steps.distribute.outputs.whats_new }}
           UPLOADED: ${{ steps.archive.outputs.uploaded }}
         run: |
@@ -588,11 +640,16 @@ jobs:
             echo "| Processing state | $(val "$STATE" 'n/a') |"
             echo "| Internal build state | $(val "$BETA_STATE" 'n/a') |"
             echo "| In internal group | $(val "$IN_GROUP" 'n/a') |"
+            echo "| Ready for internal testing | $(val "$READINESS" 'n/a') |"
+            if [ -n "$RELEASE_RUN" ]; then
+              echo "| Release run (resume provenance) | [$(safe "$RELEASE_RUN")](https://github.com/${GITHUB_REPOSITORY}/actions/runs/$(safe "$RELEASE_RUN")) |"
+            fi
             echo "| What to Test | $(val "$WHATS_NEW" 'n/a') |"
+            echo "| Archive | unsigned (CODE_SIGNING_ALLOWED=NO), signed at export with automatic cloud signing |"
             echo "| Export options | method app-store-connect, destination upload, signingStyle automatic, uploadSymbols true, manageAppVersionAndBuildNumber false |"
             echo
-            if [ "${STATE:-}" = "PENDING" ]; then
-              echo "**Processing is still pending.** Rerun with mode=resume and resume_build=$(safe "$BUILD") (same sha and validated_run) to poll and distribute the existing build."
+            if [ "${STATE:-}" = "PENDING" ] || [ "${READINESS:-}" = "pending" ]; then
+              echo "**Still pending.** Dispatch mode=resume with the same sha and validated_run, resume_build=$(safe "$BUILD") and release_run=$(safe "${RELEASE_RUN:-$GITHUB_RUN_ID}") to poll and distribute the existing build."
               echo
             fi
             echo "### Not verifiable by CI (device-only limitations)"

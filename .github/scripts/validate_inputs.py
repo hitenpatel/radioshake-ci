@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Validate ios-testflight workflow_dispatch inputs (anchored regexes, from env only).
 
-Reads SHA, VALIDATED_RUN, MODE, RESUME_BUILD, NOTES from the environment and
+Reads SHA, VALIDATED_RUN, MODE, RESUME_BUILD, RELEASE_RUN, NOTES from the environment and
 exits non-zero with a GitHub ::error:: annotation on the first violation.
 Nothing from the inputs is echoed back except the validated, constrained values.
 """
@@ -19,6 +19,7 @@ def check(env):
     run = env.get("VALIDATED_RUN", "")
     mode = env.get("MODE", "")
     resume = env.get("RESUME_BUILD", "")
+    release_run = env.get("RELEASE_RUN", "")
     notes = env.get("NOTES", "")
     if not re.fullmatch(r"[0-9a-f]{40}", sha):
         errors.append("sha must be a full 40-character lowercase hex commit id")
@@ -29,8 +30,13 @@ def check(env):
     if mode == "resume":
         if not re.fullmatch(r"[1-9][0-9]{0,8}", resume):
             errors.append("resume_build must be a build number (integer) when mode is resume")
-    elif resume:
-        errors.append("resume_build is only allowed with mode=resume")
+        if not re.fullmatch(r"[1-9][0-9]{0,19}", release_run):
+            errors.append("release_run must be the numeric run id of the release run that uploaded the build")
+    else:
+        if resume:
+            errors.append("resume_build is only allowed with mode=resume")
+        if release_run:
+            errors.append("release_run is only allowed with mode=resume")
     if len(notes) > NOTES_MAX_CHARS:
         errors.append(f"notes must be at most {NOTES_MAX_CHARS} characters")
     if CONTROL.search(notes):

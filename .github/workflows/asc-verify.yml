@@ -19,8 +19,17 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - name: Install PyJWT
-        run: pip install --quiet 'pyjwt[crypto]==2.10.1' requests
+      - name: Check out the hash-locked requirements
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          path: ci
+          sparse-checkout: .github/scripts/requirements-asc.txt
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - name: Install PyJWT and requests (hash-locked)
+        run: |
+          pip install --quiet --require-hashes --only-binary=:all: -r ci/.github/scripts/requirements-asc.txt
 
       - name: Query App Store Connect
         env:

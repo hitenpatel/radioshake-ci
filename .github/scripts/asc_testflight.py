@@ -8,9 +8,15 @@ status lines only, and error bodies are scrubbed and truncated first.
 Subcommands
   allocate    Print the next free build number (max integer build number of any
               of the app's builds + 1, minimum 1) on stdout. Read-only.
+              --greater-than N additionally forces the result above N (a number
+              that App Store Connect rejected as a duplicate may not be visible
+              through the builds API yet, so it is never offered again).
+  exists      Poll briefly for a specific version/build to become visible
+              (used after an ambiguous upload failure). Exit 0 if found.
   distribute  Poll App Store Connect until the uploaded build finishes
-              processing, then make sure it is in the internal TestFlight group
-              and (optionally) set the en-GB "What to Test" text. Idempotent.
+              processing, set the en-GB "What to Test" text (optional), make sure
+              it is in the internal TestFlight group, then poll its beta state
+              until it is ready for internal testing. Idempotent.
 
 Environment
   ASC_KEY_ID, ASC_ISSUER_ID   API key identifiers
@@ -42,6 +48,19 @@ BUILD_RE = re.compile(r"[1-9][0-9]{0,8}")
 GROUP_RE = re.compile(r"[A-Za-z0-9 _-]{1,50}")
 INTEGER_RE = re.compile(r"[0-9]{1,9}")
 _SECRETISH = re.compile(r"eyJ[A-Za-z0-9_\-.]{10,}|[A-Za-z0-9+/=_-]{60,}|-----BEGIN[^-]*-----")
+
+
+BETA_READY = {"IN_BETA_TESTING", "READY_FOR_BETA_TESTING"}
+BETA_BLOCKED = {"PROCESSING_EXCEPTION", "MISSING_EXPORT_COMPLIANCE", "EXPIRED"}
+
+
+def classify_beta_state(state: str) -> str:
+    """ready: testers can install; blocked: needs a human fix; pending: wait (incl. unknown)."""
+    if state in BETA_READY:
+        return "ready"
+    if state in BETA_BLOCKED:
+        return "blocked"
+    return "pending"
 
 
 class AscError(Exception):
@@ -195,8 +214,8 @@ class Asc:
                     "expired": bool(a.get("expired")),
                 }
 
-    def next_build_number(self, app_id: str) -> int:
-        highest = 0
+    def next_build_number(self, app_id: str, greater_than: int = 0) -> int:
+        highest = max(greater_than, 0)
         for b in self.builds(app_id):
             if INTEGER_RE.fullmatch(str(b["number"])):
                 highest = max(highest, int(b["number"]))
@@ -235,25 +254,68 @@ class Asc:
             log(f"could not read build beta detail: {exc}")
             return "UNKNOWN"
 
-    def set_whats_new(self, build_id: str, text: str) -> None:
-        existing = None
+    def _en_gb_localization(self, build_id: str) -> Optional[str]:
+        found = None
         for page in self.paginate(f"/v1/builds/{build_id}/betaBuildLocalizations", {"limit": "200"}):
             for loc in page.get("data", []):
                 if loc["attributes"].get("locale") == NOTES_LOCALE:
-                    existing = loc["id"]
+                    found = loc["id"]
+        return found
+
+    def _patch_whats_new(self, loc_id: str, text: str) -> None:
+        self.request("PATCH", f"/v1/betaBuildLocalizations/{loc_id}", body={
+            "data": {"type": "betaBuildLocalizations", "id": loc_id, "attributes": {"whatsNew": text}}})
+
+    def set_whats_new(self, build_id: str, text: str) -> None:
+        existing = self._en_gb_localization(build_id)
         if existing:
-            self.request("PATCH", f"/v1/betaBuildLocalizations/{existing}", body={
-                "data": {"type": "betaBuildLocalizations", "id": existing, "attributes": {"whatsNew": text}}})
-        else:
+            self._patch_whats_new(existing, text)
+            return
+        try:
             self.request("POST", "/v1/betaBuildLocalizations", ok=(200, 201), body={
                 "data": {"type": "betaBuildLocalizations",
                          "attributes": {"locale": NOTES_LOCALE, "whatsNew": text},
                          "relationships": {"build": {"data": {"type": "builds", "id": build_id}}}}})
+        except AscError as exc:
+            # Ambiguous or conflicting create (response lost after Apple created it, or a
+            # duplicate-resource conflict): list again and reconcile through PATCH.
+            existing = self._en_gb_localization(build_id)
+            if not existing:
+                raise
+            log(f"localization create was ambiguous ({scrub(str(exc), 80)}); reconciling with PATCH")
+            self._patch_whats_new(existing, text)
 
     # -- workflows -------------------------------------------------------
+    def build_visible(self, bundle_id: str, version: str, number: str, wait_minutes: int,
+                      poll_seconds: int = 30) -> bool:
+        app_id = self.find_app(bundle_id)
+        deadline = self.clock() + wait_minutes * 60
+        while True:
+            if self.find_build(app_id, version, number):
+                return True
+            if self.clock() >= deadline:
+                return False
+            self.sleep(poll_seconds)
+
+    def wait_beta_ready(self, build_id: str, wait_minutes: int, poll_seconds: int) -> tuple:
+        """Poll the internal beta state. Returns (state, readiness) with readiness one of
+        ready, blocked, pending (unknown counts as pending)."""
+        deadline = self.clock() + wait_minutes * 60
+        last = ""
+        while True:
+            state = self.internal_build_state(build_id)
+            readiness = classify_beta_state(state)
+            if state != last:
+                last = state
+                log(f"internal build state: {state} ({readiness})")
+            if readiness != "pending" or self.clock() >= deadline:
+                return state, readiness
+            self.sleep(poll_seconds)
+
     def distribute(self, bundle_id: str, version: str, number: str, group_name: str,
                    notes: str, wait_minutes: int, poll_seconds: int = 30,
-                   group_wait_minutes: int = 10) -> int:
+                   group_wait_minutes: int = 10, beta_wait_minutes: int = 15,
+                   membership_wait_minutes: int = 2) -> int:
         app_id = self.find_app(bundle_id)
         deadline = self.clock() + wait_minutes * 60
         build: Optional[Dict[str, Any]] = None
@@ -286,16 +348,12 @@ class Asc:
             if self.clock() >= deadline:
                 emit("state", "PENDING")
                 log(f"still not VALID after {wait_minutes} minutes: PENDING. "
-                    f"Rerun with mode=resume resume_build={number} later.")
+                    f"Dispatch mode=resume (resume_build={number}) later.")
                 return 0
             self.sleep(poll_seconds)
 
         emit("state", "VALID")
         build_id = build["id"]
-
-        beta_state = self.internal_build_state(build_id)
-        emit("beta_state", beta_state)
-        log(f"internal build state: {beta_state}")
 
         if notes:
             self.set_whats_new(build_id, notes)
@@ -318,14 +376,28 @@ class Asc:
                 self.add_to_group(group_id, build_id)
             except AscError as exc:
                 log(f"adding the build to the group failed: {exc}")
+            # The relationship can take a moment to become visible: bounded polling.
+            end = self.clock() + membership_wait_minutes * 60
             member = self.in_group(group_id, build_id)
+            while not member and self.clock() < end:
+                self.sleep(poll_seconds)
+                member = self.in_group(group_id, build_id)
         emit("in_group", "true" if member else "false")
         log(f"build in internal group {group_name!r}: {member}")
         if not member:
             return 1
-        if beta_state == "MISSING_EXPORT_COMPLIANCE":
-            log("build is missing export compliance information")
+
+        # Processing VALID plus group membership is not evidence of readiness: poll the
+        # beta state after membership is established.
+        beta_state, readiness = self.wait_beta_ready(build_id, beta_wait_minutes, poll_seconds)
+        emit("beta_state", beta_state)
+        emit("readiness", readiness)
+        if readiness == "blocked":
+            log(f"build is blocked for internal testing: {beta_state}")
             return 1
+        if readiness == "pending":
+            log(f"internal beta state still {beta_state} after {beta_wait_minutes} minutes: pending. "
+                f"Dispatch mode=resume (resume_build={number}) later.")
         return 0
 
 
@@ -344,7 +416,12 @@ def build_client() -> Asc:
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command", required=True)
-    sub.add_parser("allocate")
+    alloc = sub.add_parser("allocate")
+    alloc.add_argument("--greater-than", type=int, default=0)
+    ex = sub.add_parser("exists")
+    ex.add_argument("--version", required=True)
+    ex.add_argument("--build", required=True)
+    ex.add_argument("--wait-minutes", type=int, default=5)
     dist = sub.add_parser("distribute")
     dist.add_argument("--version", required=True)
     dist.add_argument("--build", required=True)
@@ -359,9 +436,18 @@ def main(argv: Optional[List[str]] = None) -> int:
     try:
         client = build_client()
         if args.command == "allocate":
-            number = client.next_build_number(client.find_app(bundle_id))
+            if not 0 <= args.greater_than <= 999999999:
+                print("invalid --greater-than", file=sys.stderr)
+                return 2
+            number = client.next_build_number(client.find_app(bundle_id), args.greater_than)
             print(number)
             return 0
+        if args.command == "exists":
+            if not VERSION_RE.fullmatch(args.version) or not BUILD_RE.fullmatch(args.build) \
+                    or not 1 <= args.wait_minutes <= 30:
+                print("invalid exists arguments", file=sys.stderr)
+                return 2
+            return 0 if client.build_visible(bundle_id, args.version, args.build, args.wait_minutes) else 1
         if not VERSION_RE.fullmatch(args.version) or not BUILD_RE.fullmatch(args.build) \
                 or not GROUP_RE.fullmatch(args.group) or not 1 <= args.wait_minutes <= 120:
             print("invalid distribute arguments", file=sys.stderr)

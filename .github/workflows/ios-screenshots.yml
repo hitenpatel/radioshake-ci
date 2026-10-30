@@ -162,15 +162,30 @@ jobs:
             echo "::error::device must match ^[A-Za-z0-9 ()-]{1,60}$"
             exit 1
           fi
+          RUNTIME_ID="com.apple.CoreSimulator.SimRuntime.iOS-${SIM_OS//./-}"
+          export RUNTIME_ID
           UDID=$(xcrun simctl list devices available -j | python3 -c '
           import json, os, sys
           d = json.load(sys.stdin)["devices"]
-          key = "com.apple.CoreSimulator.SimRuntime.iOS-" + os.environ["SIM_OS"].replace(".", "-")
           name = os.environ["DEVICE"]
-          match = [x["udid"] for x in d.get(key, []) if x["name"] == name]
-          if not match:
-              sys.exit("no simulator named " + name + " under iOS " + os.environ["SIM_OS"])
-          print(match[0])')
+          match = [x["udid"] for x in d.get(os.environ["RUNTIME_ID"], []) if x["name"] == name]
+          print(match[0] if match else "")')
+          if [ -z "$UDID" ]; then
+            # The image may not ship this device (e.g. iPhone SE): create it from the device type
+            # and the pinned runtime, failing clearly when the device type is unavailable.
+            TYPE_ID=$(xcrun simctl list devicetypes -j | python3 -c '
+          import json, os, sys
+          name = os.environ["DEVICE"]
+          match = [x["identifier"] for x in json.load(sys.stdin)["devicetypes"] if x["name"] == name]
+          print(match[0] if match else "")')
+            if [ -z "$TYPE_ID" ]; then
+              echo "::error::no simulator named '$DEVICE' under iOS ${SIM_OS} and no such device type on this image"
+              exit 1
+            fi
+            UDID=$(xcrun simctl create "RadioShake $DEVICE" "$TYPE_ID" "$RUNTIME_ID") \
+              || { echo "::error::could not create a '$DEVICE' simulator for iOS ${SIM_OS}"; exit 1; }
+          fi
+          [[ "$UDID" =~ ^[0-9A-F-]{36}$ ]] || { echo "::error::unexpected simulator id"; exit 1; }
           echo "UDID=$UDID" >> "$GITHUB_ENV"
           xcrun simctl boot "$UDID" || true
           xcrun simctl bootstatus "$UDID" -b
