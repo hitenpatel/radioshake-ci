@@ -16,7 +16,9 @@ fetch_run_evidence() {
   gh api --paginate "repos/${REPO}/actions/runs/${id}/jobs?per_page=100" --jq '.jobs[]' | jq -s '.' > "${prefix}-jobs.json"
   job_id=$(jq -r --arg n "$job_name" '[.[] | select(.name == $n)] | if length == 1 then .[0].id else empty end' "${prefix}-jobs.json")
   if [[ "$job_id" =~ ^[0-9]+$ ]]; then
-    gh api "repos/${REPO}/actions/jobs/${job_id}/logs" | tr -d '\r' > "${prefix}-log.txt"
+    # gh refuses log bodies that contain terminal escape codes (Xcode/Gradle colour output), so fetch with curl.
+    curl -sSfL --retry 3 -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json" \
+      "https://api.github.com/repos/${REPO}/actions/jobs/${job_id}/logs" | tr -d '\r' > "${prefix}-log.txt"
   else
     : > "${prefix}-log.txt"
   fi
