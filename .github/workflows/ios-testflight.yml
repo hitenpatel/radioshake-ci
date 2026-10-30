@@ -18,6 +18,9 @@
 
 name: ios-testflight
 
+# Shown in the Actions list and the approval request, so the owner sees what they approve.
+run-name: ios-testflight ${{ inputs.mode }} ${{ inputs.sha }} (validated ${{ inputs.validated_run }})
+
 on:
   workflow_dispatch:
     inputs:
