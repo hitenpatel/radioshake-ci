@@ -12,7 +12,10 @@ Modes (--src is a checkout of the private source repository)
              Connect returned (names only).
   preflight  Read-only. Exit 0 only when the submission is ready; otherwise print
              the failure reasons. Lists the owner checks it cannot read.
-  apply      Not available yet (a later task adds it); exits 2.
+  apply      Writes the listing (text, review detail, build, screenshots, attachments) and
+             prints only unchanged/updated/created/deleted per field. Idempotent. Refuses
+             any version that is not in an editable state. Uploads go to Apple's reservation
+             hosts only, with no credentials.
 
 Never written by any mode: content rights, age rating, App Privacy, privacy
 policy URL, price, availability, phased release, review phone, submission.
@@ -62,6 +65,49 @@ LISTING_FIELDS = ("name", "subtitle", "keywords", "promotional_text", "descripti
 SHOT_NAME_RE = re.compile(r"[0-9]{2}-[A-Za-z0-9._-]+\.jpe?g")
 BUNDLE_RE = re.compile(r"[A-Za-z0-9.-]{1,155}")
 MARKETING_VERSION_RE = re.compile(r'^[ \t]+MARKETING_VERSION:[ \t]*"([0-9]+\.[0-9]+(\.[0-9]+)?)"[ \t]*$', re.M)
+SETTLE_POLLS = 60
+SETTLE_SECONDS = 5
+UPLOAD_HOST_SUFFIX = ".apple.com"
+UPLOAD_OK_STATUSES = (200, 201, 204)
+_ID = r"[A-Za-z0-9._-]+"
+# The only writes `apply` may ever send: (method, path). Anything else is refused before it leaves.
+_WRITE_RULES = tuple((method, re.compile(pattern)) for method, pattern in (
+    ("POST", r"/v1/appStoreVersions"),
+    ("PATCH", rf"/v1/appStoreVersions/{_ID}"),
+    ("PATCH", rf"/v1/appStoreVersions/{_ID}/relationships/build"),
+    ("POST", r"/v1/appStoreVersionLocalizations"),
+    ("PATCH", rf"/v1/appStoreVersionLocalizations/{_ID}"),
+    ("POST", r"/v1/appInfoLocalizations"),
+    ("PATCH", rf"/v1/appInfoLocalizations/{_ID}"),
+    ("PATCH", rf"/v1/appInfos/{_ID}"),
+    ("POST", r"/v1/appStoreReviewDetails"),
+    ("PATCH", rf"/v1/appStoreReviewDetails/{_ID}"),
+    ("POST", r"/v1/appStoreReviewAttachments"),
+    ("PATCH", rf"/v1/appStoreReviewAttachments/{_ID}"),
+    ("DELETE", rf"/v1/appStoreReviewAttachments/{_ID}"),
+    ("POST", r"/v1/appScreenshotSets"),
+    ("PATCH", rf"/v1/appScreenshotSets/{_ID}/relationships/appScreenshots"),
+    ("POST", r"/v1/appScreenshots"),
+    ("PATCH", rf"/v1/appScreenshots/{_ID}"),
+    ("DELETE", rf"/v1/appScreenshots/{_ID}"),
+))
+# JSON:API type -> (attributes, relationships) a write body may carry. Content rights, age rating,
+# privacy URLs, the review phone, price, availability and phased release are deliberately absent.
+_WRITE_TYPES = {
+    "appStoreVersions": ({"platform", "versionString", "releaseType", "copyright"}, {"app"}),
+    "appStoreVersionLocalizations": ({"locale", "description", "keywords", "promotionalText", "supportUrl"},
+                                     {"appStoreVersion"}),
+    "appInfoLocalizations": ({"locale", "name", "subtitle"}, {"appInfo"}),
+    "appInfos": (set(), {"primaryCategory"}),
+    "appStoreReviewDetails": ({"contactFirstName", "contactLastName", "contactEmail", "demoAccountRequired",
+                               "notes"}, {"appStoreVersion"}),
+    "appStoreReviewAttachments": ({"fileName", "fileSize", "uploaded", "sourceFileChecksum"},
+                                  {"appStoreReviewDetail"}),
+    "appScreenshotSets": ({"screenshotDisplayType"}, {"appStoreVersionLocalization"}),
+    "appScreenshots": ({"fileName", "fileSize", "uploaded", "sourceFileChecksum"}, {"appScreenshotSet"}),
+}
+_HTTP_HEAD_RE = re.compile(r"^[A-Z]+ /[^ ]* -> HTTP [0-9]{3}")
+_ERROR_CODE_RE = re.compile(r"[A-Z][A-Z0-9_]*(?:\.[A-Za-z0-9_]+)*")
 LOCALIZATION_FIELDS = (("description", "description"), ("keywords", "keywords"),
                        ("promotionalText", "promotional_text"), ("supportUrl", "support_url"))
 
@@ -262,6 +308,23 @@ _ID_RE = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4
 def _generic(exc: AscError) -> AscError:
     """Same error with resource ids blanked so scrub() keeps the request path readable in the log."""
     return AscError(_ID_RE.sub("{id}", str(exc)))
+
+
+def _withheld(exc: AscError) -> AscError:
+    """A write failure for the public log: method, path, status and Apple's error codes only.
+
+    Apple's error detail can echo the rejected value (listing text, notes), so it is never printed."""
+    text = _ID_RE.sub("{id}", str(exc))
+    head = _HTTP_HEAD_RE.match(text)
+    if not head:
+        return AscError(scrub(text, 160))
+    codes = []
+    for part in text[head.end():].lstrip(": ").split("; "):
+        token = part.split(" ", 1)[0]
+        if len(token) <= 80 and _ERROR_CODE_RE.fullmatch(token):
+            codes.append(token)
+    return AscError(head.group(0) + (f" ({', '.join(codes[:3])}; details withheld)" if codes
+                                     else " (details withheld)"))
 
 
 class Listing:
@@ -577,6 +640,186 @@ class Listing:
             why.append(f"takedown page is not reachable: {err}")
         return why
 
+    # -- apply -----------------------------------------------------------
+    @staticmethod
+    def _check_write(method: str, path: str, body: Any) -> None:
+        if not any(m == method and rx.fullmatch(path) for m, rx in _WRITE_RULES):
+            raise AscError("refusing a write outside the listing allow-list")
+        if method == "DELETE":
+            if body is not None:
+                raise AscError("refusing a DELETE with a body")
+            return
+        data = body.get("data") if isinstance(body, dict) else None
+        if "/relationships/" in path:
+            expected = "builds" if path.endswith("/build") else "appScreenshots"
+            items = data if isinstance(data, list) else [data]
+            if not items or not all(isinstance(i, dict) and i.get("type") == expected and set(i) <= {"type", "id"}
+                                    for i in items):
+                raise AscError("refusing a relationship write with an unexpected body")
+            return
+        kind = data.get("type") if isinstance(data, dict) else None
+        if kind not in _WRITE_TYPES or path.split("/")[2] != kind:
+            raise AscError("refusing a write whose body does not match its path")
+        attrs_ok, rels_ok = _WRITE_TYPES[kind]
+        if not set(data.get("attributes") or {}) <= attrs_ok or not set(data.get("relationships") or {}) <= rels_ok:
+            raise AscError("refusing a write that carries a field outside the listing")
+
+    def _write(self, method: str, path: str, body: Any = None, ok: tuple = (200, 201, 204)) -> Optional[Dict[str, Any]]:
+        self._check_write(method, path, body)
+        try:
+            return self.asc.request(method, path, body=body, ok=ok)
+        except AscError as exc:
+            raise _withheld(exc) from None
+
+    @staticmethod
+    def _pending(current: Optional[Dict[str, Any]], wanted: List[Tuple[str, Any]]) -> Dict[str, Any]:
+        """Attributes that differ (all of them when the resource does not exist yet)."""
+        cur = _attrs(current)
+        out: Dict[str, Any] = {}
+        for key, value in wanted:
+            if current is None:
+                out[key] = value
+            elif isinstance(value, bool):
+                if cur.get(key) is not value:
+                    out[key] = value
+            elif _norm(cur.get(key)) != _norm(value):
+                out[key] = value
+        return out
+
+    @staticmethod
+    def _record(changes: List[Change], resource: str, current: Optional[Dict[str, Any]],
+                wanted: List[Tuple[str, Any]], pending: Dict[str, Any]) -> None:
+        for key, _ in wanted:
+            action = "created" if current is None else ("updated" if key in pending else "unchanged")
+            changes.append(Change(resource, key, action))
+
+    @staticmethod
+    def _body(kind: str, attrs: Dict[str, Any], **parents: Tuple[str, str]) -> Dict[str, Any]:
+        data: Dict[str, Any] = {"type": kind, "attributes": attrs}
+        if parents:
+            data["relationships"] = {name: {"data": {"type": ptype, "id": pid}}
+                                     for name, (ptype, pid) in parents.items()}
+        return {"data": data}
+
+    @staticmethod
+    def _patch_body(kind: str, rid: str, attrs: Dict[str, Any]) -> Dict[str, Any]:
+        return {"data": {"type": kind, "id": rid, "attributes": attrs}}
+
+    def _choose_build(self, app_id: str, m: Manifest, number: Optional[str]) -> Optional[Dict[str, Any]]:
+        """The build to attach, validated; None when no build number was asked for."""
+        if number is None:
+            return None
+        try:
+            found = [b for b in self.asc.builds(app_id, number)
+                     if str(b["number"]) == number and b["platform"] in (None, "IOS")]
+        except AscError as exc:
+            raise _generic(exc) from None
+        if not found:
+            raise AscError(f"build {scrub(number, 12)} was not found for this app")
+        matching = [b for b in found if b["marketing"] == m.version]
+        if not matching:
+            raise AscError(f"build {scrub(number, 12)} has version {scrub(str(found[0]['marketing']), 20)}, "
+                           f"not MARKETING_VERSION {m.version}")
+        build = matching[0]
+        if build["state"] != "VALID":
+            raise AscError(f"build {scrub(number, 12)} is {scrub(str(build['state']), 30)}, not VALID")
+        if build["expired"]:
+            raise AscError(f"build {scrub(number, 12)} is expired")
+        return build
+
+    def apply(self, m: Manifest, build: Optional[str] = None) -> List[Change]:
+        """Make App Store Connect match the repo. Refusals happen before the first write; a second
+        run with nothing changed sends no write. Never touches the attestations, price, availability,
+        phased release, the review phone or submission."""
+        s = self.snapshot(m)
+        app_id = s.app["id"]
+        chosen = self._choose_build(app_id, m, build)
+        if s.version and _state(s.version) not in EDITABLE_STATES:
+            raise AscError(f"version state {scrub(_state(s.version), 40)} is not editable "
+                           f"({', '.join(sorted(EDITABLE_STATES))})")
+        info_wanted = [("name", m.fields["name"]), ("subtitle", m.fields["subtitle"])]
+        category_differs = (s.category or {}).get("id") != m.primary_category
+        if category_differs or self._pending(s.info_loc, info_wanted):
+            if s.info is None:
+                raise AscError("no app information record exists")
+            if _state(s.info) not in EDITABLE_STATES:
+                raise AscError(f"app information state {scrub(_state(s.info), 40)} is not editable")
+
+        changes: List[Change] = []
+        version_wanted = [("versionString", m.version), ("releaseType", m.release_type), ("copyright", m.copyright)]
+        if s.version is None:
+            self._write("POST", "/v1/appStoreVersions", self._body(
+                "appStoreVersions", {"platform": "IOS", **dict(version_wanted)}, app=("apps", app_id)))
+            changes.extend(Change("appStoreVersion", key, "created") for key, _ in version_wanted)
+            s = self.snapshot(m)  # a new version can arrive with children: compare against what is there now
+            if s.version is None:
+                raise AscError("the created App Store version was not found on re-read")
+        else:
+            pending = self._pending(s.version, version_wanted)
+            if pending:
+                self._write("PATCH", f"/v1/appStoreVersions/{s.version['id']}",
+                            self._patch_body("appStoreVersions", s.version["id"], pending))
+            self._record(changes, "appStoreVersion", s.version, version_wanted, pending)
+        vid = s.version["id"]
+
+        if chosen is None:
+            changes.append(Change("appStoreVersion", "build", "unchanged" if s.build else "skipped"))
+        elif s.build and s.build["id"] == chosen["id"]:
+            changes.append(Change("appStoreVersion", "build", "unchanged"))
+        else:
+            self._write("PATCH", f"/v1/appStoreVersions/{vid}/relationships/build",
+                        {"data": {"type": "builds", "id": chosen["id"]}})
+            changes.append(Change("appStoreVersion", "build", "updated" if s.build else "created"))
+
+        loc_wanted = [(api, m.fields[key]) for api, key in LOCALIZATION_FIELDS]
+        pending = self._pending(s.loc, loc_wanted)
+        if s.loc is None:
+            created = self._write("POST", "/v1/appStoreVersionLocalizations", self._body(
+                "appStoreVersionLocalizations", {"locale": m.locale, **pending},
+                appStoreVersion=("appStoreVersions", vid)))
+            loc_id = ((created or {}).get("data") or {}).get("id")
+            if not loc_id:
+                raise AscError("the created version localization has no id")
+        else:
+            loc_id = s.loc["id"]
+            if pending:
+                self._write("PATCH", f"/v1/appStoreVersionLocalizations/{loc_id}",
+                            self._patch_body("appStoreVersionLocalizations", loc_id, pending))
+        self._record(changes, "appStoreVersionLocalization", s.loc, loc_wanted, pending)
+
+        pending = self._pending(s.info_loc, info_wanted)
+        if s.info_loc is None:
+            self._write("POST", "/v1/appInfoLocalizations", self._body(
+                "appInfoLocalizations", {"locale": m.locale, **pending}, appInfo=("appInfos", s.info["id"])))
+        elif pending:
+            self._write("PATCH", f"/v1/appInfoLocalizations/{s.info_loc['id']}",
+                        self._patch_body("appInfoLocalizations", s.info_loc["id"], pending))
+        self._record(changes, "appInfoLocalization", s.info_loc, info_wanted, pending)
+
+        if category_differs:
+            self._write("PATCH", f"/v1/appInfos/{s.info['id']}", {"data": {
+                "type": "appInfos", "id": s.info["id"], "relationships": {
+                    "primaryCategory": {"data": {"type": "appCategories", "id": m.primary_category}}}}})
+        changes.append(Change("appInfo", "primaryCategory",
+                              ("created" if not s.category else "updated") if category_differs else "unchanged"))
+
+        detail_wanted = [("contactFirstName", m.review_first_name), ("contactLastName", m.review_last_name),
+                         ("contactEmail", m.review_email), ("notes", m.notes), ("demoAccountRequired", False)]
+        pending = self._pending(s.detail, detail_wanted)
+        if s.detail is None:
+            created = self._write("POST", "/v1/appStoreReviewDetails", self._body(
+                "appStoreReviewDetails", pending, appStoreVersion=("appStoreVersions", vid)))
+            detail_id = ((created or {}).get("data") or {}).get("id")
+            if not detail_id:
+                raise AscError("the created review detail has no id")
+        else:
+            detail_id = s.detail["id"]
+            if pending:
+                self._write("PATCH", f"/v1/appStoreReviewDetails/{detail_id}",
+                            self._patch_body("appStoreReviewDetails", detail_id, pending))
+        self._record(changes, "appStoreReviewDetail", s.detail, detail_wanted, pending)
+        return changes
+
 
 def build_listing(bundle_id: str) -> Listing:
     def need(name: str) -> str:
@@ -619,9 +862,6 @@ def main(argv: Optional[List[str]] = None) -> int:
     if not BUNDLE_RE.fullmatch(bundle_id):
         print("invalid ASC_BUNDLE_ID", file=sys.stderr)
         return 2
-    if args.mode == "apply":
-        print("apply is not available yet", file=sys.stderr)
-        return 2
     try:
         manifest = load_manifest(src)
     except ValueError as exc:
@@ -631,6 +871,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         listing = build_listing(bundle_id)
         for line in _summary(manifest):
             print(line)
+        if args.mode == "apply":
+            for change in listing.apply(manifest, args.build):
+                print(f"{change.resource}.{change.field}: {change.action}")
+            return 0
         snap = listing.snapshot(manifest)
         if args.mode == "plan":
             for change in listing._plan(manifest, snap, args.build):

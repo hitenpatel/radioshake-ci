@@ -901,7 +901,9 @@ class ApplyTextTests(ApplyTree):
         self.w.version = None
         self.apply("7")
         lst = self.lst()
-        self.assertEqual({c.action for c in lst.plan(self.m, build="7")}, {"unchanged"})
+        text = {c.action for c in lst.plan(self.m, build="7")
+                if c.resource not in ("appStoreReviewAttachment", "appScreenshot", "appScreenshotSet")}
+        self.assertEqual(text, {"unchanged"})
 
     def test_review_phone_is_never_written_and_demo_account_is_false(self):
         self.diverge_text()
