@@ -372,7 +372,7 @@ class PreflightTests(Tree):
         self.w.pre["attributes"]["version"] = "1.0.1"
         self.assertReason("build")
         self.setUp()
-        (self.root / "ios" / "project.yml").write_text('MARKETING_VERSION: "1.0.1"\n', encoding="utf-8")
+        (self.root / "ios" / "project.yml").write_text('  MARKETING_VERSION: "1.0.1"\n', encoding="utf-8")
         self.m = a.load_manifest(self.root)
         self.assertReason("version")
 
