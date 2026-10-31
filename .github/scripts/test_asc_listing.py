@@ -108,7 +108,10 @@ def attrs_age(**over):
                                 "matureOrSuggestiveThemes", "violenceCartoonOrFantasy",
                                 "violenceRealistic", "violenceRealisticProlongedGraphicOrSadistic")}
     base.update({"gambling": False, "unrestrictedWebAccess": False, "lootBox": False,
-                 "kidsAgeBand": None, "ageRatingOverride": None, "koreaAgeRatingOverride": None})
+                 "kidsAgeBand": None, "ageRatingOverride": None, "koreaAgeRatingOverride": None,
+                 "ageRatingOverrideV2": None, "developerAgeRatingInfoUrl": None,
+                 "gracRatingClassificationNumber": None, "socialMedia": False,
+                 "socialMediaAgeRestricted": None})
     base.update(over)
     return base
 
@@ -415,6 +418,16 @@ class PreflightTests(Tree):
     def test_optional_age_rating_attributes_may_be_null(self):
         self.assertIsNone(self.w.age["attributes"]["kidsAgeBand"])
         self.assertEqual(self.reasons(), [])
+
+    def test_live_optional_attributes_and_the_social_media_follow_up(self):
+        # Names seen on the first live read: these are null when unanswered and not owner questions.
+        self.assertEqual(self.reasons(), [])
+        self.w.age["attributes"]["socialMedia"] = True
+        self.assertReason("socialMediaAgeRestricted")
+        self.w.age["attributes"]["socialMediaAgeRestricted"] = False
+        self.assertEqual(self.reasons(), [])
+        self.w.age["attributes"]["socialMedia"] = None
+        self.assertReason("socialMedia")
 
     def test_china_must_be_unavailable_and_something_available(self):
         self.w.terr[1]["attributes"]["available"] = True
