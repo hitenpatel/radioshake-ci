@@ -78,6 +78,9 @@ class LiveHttp(FakeHttp):
             routes = self.world.routes()
             if path.endswith("/build") and params and "include" in params:
                 return Resp(400, {"errors": [{"code": "PARAMETER_ERROR.ILLEGAL", "title": "x", "detail": "include"}]})
+            polled = self.world.poll_asset(path)
+            if polled is not None:
+                return Resp(200, {"data": polled})
             if ("GET", path) in routes:
                 return Resp(200, routes[("GET", path)])
             return Resp(404, {"errors": [{"code": "NOT_FOUND", "title": "nope", "detail": path}]})
@@ -206,6 +209,9 @@ class World:
         self.unexpected = []
         self.counter = 0
         self.fail_delivery = set()
+        self.processing_polls = 0
+        self.remaining = {}
+        self.upload = FakeUpload()
         self.pages = {
             m.fields["support_url"]: Page(200, f"Write to {EMAIL} for help"),
             a.PRIVACY_URL: Page(200, "We use ShazamKit to identify songs."),
@@ -254,8 +260,54 @@ class World:
                          FakePages(self.pages), "com.radioshake")
 
     def live_listing(self, upload=None, factory=None):
+        self.upload = upload or FakeUpload()
         return a.Listing(t.Asc(LiveHttp(self), factory or (lambda: "tok"), sleep=lambda s: None),
-                         upload or FakeUpload(), FakePages(self.pages), "com.radioshake")
+                         self.upload, FakePages(self.pages), "com.radioshake")
+
+    def _reserve(self, bucket, attrs, rel_name):
+        self.counter += 1
+        rid = f"n{self.counter}"
+        size = attrs["fileSize"]
+        cuts = [(0, size // 2), (size // 2, size - size // 2)] if size >= 2 else [(0, size)]
+        ops = [{"method": "PUT", "url": f"https://store.apple.com/up/{rid}/{i}", "offset": off, "length": ln,
+                "requestHeaders": [{"name": "Content-Type", "value": "application/octet-stream"}]}
+               for i, (off, ln) in enumerate(cuts)]
+        res = {"id": rid, "attributes": {"fileName": attrs["fileName"], "fileSize": size, "uploadOperations": ops,
+                                         "assetDeliveryState": {"state": "AWAITING_UPLOAD"}}}
+        bucket.append(res)
+        return 201, {"data": res}
+
+    def _find_asset(self, rid):
+        return next((x for x in self.attachments + self.shots if x["id"] == rid), None)
+
+    def _commit(self, rid, attrs):
+        res = self._find_asset(rid)
+        if res is None:
+            return 404, {"errors": [{"code": "NOT_FOUND", "title": "x", "detail": rid}]}
+        res["attributes"]["sourceFileChecksum"] = attrs.get("sourceFileChecksum")
+        parts = sorted((u for u in self.upload.calls if f"/up/{rid}/" in u[0]), key=lambda c: c[0])
+        got = md5(b"".join(c[2] for c in parts))
+        if res["attributes"]["fileName"] in self.fail_delivery or got != attrs.get("sourceFileChecksum"):
+            res["attributes"]["assetDeliveryState"] = {"state": "FAILED", "errors": [
+                {"code": "IMAGE_TOO_SMALL", "description": "SECRETISH-" + "A" * 90 + " description"}]}
+        elif self.processing_polls:
+            res["attributes"]["assetDeliveryState"] = {"state": "UPLOAD_COMPLETE"}
+            self.remaining[rid] = self.processing_polls
+        else:
+            res["attributes"]["assetDeliveryState"] = {"state": "COMPLETE"}
+        return 200, {"data": res}
+
+    def poll_asset(self, path):
+        hit = re.fullmatch(r"/v1/(?:appScreenshots|appStoreReviewAttachments)/([^/]+)", path)
+        res = self._find_asset(hit.group(1)) if hit else None
+        if res is None:
+            return None
+        rid = res["id"]
+        if self.remaining.get(rid, 0) > 0:
+            self.remaining[rid] -= 1
+            if self.remaining[rid] == 0:
+                res["attributes"]["assetDeliveryState"] = {"state": "COMPLETE"}
+        return res
 
     def write(self, method, path, body):
         """Apply one write the way App Store Connect would; returns (status, body)."""
@@ -299,6 +351,24 @@ class World:
         if (method, path) == ("PATCH", "/v1/appStoreReviewDetails/rd1"):
             self.detail["attributes"].update(attrs)
             return 200, {"data": self.detail}
+        if (method, path) == ("POST", "/v1/appStoreReviewAttachments"):
+            return self._reserve(self.attachments, attrs, "appStoreReviewDetail")
+        if (method, path) == ("POST", "/v1/appScreenshots"):
+            return self._reserve(self.shots, attrs, "appScreenshotSet")
+        if (method, path) == ("POST", "/v1/appScreenshotSets"):
+            self.set = {"id": "s1", "attributes": attrs}
+            return 201, {"data": self.set}
+        hit = re.fullmatch(r"/v1/(appStoreReviewAttachments|appScreenshots)/([^/]+)", path)
+        if hit and method == "PATCH":
+            return self._commit(hit.group(2), attrs)
+        if hit and method == "DELETE":
+            bucket = self.attachments if hit.group(1) == "appStoreReviewAttachments" else self.shots
+            bucket[:] = [x for x in bucket if x["id"] != hit.group(2)]
+            return 204, None
+        if (method, path) == ("PATCH", "/v1/appScreenshotSets/s1/relationships/appScreenshots"):
+            order = [item["id"] for item in data]
+            self.shots.sort(key=lambda x: order.index(x["id"]))
+            return 204, None
         self.unexpected.append((method, path))
         return 400, {"errors": [{"code": "UNEXPECTED_WRITE", "title": "unexpected", "detail": path}]}
 
@@ -901,9 +971,7 @@ class ApplyTextTests(ApplyTree):
         self.w.version = None
         self.apply("7")
         lst = self.lst()
-        text = {c.action for c in lst.plan(self.m, build="7")
-                if c.resource not in ("appStoreReviewAttachment", "appScreenshot", "appScreenshotSet")}
-        self.assertEqual(text, {"unchanged"})
+        self.assertEqual({c.action for c in lst.plan(self.m, build="7")}, {"unchanged"})
 
     def test_review_phone_is_never_written_and_demo_account_is_false(self):
         self.diverge_text()
@@ -966,6 +1034,275 @@ class ApplyTextTests(ApplyTree):
         self.assertIn("HTTP 409", message)
         self.assertNotIn("FAKE-DESCRIPTION", message)
         self.assertNotIn("echoed", message)
+
+
+class UploadOperationsTests(unittest.TestCase):
+    URL = "https://store.apple.com/up/x"
+
+    @staticmethod
+    def op(url=URL, method="PUT", offset=0, length=10, headers=None):
+        return {"method": method, "url": url, "offset": offset, "length": length,
+                "requestHeaders": headers if headers is not None else [{"name": "Content-Type", "value": "image/jpeg"}]}
+
+    def test_each_part_is_put_with_its_slice_and_the_operation_headers_only(self):
+        up = FakeUpload()
+        a.upload_operations([self.op(self.URL + "/1", offset=0, length=4), self.op(self.URL + "/2", offset=4, length=6)],
+                            b"abcdefghij", up)
+        self.assertEqual([(u, d) for u, h, d in up.calls], [(self.URL + "/1", b"abcd"), (self.URL + "/2", b"efghij")])
+        for url, headers, data in up.calls:
+            self.assertEqual(headers, {"Content-Type": "image/jpeg"})
+
+    def test_no_authorization_is_ever_sent_and_an_operation_asking_for_one_is_refused(self):
+        up = FakeUpload()
+        for name in ("Authorization", "authorization", "Proxy-Authorization"):
+            with self.assertRaises(t.AscError, msg=name):
+                a.upload_operations([self.op(headers=[{"name": name, "value": "Bearer x"}])], b"0123456789", up)
+        self.assertEqual(up.calls, [])
+
+    def test_http_and_non_apple_hosts_are_refused_and_nothing_is_sent(self):
+        bad_urls = ["http://store.apple.com/up/x", "https://evil.example/up/x", "https://apple.com.evil.example/x",
+                    "https://notapple.com/x", "https://apple.com/x", "https://store.apple.com@evil.example/x",
+                    "https://user:pw@store.apple.com/x", "https://store.apple.com:8443/x", "https://store.apple.com./x",
+                    "ftp://store.apple.com/x", "//store.apple.com/x", "", None, 7]
+        for url in bad_urls:
+            with self.subTest(url=url):
+                up = FakeUpload()
+                with self.assertRaises(t.AscError):
+                    a.upload_operations([self.op(self.URL + "/1", offset=0, length=5), self.op(url, offset=5, length=5)],
+                                        b"0123456789", up)
+                self.assertEqual(up.calls, [], "a bad later part must stop the first part from being sent")
+
+    def test_malformed_operations_are_refused(self):
+        up = FakeUpload()
+        cases = [[], [self.op(method="POST")], [self.op(method="GET")], [self.op(offset=-1)],
+                 [self.op(offset=5, length=6)], [self.op(length=0)], [self.op(length="10")],
+                 [self.op(offset=True)], ["not a dict"], [self.op(headers="x")],
+                 [self.op(headers=[{"name": 5, "value": "x"}])]]
+        for ops in cases:
+            with self.subTest(ops=ops):
+                with self.assertRaises(t.AscError):
+                    a.upload_operations(ops, b"0123456789", up)
+        self.assertEqual(up.calls, [])
+
+    def test_a_failed_part_raises_without_the_signed_url(self):
+        up = FakeUpload()
+        up.status = 403
+        with self.assertRaises(t.AscError) as ctx:
+            a.upload_operations([self.op(self.URL + "?sig=SECRET-SIGNATURE")], b"0123456789", up)
+        self.assertIn("HTTP 403", str(ctx.exception))
+        self.assertNotIn("SECRET-SIGNATURE", str(ctx.exception))
+        self.assertNotIn("store.apple.com", str(ctx.exception))
+
+        class Boom:
+            def put(self, url, headers, data, timeout=120):
+                raise OSError("connect to https://store.apple.com/up/x?sig=SECRET-SIGNATURE failed")
+
+        with self.assertRaises(t.AscError) as ctx:
+            a.upload_operations([self.op()], b"0123456789", Boom())
+        self.assertIn("OSError", str(ctx.exception))
+        self.assertNotIn("SECRET-SIGNATURE", str(ctx.exception))
+
+    def test_the_plain_transport_does_not_follow_redirects(self):
+        with mock.patch("requests.Session") as session:
+            a.RequestsPlainHttp().put(self.URL, {"Content-Type": "x"}, b"data")
+        session.return_value.put.assert_called_once_with(
+            self.URL, headers={"Content-Type": "x"}, data=b"data", timeout=120, allow_redirects=False)
+
+
+class ApplyAssetsTests(ApplyTree):
+    def names(self, bucket):
+        return [x["attributes"]["fileName"] for x in bucket]
+
+    def kinds(self, lst):
+        return [(c[0], c[1]) for c in self.writes(lst)]
+
+    def test_matching_attachments_and_screenshots_are_untouched(self):
+        lst, plan = self.apply()
+        self.assertNoWrites(lst)
+        self.assertEqual(self.upload.calls, [])
+        self.assertEqual(plan[("appStoreReviewAttachment", "pack.pdf")], "unchanged")
+        self.assertEqual(plan[("appScreenshot", "01-shot1.jpg")], "unchanged")
+        self.assertEqual(plan[("appScreenshotSet", "order")], "unchanged")
+
+    def test_an_attachment_is_replaced_only_when_the_checksum_differs(self):
+        self.w.attachments[0]["attributes"]["sourceFileChecksum"] = "0" * 32
+        lst, plan = self.apply()
+        self.assertEqual(plan[("appStoreReviewAttachment", "pack.pdf")], "updated")
+        self.assertEqual(self.kinds(lst), [("DELETE", "/v1/appStoreReviewAttachments/at0"),
+                                           ("POST", "/v1/appStoreReviewAttachments"),
+                                           ("PATCH", "/v1/appStoreReviewAttachments/n1")])
+        post, commit = self.writes(lst)[1][3]["data"], self.writes(lst)[2][3]["data"]
+        pack = self.m.attachments[0].read_bytes()
+        self.assertEqual(post["attributes"], {"fileName": "pack.pdf", "fileSize": len(pack)})
+        self.assertEqual(post["relationships"]["appStoreReviewDetail"]["data"],
+                         {"type": "appStoreReviewDetails", "id": "rd1"})
+        self.assertEqual(commit["attributes"], {"uploaded": True, "sourceFileChecksum": md5(pack)})
+        self.assertEqual(b"".join(d for u, h, d in self.upload.calls), pack)
+        self.assertEqual(self.names(self.w.attachments), ["pack.pdf"])
+        self.assertEqual(self.w.attachments[0]["attributes"]["assetDeliveryState"]["state"], "COMPLETE")
+
+    def test_a_missing_attachment_is_created_and_an_unknown_one_deleted(self):
+        self.w.attachments[0]["attributes"]["fileName"] = "old.pdf"
+        lst, plan = self.apply()
+        self.assertEqual(plan[("appStoreReviewAttachment", "pack.pdf")], "created")
+        self.assertEqual(plan[("appStoreReviewAttachment", "old.pdf")], "deleted")
+        self.assertEqual(self.names(self.w.attachments), ["pack.pdf"])
+
+    def test_one_differing_screenshot_replaces_only_that_shot_then_reorders(self):
+        self.w.shots[2]["attributes"]["sourceFileChecksum"] = "0" * 32
+        lst, plan = self.apply()
+        self.assertEqual(plan[("appScreenshot", "03-shot3.jpg")], "updated")
+        self.assertEqual(plan[("appScreenshot", "01-shot1.jpg")], "unchanged")
+        self.assertEqual(plan[("appScreenshotSet", "order")], "updated")
+        self.assertEqual(self.kinds(lst), [("DELETE", "/v1/appScreenshots/sc2"), ("POST", "/v1/appScreenshots"),
+                                           ("PATCH", "/v1/appScreenshots/n1"),
+                                           ("PATCH", "/v1/appScreenshotSets/s1/relationships/appScreenshots")])
+        shot = self.m.screenshots[2].read_bytes()
+        self.assertEqual(self.writes(lst)[1][3]["data"]["attributes"], {"fileName": "03-shot3.jpg", "fileSize": len(shot)})
+        self.assertEqual(self.writes(lst)[1][3]["data"]["relationships"]["appScreenshotSet"]["data"],
+                         {"type": "appScreenshotSets", "id": "s1"})
+        self.assertEqual(self.writes(lst)[2][3]["data"]["attributes"],
+                         {"uploaded": True, "sourceFileChecksum": md5(shot)})
+        order = self.writes(lst)[3][3]["data"]
+        self.assertEqual(order, [{"type": "appScreenshots", "id": i} for i in ("sc0", "sc1", "n1", "sc3", "sc4", "sc5")])
+        self.assertEqual(self.names(self.w.shots), SHOTS)
+        self.assertEqual(b"".join(d for u, h, d in self.upload.calls), shot)
+
+    def test_a_missing_screenshot_set_is_created_with_the_display_type_and_filled_in_order(self):
+        self.w.set = None
+        self.w.shots = []
+        lst, plan = self.apply()
+        self.assertEqual(plan[("appScreenshotSet", "screenshotDisplayType")], "created")
+        post = self.writes(lst)[0]
+        self.assertEqual((post[0], post[1]), ("POST", "/v1/appScreenshotSets"))
+        self.assertEqual(post[3]["data"]["attributes"], {"screenshotDisplayType": "APP_IPHONE_67"})
+        self.assertEqual(post[3]["data"]["relationships"]["appStoreVersionLocalization"]["data"],
+                         {"type": "appStoreVersionLocalizations", "id": "l1"})
+        self.assertEqual(self.names(self.w.shots), SHOTS)
+        self.assertFalse([c for c in self.writes(lst) if "relationships" in c[1]], "already in order: no reorder")
+
+    def test_unknown_and_duplicate_screenshots_are_deleted(self):
+        self.w.shots.append({"id": "x1", "attributes": {"fileName": "09-old.jpg", "sourceFileChecksum": "1" * 32,
+                                                        "assetDeliveryState": {"state": "COMPLETE"}}})
+        self.w.shots.append({"id": "x2", "attributes": dict(self.w.shots[0]["attributes"])})
+        lst, plan = self.apply()
+        self.assertEqual(plan[("appScreenshot", "09-old.jpg")], "deleted")
+        self.assertEqual(sorted(self.kinds(lst)), [("DELETE", "/v1/appScreenshots/x1"), ("DELETE", "/v1/appScreenshots/x2")])
+        self.assertEqual(self.names(self.w.shots), SHOTS)
+
+    def test_a_failed_or_abandoned_remote_asset_is_replaced(self):
+        self.w.shots[1]["attributes"]["assetDeliveryState"] = {"state": "FAILED"}
+        self.w.shots[4]["attributes"].update({"sourceFileChecksum": None,
+                                              "assetDeliveryState": {"state": "AWAITING_UPLOAD"}})
+        lst, plan = self.apply()
+        self.assertEqual(self.names(self.w.shots), SHOTS)
+        self.assertEqual({c[1] for c in self.writes(lst) if c[0] == "DELETE"},
+                         {"/v1/appScreenshots/sc1", "/v1/appScreenshots/sc4"})
+        self.assertTrue(all(x["attributes"]["assetDeliveryState"]["state"] == "COMPLETE" for x in self.w.shots))
+
+    def test_uploads_carry_no_authorization_and_no_token_is_minted_for_them(self):
+        minted = []
+
+        def factory():
+            minted.append(1)
+            return "SECRET-TOKEN-XYZ"
+
+        self.w.shots[0]["attributes"]["sourceFileChecksum"] = "0" * 32
+        self.w.attachments[0]["attributes"]["sourceFileChecksum"] = "0" * 32
+        lst, _ = self.apply(lst=self.lst(factory=factory))
+        self.assertEqual(len(self.upload.calls), 4)  # two parts for the attachment, two for the shot
+        for url, headers, data in self.upload.calls:
+            self.assertTrue(url.startswith("https://store.apple.com/up/"))
+            self.assertNotIn("authorization", {k.lower() for k in headers})
+            self.assertNotIn("SECRET-TOKEN-XYZ", " ".join(headers.values()) + url)
+        self.assertEqual(len(minted), len(lst.asc.http.calls), "exactly one token per Apple API request, none for uploads")
+        before = len(minted)
+        with self.assertRaises(t.AscError):
+            lst.asc.request("PUT", "https://store.apple.com/up/x")
+        self.assertEqual(len(minted), before)
+
+    def test_processing_is_awaited_and_a_stuck_asset_times_out(self):
+        self.w.processing_polls = 2
+        self.w.shots[0]["attributes"]["sourceFileChecksum"] = "0" * 32
+        lst, _ = self.apply()
+        self.assertEqual(self.w.shots[-1]["attributes"]["assetDeliveryState"]["state"], "COMPLETE")
+        gets = [c for c in lst.asc.http.calls if c[0] == "GET" and c[1].startswith("/v1/appScreenshots/n")]
+        self.assertEqual(len(gets), 2)
+        self.setUp()
+        self.w.processing_polls = 10 ** 6
+        self.w.shots[0]["attributes"]["sourceFileChecksum"] = "0" * 32
+        with self.assertRaises(t.AscError) as ctx:
+            self.lst().apply(self.m)
+        self.assertIn("did not finish", str(ctx.exception))
+
+    def test_a_kept_asset_that_is_still_processing_is_awaited_not_replaced(self):
+        self.w.shots[0]["attributes"]["assetDeliveryState"] = {"state": "UPLOAD_COMPLETE"}
+        self.w.remaining["sc0"] = 1
+        lst, _ = self.apply()
+        self.assertNoWrites(lst)
+        self.assertEqual(self.w.shots[0]["attributes"]["assetDeliveryState"]["state"], "COMPLETE")
+
+    def test_delivery_failed_raises_a_scrubbed_message(self):
+        self.w.fail_delivery = {"03-shot3.jpg"}
+        self.w.shots[2]["attributes"]["sourceFileChecksum"] = "0" * 32
+        with self.assertRaises(t.AscError) as ctx:
+            self.lst().apply(self.m)
+        message = str(ctx.exception)
+        self.assertIn("FAILED", message)
+        self.assertIn("IMAGE_TOO_SMALL", message)
+        self.assertNotIn("SECRETISH", message)
+        self.assertNotIn("https://", message)
+        self.assertNotIn("store.apple.com", message)
+
+    def test_a_rejected_upload_part_stops_the_apply_without_the_url(self):
+        self.upload.status = 403
+        self.w.shots[0]["attributes"]["sourceFileChecksum"] = "0" * 32
+        with self.assertRaises(t.AscError) as ctx:
+            self.lst().apply(self.m)
+        self.assertIn("HTTP 403", str(ctx.exception))
+        self.assertNotIn("store.apple.com", str(ctx.exception))
+
+    def test_a_screenshot_count_outside_the_range_is_refused_before_any_write(self):
+        self.diverge_text()
+        (self.root / "marketing" / "shots" / "06-shot6.jpg").unlink()
+        self.m = a.load_manifest(self.root)
+        self.assertEqual(len(self.m.screenshots), 5)
+        lst = self.lst()
+        with self.assertRaises(t.AscError) as ctx:
+            lst.apply(self.m, "7")
+        self.assertIn("screenshot", str(ctx.exception))
+        self.assertNoWrites(lst)
+        for n in range(6, 10):
+            (self.root / "marketing" / "shots" / f"{n:02d}-shot{n}.jpg").write_bytes(b"x%d" % n)
+        self.m = a.load_manifest(self.root)
+        self.assertEqual(len(self.m.screenshots), 9)
+        lst = self.lst()
+        with self.assertRaises(t.AscError):
+            lst.apply(self.m, "7")
+        self.assertNoWrites(lst)
+
+    def test_from_nothing_apply_uploads_everything_then_a_second_apply_writes_nothing(self):
+        self.w.version = None
+        first, _ = self.apply("7")
+        self.assertEqual(self.names(self.w.shots), SHOTS)
+        self.assertEqual(self.names(self.w.attachments), ["pack.pdf"])
+        second, plan = self.apply("7", lst=self.lst())
+        self.assertNoWrites(second)
+        self.assertEqual(set(plan.values()), {"unchanged"}, plan)
+        self.assertEqual({c.action for c in self.lst().plan(self.m, build="7")}, {"unchanged"})
+
+    def test_no_upload_or_api_text_reaches_the_summary_output(self):
+        self.diverge_text()
+        self.w.shots[0]["attributes"]["sourceFileChecksum"] = "0" * 32
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(a, "build_listing", return_value=self.w.live_listing()), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = a.main(["apply", "--src", str(self.root), "--build", "7"])
+        text = out.getvalue() + err.getvalue()
+        self.assertEqual(code, 0, text)
+        self.assertIn("appScreenshot.01-shot1.jpg: updated", text)
+        for secret in ("store.apple.com", "tok", "Bearer", DESCRIPTION, NOTES, PHONE):
+            self.assertNotIn(secret, text)
 
 
 class MainTests(Tree):
