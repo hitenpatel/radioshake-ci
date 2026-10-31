@@ -260,11 +260,58 @@ class RequestsPlainHttp:
         return self._session.get(url, timeout=timeout, allow_redirects=allow_redirects)
 
     def put(self, url: str, headers: Dict[str, str], data: bytes, timeout: int = 120):
-        return self._session.put(url, headers=headers, data=data, timeout=timeout)
+        # Never follow a redirect: the operation headers must only ever reach the vetted Apple host.
+        return self._session.put(url, headers=headers, data=data, timeout=timeout, allow_redirects=False)
 
 
 def _attrs(resource: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     return ((resource or {}).get("attributes")) or {}
+
+
+def _prepare_upload(op: Any, size: int) -> Tuple[str, Dict[str, str], int, int]:
+    """Validate one of Apple's upload operations; the messages never repeat the (signed) URL."""
+    if not isinstance(op, dict) or op.get("method") != "PUT":
+        raise AscError("refusing an upload operation that is not a PUT")
+    url = op.get("url")
+    if not isinstance(url, str):
+        raise AscError("refusing an upload operation without a URL")
+    parts = urlsplit(url)
+    host = parts.hostname or ""
+    if parts.scheme != "https" or not host.endswith(UPLOAD_HOST_SUFFIX) or parts.username or parts.password \
+            or parts.port not in (None, 443):
+        raise AscError("refusing an upload operation that is not https on an apple.com host")
+    offset, length = op.get("offset"), op.get("length")
+    if not all(isinstance(x, int) and not isinstance(x, bool) for x in (offset, length)) \
+            or offset < 0 or length <= 0 or offset + length > size:
+        raise AscError("refusing an upload operation with an invalid byte range")
+    listed = op.get("requestHeaders")
+    if not isinstance(listed, list):
+        raise AscError("refusing an upload operation without a header list")
+    headers: Dict[str, str] = {}
+    for item in listed:
+        name = item.get("name") if isinstance(item, dict) else None
+        value = item.get("value") if isinstance(item, dict) else None
+        if not isinstance(name, str) or not isinstance(value, str):
+            raise AscError("refusing an upload operation with a malformed header")
+        if name.lower() in ("authorization", "proxy-authorization"):
+            raise AscError("refusing an upload operation that asks for credentials")
+        headers[name] = value
+    return url, headers, offset, offset + length
+
+
+def upload_operations(ops: List[Dict[str, Any]], data: bytes, http: Any) -> None:
+    """PUT each part of `data` as Apple's reservation says: https on *.apple.com only, the operation's
+    own headers only, no Authorization. Every operation is validated before the first byte is sent."""
+    if not isinstance(ops, list) or not ops:
+        raise AscError("the reservation has no upload operations")
+    prepared = [_prepare_upload(op, len(data)) for op in ops]
+    for url, headers, start, end in prepared:
+        try:
+            resp = http.put(url, headers=headers, data=data[start:end], timeout=120)
+        except Exception as exc:  # class name only: the message can carry the signed URL
+            raise AscError(f"upload part failed ({type(exc).__name__})") from None
+        if resp.status_code not in UPLOAD_OK_STATUSES:
+            raise AscError(f"upload part failed (HTTP {resp.status_code})")
 
 
 def _delivery(resource: Dict[str, Any]) -> str:
@@ -641,6 +688,73 @@ class Listing:
         return why
 
     # -- apply -----------------------------------------------------------
+    def _settle(self, path: str, resource: Optional[Dict[str, Any]], name: str) -> None:
+        """Wait for Apple to finish processing an uploaded asset; FAILED raises with codes only."""
+        res: Dict[str, Any] = resource or {}
+        for _ in range(SETTLE_POLLS + 1):
+            state = _delivery(res)
+            if state == "COMPLETE":
+                return
+            if state == "FAILED":
+                errors = (_attrs(res).get("assetDeliveryState") or {}).get("errors") or []
+                codes = [str(e.get("code")) for e in errors if isinstance(e, dict)
+                         and re.fullmatch(r"[A-Za-z0-9_.-]{1,60}", str(e.get("code")))][:3]
+                raise AscError(scrub(f"{name} reached assetDeliveryState FAILED"
+                                     + (f" ({', '.join(codes)})" if codes else ""), 200))
+            self.asc.sleep(SETTLE_SECONDS)
+            res = self._one(path) or {}
+        raise AscError(scrub(f"{name} did not finish processing in time", 200))
+
+    def _upload(self, kind: str, path: pathlib.Path, **parent: Tuple[str, str]) -> str:
+        """Reserve, upload the parts, commit with the MD5 checksum, wait for COMPLETE. Returns the id."""
+        data = path.read_bytes()
+        created = self._write("POST", f"/v1/{kind}", self._body(
+            kind, {"fileName": path.name, "fileSize": len(data)}, **parent))
+        res = (created or {}).get("data") or {}
+        rid = res.get("id")
+        if not rid:
+            raise AscError("the upload reservation has no id")
+        upload_operations(_attrs(res).get("uploadOperations") or [], data, self.upload_http)
+        done = self._write("PATCH", f"/v1/{kind}/{rid}", self._patch_body(
+            kind, rid, {"uploaded": True, "sourceFileChecksum": hashlib.md5(data).hexdigest()}))
+        self._settle(f"/v1/{kind}/{rid}", (done or {}).get("data"), path.name)
+        return rid
+
+    def _sync_assets(self, changes: List[Change], resource: str, kind: str, local: Tuple[pathlib.Path, ...],
+                     remote: List[Dict[str, Any]], **parent: Tuple[str, str]) -> Tuple[Dict[str, str], bool]:
+        """Keep remote assets whose checksum equals the repo file, replace the rest, delete the unknown.
+        Returns (id by file name, whether anything was written)."""
+        wanted = {p.name: p for p in local}
+        keep: Dict[str, Dict[str, Any]] = {}
+        doomed: List[Dict[str, Any]] = []
+        for r in remote:
+            at = _attrs(r)
+            name = at.get("fileName")
+            if name in wanted and name not in keep and at.get("sourceFileChecksum") == md5_hex(wanted[name]) \
+                    and _delivery(r) in ("COMPLETE", "UPLOAD_COMPLETE"):
+                keep[name] = r
+            else:
+                doomed.append(r)
+        remote_names = {_attrs(r).get("fileName") for r in remote}
+        for p in local:
+            changes.append(Change(resource, p.name, "unchanged" if p.name in keep
+                                  else ("updated" if p.name in remote_names else "created")))
+        changes.extend(Change(resource, str(n), "deleted") for n in sorted(map(str, remote_names - set(wanted))))
+        touched = bool(doomed)
+        for r in doomed:
+            self._write("DELETE", f"/v1/{kind}/{r['id']}")
+        ids: Dict[str, str] = {}
+        for p in local:
+            if p.name in keep:
+                r = keep[p.name]
+                if _delivery(r) != "COMPLETE":
+                    self._settle(f"/v1/{kind}/{r['id']}", r, p.name)
+                ids[p.name] = r["id"]
+            else:
+                ids[p.name] = self._upload(kind, p, **parent)
+                touched = True
+        return ids, touched
+
     @staticmethod
     def _check_write(method: str, path: str, body: Any) -> None:
         if not any(m == method and rx.fullmatch(path) for m, rx in _WRITE_RULES):
@@ -731,6 +845,9 @@ class Listing:
         """Make App Store Connect match the repo. Refusals happen before the first write; a second
         run with nothing changed sends no write. Never touches the attestations, price, availability,
         phased release, the review phone or submission."""
+        if not SCREENSHOTS_MIN <= len(m.screenshots) <= SCREENSHOTS_MAX:
+            raise AscError(f"expected {SCREENSHOTS_MIN} to {SCREENSHOTS_MAX} screenshot files in the repo, "
+                           f"found {len(m.screenshots)}")
         s = self.snapshot(m)
         app_id = s.app["id"]
         chosen = self._choose_build(app_id, m, build)
@@ -818,6 +935,30 @@ class Listing:
                 self._write("PATCH", f"/v1/appStoreReviewDetails/{detail_id}",
                             self._patch_body("appStoreReviewDetails", detail_id, pending))
         self._record(changes, "appStoreReviewDetail", s.detail, detail_wanted, pending)
+
+        self._sync_assets(changes, "appStoreReviewAttachment", "appStoreReviewAttachments", m.attachments,
+                          s.attachments, appStoreReviewDetail=("appStoreReviewDetails", detail_id))
+
+        if s.shot_set is None:
+            created = self._write("POST", "/v1/appScreenshotSets", self._body(
+                "appScreenshotSets", {"screenshotDisplayType": m.display_type},
+                appStoreVersionLocalization=("appStoreVersionLocalizations", loc_id)))
+            set_id = ((created or {}).get("data") or {}).get("id")
+            if not set_id:
+                raise AscError("the created screenshot set has no id")
+            changes.append(Change("appScreenshotSet", "screenshotDisplayType", "created"))
+        else:
+            set_id = s.shot_set["id"]
+            changes.append(Change("appScreenshotSet", "screenshotDisplayType", "unchanged"))
+        ids, touched = self._sync_assets(changes, "appScreenshot", "appScreenshots", m.screenshots, s.shots,
+                                         appScreenshotSet=("appScreenshotSets", set_id))
+        current = [x["id"] for x in (self._all(f"/v1/appScreenshotSets/{set_id}/appScreenshots") if touched
+                                     else s.shots)]
+        order = [ids[p.name] for p in m.screenshots]
+        if current != order:
+            self._write("PATCH", f"/v1/appScreenshotSets/{set_id}/relationships/appScreenshots",
+                        {"data": [{"type": "appScreenshots", "id": i} for i in order]})
+        changes.append(Change("appScreenshotSet", "order", "unchanged" if current == order else "updated"))
         return changes
 
 

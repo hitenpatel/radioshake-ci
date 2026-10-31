@@ -386,13 +386,15 @@ class Tree(unittest.TestCase):
         return self.w.listing().preflight(self.m, **kw)
 
     def diverge_text(self):
-        """Everything App Store Connect holds about the text differs or is missing (assets still match)."""
+        """The text, review detail, category and build are wrong or missing (so are their child assets)."""
         self.w.version["attributes"].update({"versionString": "1.0", "releaseType": "AFTER_APPROVAL",
                                              "copyright": "old"})
         self.w.loc = None
+        self.w.set, self.w.shots = None, []  # children of a missing localization or detail do not exist either
         self.w.info_loc = None
         self.w.category = {"id": "GAMES"}
         self.w.detail = None
+        self.w.attachments = []
         self.w.build = None
 
     def assertReason(self, fragment, **kw):
@@ -1293,14 +1295,13 @@ class ApplyAssetsTests(ApplyTree):
 
     def test_no_upload_or_api_text_reaches_the_summary_output(self):
         self.diverge_text()
-        self.w.shots[0]["attributes"]["sourceFileChecksum"] = "0" * 32
         out, err = io.StringIO(), io.StringIO()
         with mock.patch.object(a, "build_listing", return_value=self.w.live_listing()), \
                 contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             code = a.main(["apply", "--src", str(self.root), "--build", "7"])
         text = out.getvalue() + err.getvalue()
         self.assertEqual(code, 0, text)
-        self.assertIn("appScreenshot.01-shot1.jpg: updated", text)
+        self.assertIn("appScreenshot.01-shot1.jpg: created", text)
         for secret in ("store.apple.com", "tok", "Bearer", DESCRIPTION, NOTES, PHONE):
             self.assertNotIn(secret, text)
 
