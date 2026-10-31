@@ -188,6 +188,20 @@ def fetch_page(url: str, http: Any) -> str:
     raise PageError("too many redirects")
 
 
+_CFEMAIL_RE = re.compile(r"""data-cfemail\s*=\s*["']([0-9a-fA-F]*)["']""")
+
+
+def _cf_emails(html: str) -> str:
+    """Addresses hidden by Cloudflare Email Address Obfuscation: hex, first byte is the XOR key."""
+    found: List[str] = []
+    for token in _CFEMAIL_RE.findall(html):
+        if len(token) < 4 or len(token) % 2:
+            continue
+        raw = bytes.fromhex(token)
+        found.append(bytes(b ^ raw[0] for b in raw[1:]).decode("utf-8", "replace"))
+    return "\n".join(found)
+
+
 class RequestsPlainHttp:
     """Plain requests transport for public pages (and, later, Apple's upload hosts): no credentials."""
 
@@ -269,13 +283,12 @@ class Listing:
         return page.get("data") or None
 
     def _all(self, path: str, params: Optional[Dict[str, str]] = None) -> List[Dict[str, Any]]:
+        """GET a list under a parent id that was just read: a 404 means a wrong path, so it raises."""
         out: List[Dict[str, Any]] = []
         try:
             for page in self.asc.paginate(path, {"limit": "200", **(params or {})}):
                 out.extend(page.get("data") or [])
         except AscError as exc:
-            if "HTTP 404" in str(exc):
-                return []
             raise _generic(exc) from None
         return out
 
@@ -323,7 +336,7 @@ class Listing:
         s.price = self._one(f"/v1/apps/{app_id}/appPriceSchedule")
         availability = self._one(f"/v1/apps/{app_id}/appAvailabilityV2")
         if availability:
-            s.territories = self._all(f"/v1/appAvailabilities/{availability['id']}/territoryAvailabilities",
+            s.territories = self._all(f"/v2/appAvailabilities/{availability['id']}/territoryAvailabilities",
                                       {"include": "territory"})
         return s
 
@@ -552,7 +565,7 @@ class Listing:
         text, err = self._page(m.fields["support_url"])
         if err:
             why.append(f"support page could not be read: {err}")
-        elif m.review_email not in text:
+        elif m.review_email not in text and m.review_email not in _cf_emails(text):
             why.append("support page does not contain the contact email")
         text, err = self._page(PRIVACY_URL)
         if err:
