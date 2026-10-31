@@ -51,7 +51,8 @@ CONTENT_RIGHTS_OK = "USES_THIRD_PARTY_CONTENT"
 # Age-rating attributes that are legitimately null for this app (kids band, regional overrides and
 # the free-text info URL are not questions the owner answers).
 AGE_RATING_OPTIONAL = frozenset({"kidsAgeBand", "ageRatingOverride", "ageRatingOverrideV2",
-                                 "koreaAgeRatingOverride", "developerAgeRatingInfoUrl"})
+                                 "koreaAgeRatingOverride", "developerAgeRatingInfoUrl",
+                                 "gracRatingClassificationNumber"})
 OWNER_CHECKS = (
     "App Privacy answers are not readable through the API: confirm them in the portal (re-confirm after 4b).",
     "EU DSA trader status (Business) is not readable through the API: confirm it in the portal.",
@@ -528,7 +529,11 @@ class Listing:
         if not s.age:
             why.append("age rating declaration is missing")
         else:
-            null = sorted(k for k, x in _attrs(s.age).items() if x is None and k not in AGE_RATING_OPTIONAL)
+            age = _attrs(s.age)
+            optional = set(AGE_RATING_OPTIONAL)
+            if age.get("socialMedia") is not True:
+                optional.add("socialMediaAgeRestricted")  # a follow-up question, asked only for social media apps
+            null = sorted(k for k, x in age.items() if x is None and k not in optional)
             if null:
                 why.append("age rating has unanswered attributes: " + ", ".join(null))
         if s.territories is None:
