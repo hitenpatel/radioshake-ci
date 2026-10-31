@@ -1,0 +1,195 @@
+name: asc-listing
+run-name: asc-listing ${{ inputs.mode }} ${{ inputs.sha }}
+
+# App Store listing for the iOS early App Review (plan / preflight / apply).
+#
+# This repository is public, so its Actions logs are public. The script prints
+# field names, unchanged/updated/created, lengths and short hashes only; never
+# listing text, review notes, the review phone or credentials. This job emits no
+# step summary and no artifact.
+#
+# - workflow_dispatch only, dispatched from main, `mode` defaults to the
+#   read-only `plan`.
+# - `plan` accepts a commit on Forgejo main or on the early-review branch;
+#   `apply` and `preflight` accept only a commit on Forgejo main.
+# - The App Store Connect secrets live only in the `testflight` environment.
+#   The key is written to runner temp (mode 600) after the listing checker
+#   has passed and is removed in an always() step.
+# - Never written by any mode: content rights, age rating, App Privacy, privacy
+#   policy URL, price, availability, phased release, review phone, submission.
+
+on:
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: 'Commit of the private source repository to read (40 hex characters)'
+        required: true
+        type: string
+      mode:
+        description: 'plan and preflight only read App Store Connect; apply writes the listing'
+        required: true
+        default: plan
+        type: choice
+        options:
+          - plan
+          - apply
+          - preflight
+      build:
+        description: 'Build number to attach or require (optional)'
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: asc-listing
+  cancel-in-progress: false
+
+jobs:
+  listing:
+    environment: testflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out CI scripts (this repo, scripts and requirements only)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          path: ci
+          sparse-checkout: .github/scripts
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - name: Require a dispatch from main and valid inputs
+        env:
+          REF: ${{ github.ref }}
+          SHA: ${{ inputs.sha }}
+          MODE: ${{ inputs.mode }}
+          BUILD: ${{ inputs.build }}
+        run: |
+          set -euo pipefail
+          [ "$REF" = "refs/heads/main" ] || { echo "::error::asc-listing must be dispatched from main"; exit 1; }
+          [[ "$SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::sha must be 40 lowercase hex characters"; exit 1; }
+          [[ "$MODE" =~ ^(plan|apply|preflight)$ ]] || { echo "::error::mode must be plan|apply|preflight"; exit 1; }
+          if [ -n "$BUILD" ]; then
+            [[ "$BUILD" =~ ^[1-9][0-9]{0,8}$ ]] || { echo "::error::build must be a build number"; exit 1; }
+          fi
+          echo "mode ${MODE}"
+
+      - name: Install PyJWT and requests (hash-locked)
+        run: |
+          set -euo pipefail
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install --quiet --require-hashes --only-binary=:all: \
+            -r ci/.github/scripts/requirements-asc.txt
+
+      - name: Clone source at the requested commit
+        env:
+          HOST: ${{ secrets.FORGEJO_HOST }}
+          TOKEN: ${{ secrets.FORGEJO_CLONE_TOKEN }}
+          SHA: ${{ inputs.sha }}
+          MODE: ${{ inputs.mode }}
+        run: |
+          set -euo pipefail
+          AUTH=$(printf 'oauth2:%s' "$TOKEN" | base64 -w0)
+          echo "::add-mask::$AUTH"
+          echo "::add-mask::$TOKEN"
+          echo "::add-mask::$HOST"
+          git_auth() { git -c http.extraheader="AUTHORIZATION: basic $AUTH" "$@"; }
+
+          # Blobs are fetched lazily at checkout (the filter is ignored by servers without support).
+          git_auth clone --no-checkout --filter=blob:none --single-branch --branch main \
+            "https://${HOST}/hiten/RadioShake.git" src >/dev/null 2>&1 \
+            || { echo "::error::could not clone Forgejo main"; exit 1; }
+          if grep -rq AUTHORIZATION src/.git/config; then
+            echo "::error::auth header was persisted in src/.git/config"
+            exit 1
+          fi
+
+          allowed=0
+          if git -C src cat-file -e "${SHA}^{commit}" 2>/dev/null \
+              && git -C src merge-base --is-ancestor "$SHA" refs/remotes/origin/main; then
+            allowed=1
+          elif [ "$MODE" = "plan" ]; then
+            # A plan may also read the early-review branch; apply and preflight never do.
+            git_auth -C src fetch --quiet origin +refs/heads/feat/ios-early-review:refs/remotes/origin/feat/ios-early-review \
+              >/dev/null 2>&1 || true
+            if git -C src cat-file -e "${SHA}^{commit}" 2>/dev/null \
+                && git -C src rev-parse --verify -q refs/remotes/origin/feat/ios-early-review >/dev/null \
+                && git -C src merge-base --is-ancestor "$SHA" refs/remotes/origin/feat/ios-early-review; then
+              allowed=1
+            fi
+          fi
+          if [ "$allowed" != "1" ]; then
+            echo "::error::${SHA} is not on an allowed branch for mode ${MODE}"
+            exit 1
+          fi
+
+          git_auth -C src checkout --quiet --detach "$SHA" \
+            || { echo "::error::could not check out ${SHA}"; exit 1; }
+          [ "$(git -C src rev-parse HEAD)" = "$SHA" ] \
+            || { echo "::error::checked-out commit does not match ${SHA}"; exit 1; }
+          if grep -rq AUTHORIZATION src/.git/config; then
+            echo "::error::auth header was persisted in src/.git/config"
+            exit 1
+          fi
+          echo "checked out ${SHA}"
+
+      - name: Check listing files (fail closed)
+        env:
+          MODE: ${{ inputs.mode }}
+        run: |
+          set -euo pipefail
+          flags=(--root src)
+          SHOT_DIR=$(python3 -c 'import json; print(json.load(open("src/ios/appstore/appstore.json"))["screenshots"]["dir"])')
+          case "$MODE" in
+            apply|preflight) flags+=(--submission) ;;
+            plan) [ -d "src/$SHOT_DIR" ] || flags+=(--no-screenshots) ;;
+          esac
+          python3 src/scripts/check_appstore_listing.py "${flags[@]}"
+
+      - name: Prepare App Store Connect key
+        env:
+          ASC_KEY_B64: ${{ secrets.APP_STORE_CONNECT_PRIVATE_KEY_B64 }}
+        run: |
+          set -euo pipefail
+          [ -n "$ASC_KEY_B64" ] || { echo "::error::the testflight environment key secret is missing"; exit 1; }
+          KEY="$RUNNER_TEMP/asc-key.p8"
+          umask 077
+          python3 - "$KEY" <<'PY'
+          import base64, os, sys
+          fd = os.open(sys.argv[1], os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+          with os.fdopen(fd, "wb") as fh:
+              fh.write(base64.b64decode(os.environ["ASC_KEY_B64"], validate=False))
+          PY
+          chmod 600 "$KEY"
+          openssl pkey -in "$KEY" -noout 2>/dev/null \
+            || { echo "::error::the decoded App Store Connect key is not a valid private key"; exit 1; }
+          echo "App Store Connect key prepared (mode 600)"
+
+      - name: Run listing script
+        env:
+          ASC_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          ASC_KEY_PATH: ${{ runner.temp }}/asc-key.p8
+          ASC_BUNDLE_ID: com.radioshake
+          MODE: ${{ inputs.mode }}
+          BUILD: ${{ inputs.build }}
+        run: |
+          set -euo pipefail
+          args=("$MODE" --src "$GITHUB_WORKSPACE/src")
+          if [ -n "$BUILD" ]; then
+            args+=(--build "$BUILD")
+          fi
+          "$RUNNER_TEMP/venv/bin/python" "$GITHUB_WORKSPACE/ci/.github/scripts/asc_listing.py" "${args[@]}"
+
+      - name: Remove the App Store Connect key
+        if: ${{ always() }}
+        run: |
+          rm -f "$RUNNER_TEMP/asc-key.p8"
+          if [ -e "$RUNNER_TEMP/asc-key.p8" ]; then
+            echo "::error::key file still exists"
+            exit 1
+          fi
+          echo "key removed"

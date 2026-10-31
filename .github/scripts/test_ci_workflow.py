@@ -162,10 +162,12 @@ class AscListingWorkflowTests(unittest.TestCase):
     def test_branch_rule_plan_accepts_feature_branch_others_only_main(self):
         step = self.step("Clone source at the requested commit")
         run = step["run"]
-        self.assertEqual(self.text.count("feat/ios-early-review"), 1)
+        self.assertEqual(self.text.count("feat/ios-early-review"), run.count("feat/ios-early-review"))
+        self.assertEqual(self.text.count("refs/remotes/origin/main"), run.count("refs/remotes/origin/main"))
         self.assertIn("merge-base --is-ancestor", run)
         self.assertIn("refs/remotes/origin/main", run)
         self.assertLess(run.index('"$MODE" = "plan"'), run.index("feat/ios-early-review"))
+        self.assertLess(run.index("refs/remotes/origin/main"), run.index('"$MODE" = "plan"'))
         self.assertIn("add-mask", run)
         self.assertIn("http.extraheader", run)
         self.assertIn("AUTHORIZATION", run)
@@ -195,16 +197,19 @@ class AscListingWorkflowTests(unittest.TestCase):
         self.assertIn('"$MODE"', script["run"])
         self.assertEqual(script["env"]["ASC_KEY_PATH"], "${{ runner.temp }}/asc-key.p8")
 
-    def test_secrets_only_in_clone_and_key_steps(self):
+    def test_secrets_only_in_clone_key_and_run_env(self):
         found = {}
         for s in self.steps:
             for name in re.findall(r"secrets\.([A-Z0-9_]+)", str(s)):
                 found.setdefault(s["name"], set()).add(name)
-        self.assertEqual(set(found), {"Clone source at the requested commit", "Prepare App Store Connect key"})
+        self.assertEqual(set(found), {"Clone source at the requested commit", "Prepare App Store Connect key",
+                                      "Run listing script"})
         self.assertEqual(found["Clone source at the requested commit"], {"FORGEJO_HOST", "FORGEJO_CLONE_TOKEN"})
-        self.assertEqual(found["Prepare App Store Connect key"],
-                         SECRET_NAMES - {"FORGEJO_HOST", "FORGEJO_CLONE_TOKEN"})
-        self.assertNotIn("secrets.", self.step("Run listing script")["run"])
+        self.assertEqual(found["Prepare App Store Connect key"], {"APP_STORE_CONNECT_PRIVATE_KEY_B64"})
+        self.assertEqual(found["Run listing script"], {"APP_STORE_CONNECT_KEY_ID", "APP_STORE_CONNECT_ISSUER_ID"})
+        self.assertTrue(set().union(*found.values()) <= SECRET_NAMES)
+        for name in found:
+            self.assertNotIn("secrets.", self.step(name)["run"], name)
 
     def test_key_is_mode_600_and_removed_in_always_step(self):
         run = self.step("Prepare App Store Connect key")["run"]
