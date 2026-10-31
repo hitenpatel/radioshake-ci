@@ -50,6 +50,8 @@ class FakeHttp:
         assert headers["Authorization"].startswith("Bearer ")
         path = url[len(APP):]
         self.calls.append((method, path, params, json))
+        if path.endswith("/build") and params and "include" in params:
+            return Resp(400, {"errors": [{"code": "PARAMETER_ERROR.ILLEGAL", "title": "x", "detail": "include"}]})
         if (method, path) not in self.routes:
             return Resp(404, {"errors": [{"code": "NOT_FOUND", "title": "nope", "detail": path}]})
         return Resp(200, self.routes[(method, path)])
@@ -169,7 +171,8 @@ class World:
         r[("GET", "/v1/appStoreReviewDetails/rd1/appStoreReviewAttachments")] = {"data": self.attachments}
         r[("GET", "/v1/appStoreVersionLocalizations/l1/appScreenshotSets")] = {"data": [self.set] if self.set else []}
         r[("GET", "/v1/appScreenshotSets/s1/appScreenshots")] = {"data": self.shots}
-        r[("GET", "/v1/appStoreVersions/v1/build")] = {"data": self.build, "included": [self.pre] if self.pre else []}
+        r[("GET", "/v1/appStoreVersions/v1/build")] = {"data": self.build}
+        r[("GET", "/v1/builds/b1/preReleaseVersion")] = {"data": self.pre}
         r[("GET", "/v1/apps/app1/appPriceSchedule")] = {"data": self.price}
         r[("GET", "/v1/apps/app1/appAvailabilityV2")] = {"data": {"id": "av1"}}
         r[("GET", "/v1/appAvailabilities/av1/territoryAvailabilities")] = {"data": self.terr}
@@ -385,6 +388,13 @@ class PreflightTests(Tree):
         self.setUp()
         self.w.build["attributes"]["expired"] = True
         self.assertReason("expired")
+
+    def test_build_read_never_sends_include_which_apple_rejects(self):
+        lst = self.w.listing()
+        lst.preflight(self.m)
+        for method, path, params, _ in lst.asc.http.calls:
+            if path.endswith("/build"):
+                self.assertFalse(params, "GET .../build rejects include (HTTP 400 on the first live read)")
 
     def test_requested_build_number_must_match(self):
         self.assertEqual(self.reasons(build="7"), [])
