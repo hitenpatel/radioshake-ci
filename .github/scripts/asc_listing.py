@@ -241,6 +241,14 @@ def _state(resource: Optional[Dict[str, Any]]) -> str:
     return str(a.get("appStoreState") or a.get("appVersionState") or a.get("state") or "UNKNOWN")
 
 
+_ID_RE = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+
+
+def _generic(exc: AscError) -> AscError:
+    """Same error with resource ids blanked so scrub() keeps the request path readable in the log."""
+    return AscError(_ID_RE.sub("{id}", str(exc)))
+
+
 class Listing:
     def __init__(self, asc: Asc, upload_http: Any, page_http: Any, bundle_id: str) -> None:
         self.asc = asc
@@ -256,7 +264,7 @@ class Listing:
         except AscError as exc:
             if "HTTP 404" in str(exc):
                 return None
-            raise
+            raise _generic(exc) from None
         return page.get("data") or None
 
     def _all(self, path: str, params: Optional[Dict[str, str]] = None) -> List[Dict[str, Any]]:
@@ -267,7 +275,7 @@ class Listing:
         except AscError as exc:
             if "HTTP 404" in str(exc):
                 return []
-            raise
+            raise _generic(exc) from None
         return out
 
     def _app(self) -> Dict[str, Any]:
@@ -292,18 +300,10 @@ class Listing:
             s.loc = next((x for x in self._all(f"/v1/appStoreVersions/{vid}/appStoreVersionLocalizations")
                           if _attrs(x).get("locale") == m.locale), None)
             s.detail = self._one(f"/v1/appStoreVersions/{vid}/appStoreReviewDetail")
-            try:
-                page = self.asc.request("GET", f"/v1/appStoreVersions/{vid}/build",
-                                        params={"include": "preReleaseVersion"}) or {}
-            except AscError as exc:
-                if "HTTP 404" not in str(exc):
-                    raise
-                page = {}
-            s.build = page.get("data") or None
+            # Apple rejects `include` on this request (HTTP 400): read the pre-release version separately.
+            s.build = self._one(f"/v1/appStoreVersions/{vid}/build")
             if s.build:
-                wanted = (((s.build.get("relationships") or {}).get("preReleaseVersion") or {}).get("data") or {}).get("id")
-                pres = [x for x in page.get("included") or [] if x.get("type") == "preReleaseVersions"]
-                pre = next((x for x in pres if x.get("id") == wanted), pres[0] if pres else None)
+                pre = self._one(f"/v1/builds/{s.build['id']}/preReleaseVersion")
                 s.build_marketing = _attrs(pre).get("version")
         if s.detail:
             s.attachments = self._all(f"/v1/appStoreReviewDetails/{s.detail['id']}/appStoreReviewAttachments")
