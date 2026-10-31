@@ -8,6 +8,7 @@ import io
 import json
 import os
 import pathlib
+import re
 import sys
 import tempfile
 import unittest
@@ -55,6 +56,45 @@ class FakeHttp:
         if (method, path) not in self.routes:
             return Resp(404, {"errors": [{"code": "NOT_FOUND", "title": "nope", "detail": path}]})
         return Resp(200, self.routes[(method, path)])
+
+
+class LiveHttp(FakeHttp):
+    """Stateful Apple API fake: GETs read the world as it is now, writes mutate it."""
+
+    def __init__(self, world):
+        super().__init__()
+        self.world = world
+        self.errors = {}  # (method, path) -> (status, body)
+
+    def request(self, method, url, headers, json=None, params=None, timeout=30):
+        assert headers["Authorization"].startswith("Bearer ")
+        assert url.startswith(APP + "/"), "the bearer token went to a non-Apple URL"
+        path = url[len(APP):]
+        self.calls.append((method, path, params, json))
+        if (method, path) in self.errors:
+            status, body = self.errors[(method, path)]
+            return Resp(status, body)
+        if method == "GET":
+            routes = self.world.routes()
+            if path.endswith("/build") and params and "include" in params:
+                return Resp(400, {"errors": [{"code": "PARAMETER_ERROR.ILLEGAL", "title": "x", "detail": "include"}]})
+            if ("GET", path) in routes:
+                return Resp(200, routes[("GET", path)])
+            return Resp(404, {"errors": [{"code": "NOT_FOUND", "title": "nope", "detail": path}]})
+        status, body = self.world.write(method, path, json)
+        return Resp(status, body)
+
+
+class FakeUpload:
+    """Apple's upload hosts: records every PUT; never sees an Authorization header."""
+
+    def __init__(self):
+        self.calls = []  # (url, headers, data)
+        self.status = 200
+
+    def put(self, url, headers, data, timeout=120):
+        self.calls.append((url, dict(headers), bytes(data)))
+        return Resp(self.status, None)
 
 
 class Page:
@@ -160,15 +200,29 @@ class World:
                       "relationships": {"territory": {"data": {"type": "territories", "id": "GBR"}}}},
                      {"id": "ta2", "attributes": {"available": False},
                       "relationships": {"territory": {"data": {"type": "territories", "id": "CHN"}}}}]
+        self.catalog = [
+            {"id": "b1", "number": "7", "state": "VALID", "expired": False, "marketing": m.version},
+            {"id": "b2", "number": "8", "state": "VALID", "expired": False, "marketing": m.version}]
+        self.unexpected = []
+        self.counter = 0
+        self.fail_delivery = set()
         self.pages = {
             m.fields["support_url"]: Page(200, f"Write to {EMAIL} for help"),
             a.PRIVACY_URL: Page(200, "We use ShazamKit to identify songs."),
             a.TAKEDOWN_URL: Page(200, "Rights holders: contact us"),
         }
 
-    def http(self) -> FakeHttp:
-        h = FakeHttp()
-        r = h.routes
+    def builds_body(self):
+        return {"data": [{"id": b["id"], "attributes": {"version": b["number"], "processingState": b["state"],
+                                                        "expired": b["expired"]},
+                          "relationships": {"preReleaseVersion": {"data": {"type": "preReleaseVersions",
+                                                                           "id": "p-" + b["id"]}}}}
+                         for b in self.catalog],
+                "included": [{"type": "preReleaseVersions", "id": "p-" + b["id"],
+                              "attributes": {"version": b["marketing"], "platform": "IOS"}} for b in self.catalog]}
+
+    def routes(self):
+        r = {}
         r[("GET", "/v1/apps")] = {"data": [self.app]}
         r[("GET", "/v1/apps/app1/appStoreVersions")] = {"data": [self.version] if self.version else []}
         r[("GET", "/v1/appStoreVersions/v1/appStoreVersionPhasedRelease")] = {"data": self.phased}
@@ -182,15 +236,71 @@ class World:
         r[("GET", "/v1/appStoreVersionLocalizations/l1/appScreenshotSets")] = {"data": [self.set] if self.set else []}
         r[("GET", "/v1/appScreenshotSets/s1/appScreenshots")] = {"data": self.shots}
         r[("GET", "/v1/appStoreVersions/v1/build")] = {"data": self.build}
-        r[("GET", "/v1/builds/b1/preReleaseVersion")] = {"data": self.pre}
+        if self.build:
+            r[("GET", f"/v1/builds/{self.build['id']}/preReleaseVersion")] = {"data": self.pre}
+        r[("GET", "/v1/builds")] = self.builds_body()
         r[("GET", "/v1/apps/app1/appPriceSchedule")] = {"data": self.price}
         r[("GET", "/v1/apps/app1/appAvailabilityV2")] = {"data": {"id": "av1"}}
         r[("GET", "/v2/appAvailabilities/av1/territoryAvailabilities")] = {"data": self.terr}
+        return r
+
+    def http(self) -> FakeHttp:
+        h = FakeHttp()
+        h.routes = self.routes()
         return h
 
     def listing(self):
         return a.Listing(t.Asc(self.http(), lambda: "tok", sleep=lambda s: None), mock.Mock(),
                          FakePages(self.pages), "com.radioshake")
+
+    def live_listing(self, upload=None, factory=None):
+        return a.Listing(t.Asc(LiveHttp(self), factory or (lambda: "tok"), sleep=lambda s: None),
+                         upload or FakeUpload(), FakePages(self.pages), "com.radioshake")
+
+    def write(self, method, path, body):
+        """Apply one write the way App Store Connect would; returns (status, body)."""
+        data = (body or {}).get("data")
+        attrs = dict(data.get("attributes") or {}) if isinstance(data, dict) else {}
+        rels = (data.get("relationships") or {}) if isinstance(data, dict) else {}
+        if (method, path) == ("POST", "/v1/appStoreVersions"):
+            self.version = {"id": "v1", "attributes": {**attrs, "appStoreState": "PREPARE_FOR_SUBMISSION"}}
+            self.phased = self.loc = self.detail = self.set = self.build = None
+            self.attachments, self.shots = [], []
+            return 201, {"data": self.version}
+        if (method, path) == ("PATCH", "/v1/appStoreVersions/v1"):
+            self.version["attributes"].update(attrs)
+            return 200, {"data": self.version}
+        if (method, path) == ("PATCH", "/v1/appStoreVersions/v1/relationships/build"):
+            entry = next(b for b in self.catalog if b["id"] == data["id"])
+            self.build = {"id": entry["id"], "attributes": {"version": entry["number"],
+                                                            "processingState": entry["state"],
+                                                            "expired": entry["expired"]}}
+            self.pre = {"type": "preReleaseVersions", "id": "p-" + entry["id"],
+                        "attributes": {"version": entry["marketing"], "platform": "IOS"}}
+            return 204, None
+        if (method, path) == ("POST", "/v1/appStoreVersionLocalizations"):
+            self.loc = {"id": "l1", "attributes": attrs}
+            return 201, {"data": self.loc}
+        if (method, path) == ("PATCH", "/v1/appStoreVersionLocalizations/l1"):
+            self.loc["attributes"].update(attrs)
+            return 200, {"data": self.loc}
+        if (method, path) == ("POST", "/v1/appInfoLocalizations"):
+            self.info_loc = {"id": "il1", "attributes": attrs}
+            return 201, {"data": self.info_loc}
+        if (method, path) == ("PATCH", "/v1/appInfoLocalizations/il1"):
+            self.info_loc["attributes"].update(attrs)
+            return 200, {"data": self.info_loc}
+        if (method, path) == ("PATCH", "/v1/appInfos/i1"):
+            self.category = {"id": rels["primaryCategory"]["data"]["id"]}
+            return 200, {"data": self.info}
+        if (method, path) == ("POST", "/v1/appStoreReviewDetails"):
+            self.detail = {"id": "rd1", "attributes": attrs}
+            return 201, {"data": self.detail}
+        if (method, path) == ("PATCH", "/v1/appStoreReviewDetails/rd1"):
+            self.detail["attributes"].update(attrs)
+            return 200, {"data": self.detail}
+        self.unexpected.append((method, path))
+        return 400, {"errors": [{"code": "UNEXPECTED_WRITE", "title": "unexpected", "detail": path}]}
 
 
 class Tree(unittest.TestCase):
@@ -204,6 +314,16 @@ class Tree(unittest.TestCase):
 
     def reasons(self, **kw):
         return self.w.listing().preflight(self.m, **kw)
+
+    def diverge_text(self):
+        """Everything App Store Connect holds about the text differs or is missing (assets still match)."""
+        self.w.version["attributes"].update({"versionString": "1.0", "releaseType": "AFTER_APPROVAL",
+                                             "copyright": "old"})
+        self.w.loc = None
+        self.w.info_loc = None
+        self.w.category = {"id": "GAMES"}
+        self.w.detail = None
+        self.w.build = None
 
     def assertReason(self, fragment, **kw):
         reasons = self.reasons(**kw)
@@ -588,6 +708,264 @@ class PreflightTests(Tree):
         self.assertTrue(all(c[0] == "GET" for c in lst.asc.http.calls))
 
 
+class ApplyTree(Tree):
+    def setUp(self):
+        super().setUp()
+        self.addCleanup(lambda: self.assertEqual(self.w.unexpected, []))
+        self.upload = FakeUpload()
+
+    def lst(self, **kw):
+        return self.w.live_listing(self.upload, **kw)
+
+    def apply(self, build=None, lst=None):
+        lst = lst or self.lst()
+        changes = lst.apply(self.m, build)
+        return lst, {(c.resource, c.field): c.action for c in changes}
+
+    @staticmethod
+    def writes(lst):
+        return [c for c in lst.asc.http.calls if c[0] != "GET"]
+
+    def assertNoWrites(self, lst):
+        self.assertEqual(self.writes(lst), [])
+
+
+class ApplyTextTests(ApplyTree):
+    def test_default_one_point_zero_is_renamed_to_marketing_version(self):
+        self.w.version["attributes"]["versionString"] = "1.0"
+        lst, plan = self.apply()
+        self.assertEqual(plan[("appStoreVersion", "versionString")], "updated")
+        self.assertEqual(self.w.version["attributes"]["versionString"], self.m.version)
+        patch = [c for c in self.writes(lst) if c[1] == "/v1/appStoreVersions/v1"]
+        self.assertEqual(len(patch), 1)
+        self.assertEqual(patch[0][0], "PATCH")
+        self.assertEqual(patch[0][3]["data"]["attributes"], {"versionString": self.m.version})
+
+    def test_missing_version_is_created_for_ios_with_the_manifest_values(self):
+        self.w.version = None
+        lst, plan = self.apply()
+        post = [c for c in self.writes(lst) if (c[0], c[1]) == ("POST", "/v1/appStoreVersions")]
+        self.assertEqual(len(post), 1)
+        data = post[0][3]["data"]
+        self.assertEqual(data["type"], "appStoreVersions")
+        self.assertEqual(data["attributes"], {"platform": "IOS", "versionString": self.m.version,
+                                              "releaseType": "MANUAL", "copyright": self.m.copyright})
+        self.assertEqual(data["relationships"]["app"]["data"], {"type": "apps", "id": "app1"})
+        self.assertEqual(plan[("appStoreVersion", "versionString")], "created")
+        self.assertEqual(self.w.version["attributes"]["versionString"], self.m.version)
+
+    def test_release_type_is_set_to_manual_and_copyright_synced(self):
+        self.w.version["attributes"].update({"releaseType": "AFTER_APPROVAL", "copyright": "old"})
+        lst, plan = self.apply()
+        self.assertEqual(self.w.version["attributes"]["releaseType"], "MANUAL")
+        self.assertEqual(self.w.version["attributes"]["copyright"], self.m.copyright)
+        self.assertEqual(plan[("appStoreVersion", "releaseType")], "updated")
+        self.assertEqual(plan[("appStoreVersion", "copyright")], "updated")
+
+    def test_every_editable_state_is_accepted(self):
+        for state in sorted(a.EDITABLE_STATES):
+            with self.subTest(state=state):
+                self.w.version["attributes"]["appStoreState"] = state
+                lst, plan = self.apply()
+                self.assertNoWrites(lst)
+
+    def test_states_that_must_not_be_touched_are_refused_before_any_write(self):
+        self.diverge_text()
+        for state in ["WAITING_FOR_REVIEW", "PENDING_DEVELOPER_RELEASE", "IN_REVIEW", "READY_FOR_SALE",
+                      "PENDING_APPLE_RELEASE", "PROCESSING_FOR_APP_STORE"]:
+            with self.subTest(state=state):
+                self.w.version["attributes"]["appStoreState"] = state
+                lst = self.lst()
+                with self.assertRaises(t.AscError) as ctx:
+                    lst.apply(self.m, "8")
+                self.assertIn(state, str(ctx.exception))
+                self.assertNoWrites(lst)
+
+    def test_rejected_version_with_a_newer_build_swaps_the_build_and_keeps_the_version(self):
+        self.w.version["attributes"]["appStoreState"] = "REJECTED"
+        self.assertEqual(self.w.build["id"], "b1")
+        lst, plan = self.apply("8")
+        writes = self.writes(lst)
+        self.assertEqual([(c[0], c[1]) for c in writes], [("PATCH", "/v1/appStoreVersions/v1/relationships/build")])
+        self.assertEqual(writes[0][3], {"data": {"type": "builds", "id": "b2"}})
+        self.assertEqual(self.w.build["id"], "b2")
+        self.assertEqual(self.w.version["attributes"]["versionString"], self.m.version)
+        self.assertEqual(plan[("appStoreVersion", "build")], "updated")
+        self.assertEqual(plan[("appStoreVersion", "versionString")], "unchanged")
+
+    def test_attaching_a_build_when_none_is_attached(self):
+        self.w.build = None
+        lst, plan = self.apply("7")
+        self.assertEqual(plan[("appStoreVersion", "build")], "created")
+        self.assertEqual(self.w.build["id"], "b1")
+
+    def test_the_already_attached_build_is_not_rewritten(self):
+        lst, plan = self.apply("7")
+        self.assertNoWrites(lst)
+        self.assertEqual(plan[("appStoreVersion", "build")], "unchanged")
+
+    def test_without_a_build_number_the_attachment_is_left_alone(self):
+        lst, plan = self.apply(None)
+        self.assertNoWrites(lst)
+        self.assertEqual(plan[("appStoreVersion", "build")], "unchanged")
+        self.w.build = None
+        lst, plan = self.apply(None)
+        self.assertNoWrites(lst)
+        self.assertEqual(plan[("appStoreVersion", "build")], "skipped")
+
+    def test_a_build_that_is_not_valid_or_has_another_version_is_refused_before_any_write(self):
+        self.diverge_text()
+        cases = {
+            "state": lambda: self.w.catalog[1].update(state="PROCESSING"),
+            "expired": lambda: self.w.catalog[1].update(expired=True),
+            "version": lambda: self.w.catalog[1].update(marketing="1.0.1"),
+        }
+        for label, mutate in cases.items():
+            with self.subTest(label):
+                self.w.catalog[1].update(state="VALID", expired=False, marketing=self.m.version)
+                mutate()
+                lst = self.lst()
+                with self.assertRaises(t.AscError):
+                    lst.apply(self.m, "8")
+                self.assertNoWrites(lst)
+        self.w.catalog[1].update(state="VALID", expired=False, marketing=self.m.version)
+        lst = self.lst()
+        with self.assertRaises(t.AscError):
+            lst.apply(self.m, "99")  # no such build
+        self.assertNoWrites(lst)
+
+    def test_build_marketing_version_must_equal_marketing_version_in_project_yml(self):
+        (self.root / "ios" / "project.yml").write_text('  MARKETING_VERSION: "1.0.1"\n', encoding="utf-8")
+        self.m = a.load_manifest(self.root)
+        lst = self.lst()
+        with self.assertRaises(t.AscError):
+            lst.apply(self.m, "7")
+        self.assertNoWrites(lst)
+
+    def test_missing_localizations_review_detail_and_category_are_written(self):
+        self.diverge_text()
+        lst, plan = self.apply("7")
+        f = self.m.fields
+        self.assertEqual(self.w.loc["attributes"], {
+            "locale": self.m.locale, "description": f["description"], "keywords": f["keywords"],
+            "promotionalText": f["promotional_text"], "supportUrl": f["support_url"]})
+        self.assertEqual(self.w.info_loc["attributes"], {"locale": self.m.locale, "name": f["name"],
+                                                         "subtitle": f["subtitle"]})
+        self.assertEqual(self.w.category, {"id": "MUSIC"})
+        self.assertEqual(self.w.detail["attributes"], {
+            "contactFirstName": self.m.review_first_name, "contactLastName": self.m.review_last_name,
+            "contactEmail": self.m.review_email, "demoAccountRequired": False, "notes": self.m.notes})
+        self.assertEqual(plan[("appStoreVersionLocalization", "description")], "created")
+        self.assertEqual(plan[("appInfoLocalization", "subtitle")], "created")
+        self.assertEqual(plan[("appStoreReviewDetail", "notes")], "created")
+        self.assertEqual(plan[("appInfo", "primaryCategory")], "updated")
+
+    def test_the_new_localizations_point_at_their_parents(self):
+        self.diverge_text()
+        lst, _ = self.apply()
+        by_path = {c[1]: c[3]["data"] for c in self.writes(lst) if c[0] == "POST"}
+        self.assertEqual(by_path["/v1/appStoreVersionLocalizations"]["relationships"],
+                         {"appStoreVersion": {"data": {"type": "appStoreVersions", "id": "v1"}}})
+        self.assertEqual(by_path["/v1/appInfoLocalizations"]["relationships"],
+                         {"appInfo": {"data": {"type": "appInfos", "id": "i1"}}})
+        self.assertEqual(by_path["/v1/appStoreReviewDetails"]["relationships"],
+                         {"appStoreVersion": {"data": {"type": "appStoreVersions", "id": "v1"}}})
+
+    def test_only_differing_fields_are_patched(self):
+        self.w.loc["attributes"]["keywords"] = "other"
+        self.w.info_loc["attributes"]["subtitle"] = "other"
+        self.w.detail["attributes"]["notes"] = "other"
+        self.w.category = {"id": "GAMES"}
+        lst, plan = self.apply()
+        sent = {c[1]: c[3]["data"] for c in self.writes(lst)}
+        self.assertEqual(sent["/v1/appStoreVersionLocalizations/l1"]["attributes"], {"keywords": self.m.fields["keywords"]})
+        self.assertEqual(sent["/v1/appInfoLocalizations/il1"]["attributes"], {"subtitle": self.m.fields["subtitle"]})
+        self.assertEqual(sent["/v1/appStoreReviewDetails/rd1"]["attributes"], {"notes": self.m.notes})
+        self.assertEqual(sent["/v1/appInfos/i1"]["relationships"],
+                         {"primaryCategory": {"data": {"type": "appCategories", "id": "MUSIC"}}})
+        self.assertNotIn("attributes", sent["/v1/appInfos/i1"])
+        self.assertEqual(plan[("appStoreVersionLocalization", "description")], "unchanged")
+        self.assertEqual(plan[("appStoreVersionLocalization", "keywords")], "updated")
+        self.assertEqual(len(sent), 4)
+
+    def test_a_second_apply_writes_nothing(self):
+        self.diverge_text()
+        first, plan = self.apply("8")
+        self.assertTrue(self.writes(first))
+        self.assertNotEqual(set(plan.values()), {"unchanged"})
+        second, plan = self.apply("8", lst=self.lst())
+        self.assertNoWrites(second)
+        self.assertEqual(set(plan.values()), {"unchanged"}, plan)
+
+    def test_apply_from_nothing_then_plan_is_all_unchanged(self):
+        self.w.version = None
+        self.apply("7")
+        lst = self.lst()
+        self.assertEqual({c.action for c in lst.plan(self.m, build="7")}, {"unchanged"})
+
+    def test_review_phone_is_never_written_and_demo_account_is_false(self):
+        self.diverge_text()
+        self.w.detail = {"id": "rd1", "attributes": {"contactPhone": PHONE, "notes": "x"}}
+        lst, _ = self.apply()
+        self.assertEqual(self.w.detail["attributes"]["contactPhone"], PHONE)
+        for method, path, params, body in self.writes(lst):
+            self.assertNotIn("contactPhone", json.dumps(body))
+        self.assertIs(self.w.detail["attributes"]["demoAccountRequired"], False)
+
+    def test_no_request_ever_targets_the_attestations_price_availability_or_phased_release(self):
+        self.diverge_text()
+        lst, _ = self.apply("8")
+        forbidden_paths = ("ageRating", "appPrice", "appAvailabilit", "territor", "phasedRelease",
+                           "appPrivacy", "reviewSubmissions", "appStoreVersionSubmissions", "/v1/apps/",
+                           "betaGroups", "builds/")
+        forbidden_attrs = ("contentRightsDeclaration", "privacyPolicyUrl", "privacyChoicesUrl", "contactPhone",
+                           "appStoreAgeRating", "ageRating", "price", "availableInNewTerritories")
+        for method, path, params, body in self.writes(lst):
+            for bad in forbidden_paths:
+                self.assertNotIn(bad, path, (method, path))
+            for bad in forbidden_attrs:
+                self.assertNotIn(bad, json.dumps(body or {}), (method, path))
+        self.assertEqual(self.w.app["attributes"].get("contentRightsDeclaration"), "USES_THIRD_PARTY_CONTENT")
+
+    def test_the_write_guard_refuses_everything_outside_the_listing(self):
+        lst = self.lst()
+        refused = [
+            ("PATCH", "/v1/apps/app1", {"data": {"type": "apps", "id": "app1",
+                                                  "attributes": {"contentRightsDeclaration": "X"}}}),
+            ("PATCH", "/v1/ageRatingDeclarations/age1", {"data": {"type": "ageRatingDeclarations", "id": "age1",
+                                                                  "attributes": {"gambling": False}}}),
+            ("POST", "/v1/appPriceSchedules", {"data": {"type": "appPriceSchedules"}}),
+            ("PATCH", "/v2/appAvailabilities/av1", {"data": {"type": "appAvailabilities"}}),
+            ("POST", "/v1/appStoreVersionPhasedReleases", {"data": {"type": "appStoreVersionPhasedReleases"}}),
+            ("POST", "/v1/reviewSubmissions", {"data": {"type": "reviewSubmissions"}}),
+            ("PATCH", "/v1/appInfoLocalizations/il1", {"data": {"type": "appInfoLocalizations", "id": "il1",
+                                                                "attributes": {"privacyPolicyUrl": "https://x.example"}}}),
+            ("PATCH", "/v1/appStoreReviewDetails/rd1", {"data": {"type": "appStoreReviewDetails", "id": "rd1",
+                                                                 "attributes": {"contactPhone": PHONE}}}),
+            ("PATCH", "/v1/appInfos/i1", {"data": {"type": "appInfos", "id": "i1",
+                                                    "relationships": {"secondaryCategory": {"data": None}}}}),
+            ("DELETE", "/v1/appStoreVersions/v1", None),
+        ]
+        for method, path, body in refused:
+            with self.subTest(method=method, path=path):
+                with self.assertRaises(t.AscError):
+                    lst._write(method, path, body)
+        self.assertEqual(lst.asc.http.calls, [])
+
+    def test_a_write_failure_withholds_the_server_text_but_keeps_the_codes(self):
+        self.diverge_text()
+        lst = self.lst()
+        lst.asc.http.errors[("POST", "/v1/appStoreVersionLocalizations")] = (409, {"errors": [{
+            "code": "ENTITY_ERROR.ATTRIBUTE.INVALID", "title": "bad", "detail": DESCRIPTION + " echoed back"}]})
+        with self.assertRaises(t.AscError) as ctx:
+            lst.apply(self.m, "7")
+        message = str(ctx.exception)
+        self.assertIn("ENTITY_ERROR.ATTRIBUTE.INVALID", message)
+        self.assertIn("HTTP 409", message)
+        self.assertNotIn("FAKE-DESCRIPTION", message)
+        self.assertNotIn("echoed", message)
+
+
 class MainTests(Tree):
     def run_main(self, argv, listing=None):
         out, err = io.StringIO(), io.StringIO()
@@ -603,10 +981,25 @@ class MainTests(Tree):
             code, _ = self.run_main(argv)
             self.assertEqual(code, 2, argv)
 
-    def test_apply_is_not_available_yet(self):
-        code, out = self.run_main(["apply", "--src", str(self.root)])
-        self.assertEqual(code, 2)
-        self.assertIn("apply", out)
+    def test_apply_prints_actions_never_the_texts_and_exits_zero(self):
+        self.diverge_text()
+        code, out = self.run_main(["apply", "--src", str(self.root), "--build", "8"], self.w.live_listing())
+        self.assertEqual(code, 0, out)
+        self.assertIn("appStoreVersionLocalization.description: created", out)
+        self.assertIn("appStoreVersion.versionString: updated", out)
+        for secret in (DESCRIPTION, NOTES, PHONE, "FAKE-DESCRIPTION", "FAKE-NOTES", "fake,words"):
+            self.assertNotIn(secret, out)
+        code, out = self.run_main(["apply", "--src", str(self.root), "--build", "8"], self.w.live_listing())
+        self.assertEqual(code, 0, out)
+        self.assertNotIn(": created", out)
+        self.assertNotIn(": updated", out)
+
+    def test_apply_refusal_exits_one_with_a_scrubbed_message(self):
+        self.w.version["attributes"]["appStoreState"] = "WAITING_FOR_REVIEW"
+        code, out = self.run_main(["apply", "--src", str(self.root)], self.w.live_listing())
+        self.assertEqual(code, 1)
+        self.assertIn("WAITING_FOR_REVIEW", out)
+        self.assertNotIn(NOTES, out)
 
     def test_plan_prints_field_names_and_never_the_texts(self):
         self.w.loc["attributes"]["keywords"] = "other"
