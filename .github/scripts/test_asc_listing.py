@@ -116,6 +116,13 @@ def attrs_age(**over):
     return base
 
 
+def cf_obfuscated(prefix: str, email: str, key: int = 0x75) -> str:
+    """Page text as Cloudflare Email Address Obfuscation serves it: the address only as data-cfemail hex."""
+    token = "%02x" % key + "".join("%02x" % (ord(ch) ^ key) for ch in email)
+    return (f'<p>{prefix}</p><a href="/cdn-cgi/l/email-protection#{token}"><span class="__cf_email__" '
+            f'data-cfemail="{token}">[email&#160;protected]</span></a>')
+
+
 class World:
     """A fully ready App Store Connect account for one manifest; tests mutate pieces."""
 
@@ -178,7 +185,7 @@ class World:
         r[("GET", "/v1/builds/b1/preReleaseVersion")] = {"data": self.pre}
         r[("GET", "/v1/apps/app1/appPriceSchedule")] = {"data": self.price}
         r[("GET", "/v1/apps/app1/appAvailabilityV2")] = {"data": {"id": "av1"}}
-        r[("GET", "/v1/appAvailabilities/av1/territoryAvailabilities")] = {"data": self.terr}
+        r[("GET", "/v2/appAvailabilities/av1/territoryAvailabilities")] = {"data": self.terr}
         return h
 
     def listing(self):
@@ -435,6 +442,49 @@ class PreflightTests(Tree):
         self.setUp()
         self.w.terr[0]["attributes"]["available"] = False
         self.assertReason("territor")
+
+    def test_territories_are_read_from_the_v2_endpoint_with_territory_included(self):
+        lst = self.w.listing()
+        self.assertEqual(lst.preflight(self.m), [])
+        reads = [c for c in lst.asc.http.calls if "territoryAvailabilities" in c[1]]
+        self.assertEqual([c[1] for c in reads], ["/v2/appAvailabilities/av1/territoryAvailabilities"])
+        self.assertEqual(reads[0][2].get("include"), "territory")
+
+    def test_a_missing_list_endpoint_fails_loudly_instead_of_reading_as_empty(self):
+        for path in ("/v2/appAvailabilities/av1/territoryAvailabilities",
+                     "/v1/appStoreVersions/v1/appStoreVersionLocalizations",
+                     "/v1/appStoreReviewDetails/rd1/appStoreReviewAttachments",
+                     "/v1/appScreenshotSets/s1/appScreenshots"):
+            with self.subTest(path=path):
+                h = self.w.http()
+                del h.routes[("GET", path)]
+                lst = a.Listing(t.Asc(h, lambda: "tok", sleep=lambda s: None), mock.Mock(),
+                                FakePages(self.w.pages), "com.radioshake")
+                with self.assertRaises(t.AscError):
+                    lst.preflight(self.m)
+                with self.assertRaises(t.AscError):
+                    lst.plan(self.m)
+
+    def test_a_missing_to_one_relationship_still_reads_as_absent(self):
+        h = self.w.http()
+        del h.routes[("GET", "/v1/appStoreVersions/v1/appStoreVersionPhasedRelease")]
+        lst = a.Listing(t.Asc(h, lambda: "tok", sleep=lambda s: None), mock.Mock(),
+                        FakePages(self.w.pages), "com.radioshake")
+        self.assertEqual(lst.preflight(self.m), [])
+
+    def test_support_email_obfuscated_by_cloudflare_is_decoded(self):
+        self.w.pages[self.m.fields["support_url"]] = Page(200, cf_obfuscated("Write to", EMAIL))
+        self.assertNotIn(EMAIL, self.w.pages[self.m.fields["support_url"]].text)
+        self.assertEqual(self.reasons(), [])
+
+    def test_obfuscated_other_address_is_not_the_contact_email(self):
+        self.w.pages[self.m.fields["support_url"]] = Page(200, cf_obfuscated("Write to x", "other@example.com"))
+        self.assertReason("support page")
+
+    def test_malformed_cfemail_token_is_ignored_not_a_crash(self):
+        page = '<a data-cfemail="zz"></a><a data-cfemail="7"></a><a data-cfemail=""></a>'
+        self.w.pages[self.m.fields["support_url"]] = Page(200, page)
+        self.assertReason("support page")
 
     def test_page_reads(self):
         self.w.pages[self.m.fields["support_url"]] = Page(200, "no mail here")
