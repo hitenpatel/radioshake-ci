@@ -124,6 +124,10 @@ class ScreenshotsWorkflowTests(unittest.TestCase):
         cls.on = cls.wf.get("on", cls.wf.get(True))
         cls.steps = {s["name"]: s for s in cls.wf["jobs"]["tour"]["steps"] if "name" in s}
 
+    def test_tour_job_allows_an_ipad_tour_to_finish(self):
+        # A full iPad (A16) tour ran past 60 minutes and was cancelled (run 41353769395).
+        self.assertGreaterEqual(self.wf["jobs"]["tour"]["timeout-minutes"], 120)
+
     def test_suite_input_is_a_tour_store_choice_defaulting_to_tour(self):
         suite = self.on["workflow_dispatch"]["inputs"]["suite"]
         self.assertEqual(suite["type"], "choice")
