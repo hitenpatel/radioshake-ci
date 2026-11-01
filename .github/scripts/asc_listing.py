@@ -131,6 +131,8 @@ class Manifest:
     display_type: str
     screenshots: Tuple[pathlib.Path, ...]
     fields: Dict[str, str]
+    # The submitted source has song recognition (Phase 4b, `ios/App/SongId/`), so the privacy policy must name ShazamKit.
+    recognition: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -201,7 +203,7 @@ def load_manifest(src_root: pathlib.Path) -> Manifest:
         review_email=_need(data, "review", "email"),
         notes=_text(_file(root, _need(data, "review", "notesPath"), "notesPath"), "review notes"),
         attachments=tuple(attachment_paths), display_type=_need(data, "screenshots", "displayType"),
-        screenshots=shots, fields=fields)
+        screenshots=shots, fields=fields, recognition=(root / "ios" / "App" / "SongId").is_dir())
 
 
 def md5_hex(path: pathlib.Path) -> str:
@@ -680,7 +682,7 @@ class Listing:
         text, err = self._page(PRIVACY_URL)
         if err:
             why.append(f"privacy policy page could not be read: {err}")
-        elif "ShazamKit" not in text:
+        elif m.recognition and "ShazamKit" not in text:
             why.append("privacy policy page does not mention ShazamKit")
         _, err = self._page(TAKEDOWN_URL)
         if err:
