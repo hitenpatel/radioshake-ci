@@ -36,7 +36,9 @@ class ExportEntitlementGateTests(unittest.TestCase):
         self.assertIn("entitlements missing at export", gate.check(output(OTHER)))
 
     def test_development_fails(self):
-        self.assertIn("not 'production'", gate.check(output(attest(b"development"))))
+        message = gate.check(output(attest(b"development")))
+        self.assertTrue(message.startswith("entitlements missing at export"), message)
+        self.assertIn("not 'production'", message)
 
     def test_empty_or_garbage_output_fails(self):
         for raw in (b"", b"not a plist", b"<plist><dict>"):
