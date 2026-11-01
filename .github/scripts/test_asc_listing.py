@@ -682,11 +682,21 @@ class PreflightTests(Tree):
         self.w.pages[self.m.fields["support_url"]] = Page(200, "no mail here")
         self.assertReason("support page")
         self.setUp()
-        self.w.pages[a.PRIVACY_URL] = Page(200, "no recognition mention")
-        self.assertReason("ShazamKit")
-        self.setUp()
         self.w.pages[a.TAKEDOWN_URL] = Page(404, "")
         self.assertReason("takedown")
+
+    def test_a_build_with_song_recognition_needs_shazamkit_in_the_privacy_policy(self):
+        (self.root / "ios" / "App" / "SongId").mkdir(parents=True)
+        self.m = a.load_manifest(self.root)
+        self.assertTrue(self.m.recognition)
+        self.w = World(self.m)
+        self.w.pages[a.PRIVACY_URL] = Page(200, "no recognition mention")
+        self.assertReason("ShazamKit")
+
+    def test_a_build_without_song_recognition_does_not_need_shazamkit(self):
+        self.assertFalse(self.m.recognition)
+        self.w.pages[a.PRIVACY_URL] = Page(200, "no recognition mention")
+        self.assertFalse([r for r in self.reasons() if "ShazamKit" in r], self.reasons())
 
     def test_support_url_on_another_host_is_a_reason_not_a_fetch(self):
         self.w.loc["attributes"]["supportUrl"] = "https://example.com/support"
