@@ -496,7 +496,14 @@ jobs:
           # "App Attest, distributed builds" (5c decision 16 (c) ad-hoc-signed archive, then (d) owner decision).
           gate_entitlements() {
             local gate_dir="$RUNNER_TEMP/export-gate" gate_opts="$RUNNER_TEMP/ExportOptionsGate.plist"
-            local gate_app="$RUNNER_TEMP/gate-app" ents="$RUNNER_TEMP/gate-entitlements.txt" ipa app message
+            local gate_app="$RUNNER_TEMP/gate-app" ents="$RUNNER_TEMP/gate-entitlements.txt" ipa app message applies=0
+            # Only a source that declares the entitlement is gated (main before Phase P1 merges has none).
+            python3 "$SCRIPTS/check_export_entitlements.py" --declared "$GITHUB_WORKSPACE/src/ios/project.yml" || applies=$?
+            case "$applies" in
+              0) ;;
+              4) echo "gate not applicable at ${SHA}"; return 0 ;;
+              *) fail "could not decide whether the entitlement gate applies (project.yml unreadable)" ;;
+            esac
             rm -rf "$gate_dir" "$gate_app"
             python3 - "$OPTIONS" "$gate_opts" <<'PY'
           import plistlib, sys

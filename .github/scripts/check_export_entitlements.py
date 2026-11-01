@@ -7,6 +7,10 @@ export, so this is where a dropped entitlement would show up, before anything is
 
 Usage: check_export_entitlements.py FILE   (use - for stdin)
 Exit 0: present and production. Exit 1: "entitlements missing at export" (absent, another value, or unreadable output).
+
+Applicability: check_export_entitlements.py --declared PROJECT_YML
+Exit 0: the released source declares the entitlement (the gate applies). Exit 4: it does not (a sha from before Phase P1;
+the gate is not applicable and the release continues). Exit 2: PROJECT_YML is unreadable (never a silent skip).
 """
 import plistlib
 import sys
@@ -29,6 +33,11 @@ def parse(raw: bytes) -> dict:
     return loaded
 
 
+def declared(project_yml: str) -> bool:
+    """True when an uncommented line of the XcodeGen spec names the App Attest entitlement."""
+    return any(KEY in line for line in project_yml.splitlines() if not line.lstrip().startswith("#"))
+
+
 def check(raw: bytes) -> str:
     """Returns "" when the gate passes, else the failure message."""
     try:
@@ -43,6 +52,18 @@ def check(raw: bytes) -> str:
 
 
 def main(argv) -> int:
+    if len(argv) == 3 and argv[1] == "--declared":
+        try:
+            with open(argv[2], encoding="utf-8") as fh:
+                text = fh.read()
+        except OSError as exc:
+            print(f"::error::cannot read {argv[2]} to decide whether the entitlement gate applies: {exc}")
+            return 2
+        if declared(text):
+            print(f"{KEY} is declared: the export gate applies")
+            return 0
+        print("no App Attest entitlement declared in the released source: gate not applicable")
+        return 4
     if len(argv) != 2:
         print("usage: check_export_entitlements.py FILE|-", file=sys.stderr)
         return 2

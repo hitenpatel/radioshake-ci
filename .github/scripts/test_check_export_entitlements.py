@@ -93,6 +93,15 @@ class DeclaredEntitlementTests(unittest.TestCase):
                                 capture_output=True, text=True)
         self.assertEqual(result.returncode, 2)
 
+    def test_the_workflow_gate_is_conditional_on_the_declaration(self):
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(root, "workflows", "ios-testflight.yml"), encoding="utf-8") as fh:
+            text = fh.read()
+        start = text.index("gate_entitlements() {")
+        body = text[start:text.index("classify_export_failure() {")]
+        self.assertIn("check_export_entitlements.py\" --declared", body)
+        self.assertLess(body.index("--declared"), body.index("xcodebuild -exportArchive"))
+
 
 if __name__ == "__main__":
     unittest.main()
