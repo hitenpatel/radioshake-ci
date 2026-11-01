@@ -23,6 +23,14 @@ on:
         required: false
         default: 'iPhone 17'
         type: string
+      suite:
+        description: 'tour = the review tour (default); store = App Store screenshots (6.9 inch: use device "iPhone 17 Pro Max")'
+        required: false
+        default: 'tour'
+        type: choice
+        options:
+          - tour
+          - store
 
 permissions:
   contents: read
@@ -194,13 +202,20 @@ jobs:
 
       - name: Run screenshot tour
         working-directory: src/ios
+        env:
+          SUITE: ${{ inputs.suite || 'tour' }}
         run: |
           set -euo pipefail
+          case "$SUITE" in
+            tour) ONLY=-only-testing:RadioShakeUITests/ScreenshotTourUITests ;;
+            store) ONLY=-only-testing:RadioShakeUITests/StoreScreenshotsUITests ;;
+            *) echo "::error::suite must be tour or store"; exit 1 ;;
+          esac
           set +e
           xcodebuild test \
             -project RadioShake.xcodeproj -scheme RadioShake -configuration Debug \
             -destination "id=$UDID" -derivedDataPath /tmp/derived-data \
-            -only-testing:RadioShakeUITests/ScreenshotTourUITests \
+            "$ONLY" \
             -resultBundlePath /tmp/rs-shots.xcresult \
             CODE_SIGNING_ALLOWED=NO > /tmp/tour.log 2>&1
           RC=$?
@@ -210,6 +225,8 @@ jobs:
 
       - name: Export and encrypt screenshots, delete plaintext
         if: always()
+        env:
+          SUITE: ${{ inputs.suite || 'tour' }}
         run: |
           set -euo pipefail
           OPENSSL="$(brew --prefix openssl@3 2>/dev/null)/bin/openssl"
@@ -217,6 +234,44 @@ jobs:
           mkdir -p /tmp/rs-shots /tmp/rs-enc
           if [ -d /tmp/rs-shots.xcresult ]; then
             xcrun xcresulttool export attachments --path /tmp/rs-shots.xcresult --output-path /tmp/rs-shots >/dev/null
+          fi
+          if [ "$SUITE" = "store" ]; then
+            # App Store shots must be sRGB JPEG. Convert every store-* attachment (and
+            # region-notice) here, before tar and encryption; the PNG originals are removed.
+            python3 - > /tmp/rs-store-map.tsv <<'PY'
+          import json, os, re
+          d = "/tmp/rs-shots"
+          names = {}
+          mf = os.path.join(d, "manifest.json")
+          if os.path.exists(mf):
+              def walk(o):
+                  if isinstance(o, dict):
+                      if "exportedFileName" in o:
+                          names[o["exportedFileName"]] = o.get("suggestedHumanReadableName", o["exportedFileName"])
+                      for v in o.values():
+                          walk(v)
+                  elif isinstance(o, list):
+                      for v in o:
+                          walk(v)
+              walk(json.load(open(mf)))
+          for fn in sorted(os.listdir(d)):
+              if not fn.lower().endswith((".png", ".jpg", ".jpeg", ".heic")):
+                  continue
+              # Xcode appends _<index>_<UUID> to attachment names on export
+              stem = re.sub(r"(_\d+_[0-9A-Fa-f-]{36})?\.[A-Za-z]+$", "", names.get(fn, fn))
+              if re.fullmatch(r"(store-|region-notice)[A-Za-z0-9._-]*", stem):
+                  print(f"{fn}\t{stem}")
+          PY
+            CONVERTED=0
+            while IFS=$'\t' read -r SRC STEM; do
+              sips -m '/System/Library/ColorSync/Profiles/sRGB Profile.icc' -s format jpeg -s formatOptions 95 \
+                "/tmp/rs-shots/$SRC" --out "/tmp/rs-shots/$STEM.jpg" >/dev/null
+              [ "$SRC" = "$STEM.jpg" ] || rm -f "/tmp/rs-shots/$SRC"
+              CONVERTED=$((CONVERTED + 1))
+            done < /tmp/rs-store-map.tsv
+            rm -f /tmp/rs-store-map.tsv
+            echo "converted $CONVERTED store attachments to sRGB JPEG"
+            [ "$CONVERTED" -gt 0 ] || echo "::warning::suite=store but no store-* attachments were found"
           fi
           echo "${TOUR_RC:-1}" > /tmp/rs-shots/tour-exit-code.txt
           tar -czf /tmp/rs-shots.tgz -C /tmp/rs-shots .

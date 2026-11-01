@@ -605,6 +605,7 @@ jobs:
             -only-testing:RadioShakeTests \
             "${ONLY[@]}" \
             -skip-testing:RadioShakeUITests/ScreenshotTourUITests \
+            -skip-testing:RadioShakeUITests/StoreScreenshotsUITests \
             CODE_SIGNING_ALLOWED=NO 2>&1 | tee /tmp/ios-logs/xctest.log
 
       - name: Every selected UI test class ran
@@ -622,7 +623,11 @@ jobs:
             echo "::error::ScreenshotTourUITests ran in the public job; its screenshots would be uploaded unencrypted"
             exit 1
           fi
-          echo "OK - no screenshot tour in the public result bundle"
+          if grep -qE "Test Case '-\\[RadioShakeUITests\\.StoreScreenshotsUITests" /tmp/ios-logs/xctest.log; then
+            echo "::error::StoreScreenshotsUITests ran in the public job; its screenshots would be uploaded unencrypted"
+            exit 1
+          fi
+          echo "OK - no screenshot tour or store screenshots in the public result bundle"
 
       # TASK-141 AC #5 / TASK-174 follow-up: the StoreKit storefront test
       # skips itself when the simulator has no storefront. On CI it must
@@ -1137,6 +1142,7 @@ jobs:
             -resultBundlePath "/tmp/ios-app-test-shard-${SHARD}.xcresult" \
             "${ONLY[@]}" \
             -skip-testing:RadioShakeUITests/ScreenshotTourUITests \
+            -skip-testing:RadioShakeUITests/StoreScreenshotsUITests \
             CODE_SIGNING_ALLOWED=NO 2>&1 | tee /tmp/ios-logs/xctest.log
 
       - name: Every selected UI test class ran
@@ -1154,7 +1160,11 @@ jobs:
             echo "::error::ScreenshotTourUITests ran in the public job; its screenshots would be uploaded unencrypted"
             exit 1
           fi
-          echo "OK - no screenshot tour in the public result bundle"
+          if grep -qE "Test Case '-\\[RadioShakeUITests\\.StoreScreenshotsUITests" /tmp/ios-logs/xctest.log; then
+            echo "::error::StoreScreenshotsUITests ran in the public job; its screenshots would be uploaded unencrypted"
+            exit 1
+          fi
+          echo "OK - no screenshot tour or store screenshots in the public result bundle"
 
       - name: Record shard evidence
         if: always()

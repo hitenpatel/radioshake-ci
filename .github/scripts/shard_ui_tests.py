@@ -23,7 +23,7 @@ import re
 import sys
 
 DEFAULT_SECONDS_PER_METHOD = 25.0
-DEFAULT_EXCLUDE = ("ScreenshotTourUITests",)
+DEFAULT_EXCLUDE = ("ScreenshotTourUITests", "StoreScreenshotsUITests")
 IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 # A column-0 type declaration starts a new section; test methods belong to the section they are in.
 DECL = re.compile(
