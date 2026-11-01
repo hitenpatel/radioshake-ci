@@ -38,7 +38,7 @@ def check(raw: bytes) -> str:
     if KEY not in entitlements:
         return f"entitlements missing at export ({KEY} is absent)"
     if entitlements[KEY] != WANT:
-        return f"entitlements wrong at export ({KEY} is {entitlements[KEY]!r}, not {WANT!r})"
+        return f"entitlements missing at export ({KEY} is {entitlements[KEY]!r}, not {WANT!r})"
     return ""
 
 
