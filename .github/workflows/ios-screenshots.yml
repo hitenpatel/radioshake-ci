@@ -42,7 +42,7 @@ env:
 jobs:
   tour:
     runs-on: macos-26
-    timeout-minutes: 60
+    timeout-minutes: 120
     outputs:
       head_sha: ${{ steps.clone.outputs.head_sha }}
     steps:
