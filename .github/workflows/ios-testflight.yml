@@ -490,6 +490,43 @@ jobs:
               > "$EXPORT_LOG" 2>&1
           }
 
+          # Phase P1 (spec decision 17): the upload export gives no app to inspect, so the same archive is first
+          # exported to disk (destination export, same signing) and the signed app's entitlements are checked: the App
+          # Attest entitlement must be `production`, else nothing is uploaded. Fallback if it is dropped: runbook
+          # "App Attest, distributed builds" (5c decision 16 (c) ad-hoc-signed archive, then (d) owner decision).
+          gate_entitlements() {
+            local gate_dir="$RUNNER_TEMP/export-gate" gate_opts="$RUNNER_TEMP/ExportOptionsGate.plist"
+            local gate_app="$RUNNER_TEMP/gate-app" ents="$RUNNER_TEMP/gate-entitlements.txt" ipa app message
+            rm -rf "$gate_dir" "$gate_app"
+            python3 - "$OPTIONS" "$gate_opts" <<'PY'
+          import plistlib, sys
+          with open(sys.argv[1], "rb") as fh:
+              options = plistlib.load(fh)
+          options["destination"] = "export"
+          with open(sys.argv[2], "wb") as fh:
+              plistlib.dump(options, fh)
+          PY
+            if ! xcodebuild -exportArchive -archivePath "$ARCHIVE" -exportPath "$gate_dir" \
+                 -exportOptionsPlist "$gate_opts" "${export_flags[@]}" > "$EXPORT_LOG" 2>&1; then
+              show_export_digest
+              fail "the entitlement gate could not export the archive (see the Apple messages above and the runbook Recovery section)"
+            fi
+            ipa=$(ls "$gate_dir"/*.ipa 2>/dev/null | head -n 1 || true)
+            [ -n "$ipa" ] || fail "entitlements missing at export (the gate export produced no ipa)"
+            mkdir -p "$gate_app"
+            unzip -q "$ipa" 'Payload/*' -d "$gate_app" || fail "entitlements missing at export (the gate ipa could not be read)"
+            app=$(ls -d "$gate_app"/Payload/*.app 2>/dev/null | head -n 1 || true)
+            [ -n "$app" ] || fail "entitlements missing at export (no app in the gate ipa)"
+            codesign -d --entitlements :- "$app" > "$ents" 2>/dev/null || true
+            if message=$(python3 "$SCRIPTS/check_export_entitlements.py" "$ents"); then
+              echo "$message"
+            else
+              echo "$message"
+              fail "entitlements missing at export: the signed app lacks appattest-environment = production; see the runbook, App Attest distributed builds"
+            fi
+            rm -rf "$gate_dir" "$gate_app"
+          }
+
           # Category from fixed patterns over the export output plus the sanitised digest (which
           # includes the IDEDistribution log folder lines); only the digest is ever printed.
           classify_export_failure() {
@@ -546,6 +583,8 @@ jobs:
               [ "$attempt" = 1 ] && continue
               fail "build number went stale twice"
             fi
+
+            gate_entitlements
 
             if do_export; then
               uploaded=true
