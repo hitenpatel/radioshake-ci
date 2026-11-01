@@ -57,5 +57,42 @@ class ExportEntitlementGateTests(unittest.TestCase):
         self.assertIn("entitlements missing at export", result.stdout)
 
 
+class DeclaredEntitlementTests(unittest.TestCase):
+    """The gate only applies when the released source declares the App Attest entitlement (a main sha from before
+    Phase P1 has none, and must still release)."""
+
+    SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "check_export_entitlements.py")
+
+    def test_declared_in_project_yml(self):
+        text = "targets:\n  RadioShake:\n    entitlements:\n      properties:\n" \
+               "        com.apple.developer.devicecheck.appattest-environment: $(APP_ATTEST_ENV)\n"
+        self.assertTrue(gate.declared(text))
+
+    def test_absent_is_not_declared(self):
+        self.assertFalse(gate.declared("targets:\n  RadioShake:\n    type: application\n"))
+
+    def test_a_comment_does_not_count_as_declared(self):
+        self.assertFalse(gate.declared("# com.apple.developer.devicecheck.appattest-environment: production\n"))
+
+    def _run(self, text):
+        with tempfile.NamedTemporaryFile(suffix=".yml", delete=False, mode="w") as fh:
+            fh.write(text)
+        try:
+            return subprocess.run([sys.executable, self.SCRIPT, "--declared", fh.name], capture_output=True, text=True)
+        finally:
+            os.unlink(fh.name)
+
+    def test_declared_command_line_exit_codes(self):
+        self.assertEqual(self._run("a: com.apple.developer.devicecheck.appattest-environment\n").returncode, 0)
+        result = self._run("targets: {}\n")
+        self.assertEqual(result.returncode, 4, result.stdout)
+        self.assertIn("gate not applicable", result.stdout)
+
+    def test_an_unreadable_project_yml_is_an_error_not_a_skip(self):
+        result = subprocess.run([sys.executable, self.SCRIPT, "--declared", "/nonexistent/project.yml"],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2)
+
+
 if __name__ == "__main__":
     unittest.main()
