@@ -47,6 +47,15 @@ class DiscoverTests(unittest.TestCase):
         })
         self.assertEqual(got, {"AUITests": 2})
 
+    def test_default_exclude_covers_tour_and_store_screenshot_classes(self):
+        self.assertIn("ScreenshotTourUITests", sh.DEFAULT_EXCLUDE)
+        self.assertIn("StoreScreenshotsUITests", sh.DEFAULT_EXCLUDE)
+        got = self.discover({
+            "Store.swift": swift_class("StoreScreenshotsUITests", 9),
+            "A.swift": swift_class("AUITests", 2),
+        })
+        self.assertEqual(got, {"AUITests": 2})
+
     def test_ignores_private_commented_and_parameterised_tests(self):
         extra = ("    private func testHidden() {}\n    func testHelper(_ x: Int) {}\n"
                  "    // func testCommented() {}\n    /* func testBlock() {} */\n"
@@ -121,6 +130,7 @@ class CliTests(unittest.TestCase):
     def setUp(self):
         files = {f"C{i}.swift": swift_class(f"C{i}UITests", n) for i, n in enumerate([5, 4, 3, 2, 1])}
         files["Tour.swift"] = swift_class("ScreenshotTourUITests", 9)
+        files["Store.swift"] = swift_class("StoreScreenshotsUITests", 8)
         self.tree = FakeTree(files)
         self.addCleanup(self.tree.cleanup)
         self.out = os.path.join(self.tree.dir, "..", f"args-{os.getpid()}.txt")
@@ -145,6 +155,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(len(seen), len(set(seen)))
         self.assertEqual(len(seen), 5)
         self.assertFalse(any("ScreenshotTour" in l for l in seen))
+        self.assertFalse(any("StoreScreenshots" in l for l in seen))
 
     def test_empty_shard_fails(self):
         code, out = self.run_cli("--shards", "9", "--index", "8")

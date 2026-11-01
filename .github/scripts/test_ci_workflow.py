@@ -94,6 +94,78 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("-only-testing:RadioShakeTests", validate_run)
         self.assertIn("-skip-testing:RadioShakeUITests/ScreenshotTourUITests", validate_run)
 
+    GUARD = "Screenshot tour did not run in the public job"
+
+    def test_both_jobs_skip_the_store_screenshot_class(self):
+        shard = self.steps(self.jobs["ui-shard"])["Run XCTest UI tests (shard)"]["run"]
+        validate = self.steps(self.jobs["validate"])["Run XCTest unit + UI tests"]["run"]
+        for run in (shard, validate):
+            self.assertIn("-skip-testing:RadioShakeUITests/ScreenshotTourUITests", run)
+            self.assertIn("-skip-testing:RadioShakeUITests/StoreScreenshotsUITests", run)
+
+    def test_both_guards_fail_if_the_store_class_ran(self):
+        for job in ("validate", "ui-shard"):
+            run = self.steps(self.jobs[job])[self.GUARD]["run"]
+            self.assertIn("ScreenshotTourUITests", run, job)
+            self.assertRegex(run, r"grep -qE .*StoreScreenshotsUITests", job)
+            self.assertIn("StoreScreenshotsUITests ran in the public job", run, job)
+            self.assertIn("exit 1", run, job)
+
+
+SCREENSHOTS_WORKFLOW = os.path.join(ROOT, ".github", "workflows", "ios-screenshots.yml")
+
+
+@unittest.skipIf(yaml is None, "PyYAML not installed")
+class ScreenshotsWorkflowTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        with open(SCREENSHOTS_WORKFLOW, encoding="utf-8") as fh:
+            cls.wf = yaml.safe_load(fh)
+        cls.on = cls.wf.get("on", cls.wf.get(True))
+        cls.steps = {s["name"]: s for s in cls.wf["jobs"]["tour"]["steps"] if "name" in s}
+
+    def test_suite_input_is_a_tour_store_choice_defaulting_to_tour(self):
+        suite = self.on["workflow_dispatch"]["inputs"]["suite"]
+        self.assertEqual(suite["type"], "choice")
+        self.assertEqual(suite["options"], ["tour", "store"])
+        self.assertEqual(suite["default"], "tour")
+        self.assertFalse(suite.get("required", False))
+
+    def test_run_step_selects_class_by_suite(self):
+        step = self.steps["Run screenshot tour"]
+        self.assertIn("inputs.suite", step["env"]["SUITE"])
+        run = step["run"]
+        self.assertIn("-only-testing:RadioShakeUITests/ScreenshotTourUITests", run)
+        self.assertIn("-only-testing:RadioShakeUITests/StoreScreenshotsUITests", run)
+        self.assertIn("store", run)
+
+    def test_store_shots_become_srgb_jpeg_before_encryption(self):
+        step = self.steps["Export and encrypt screenshots, delete plaintext"]
+        self.assertIn("SUITE", step["env"])
+        run = step["run"]
+        self.assertIn("store-", run)
+        self.assertIn("region-notice", run)
+        self.assertIn("sips -m '/System/Library/ColorSync/Profiles/sRGB Profile.icc' "
+                      "-s format jpeg -s formatOptions 95", run)
+        export = run.index("xcresulttool export attachments")
+        sips = run.index("sips -m")
+        tar = run.index("tar -czf")
+        enc = run.index("enc -aes-256-cbc")
+        self.assertLess(export, sips)
+        self.assertLess(sips, tar)
+        self.assertLess(sips, enc)
+
+    def test_screenshots_only_leave_through_the_encrypted_upload(self):
+        uploads = [(n, s) for n, s in self.steps.items() if "upload-artifact" in s.get("uses", "")]
+        self.assertEqual(len(uploads), 1)
+        paths = uploads[0][1]["with"]["path"].split()
+        self.assertEqual(sorted(paths), ["/tmp/rs-enc/key.enc", "/tmp/rs-enc/shots.tgz.enc"])
+        for step in self.wf["jobs"]["tour"]["steps"]:
+            self.assertNotIn("upload-artifact", step.get("uses", "") if step is not uploads[0][1] else "")
+        # converted JPEGs are written inside the directory that is tarred and then deleted
+        run = self.steps["Export and encrypt screenshots, delete plaintext"]["run"]
+        self.assertIn("rm -rf /tmp/rs-key.hex /tmp/rs-shots.tgz /tmp/rs-shots", run)
+
 
 LISTING_WORKFLOW = os.path.join(ROOT, ".github", "workflows", "asc-listing.yml")
 SECRET_NAMES = {"FORGEJO_HOST", "FORGEJO_CLONE_TOKEN", "APP_STORE_CONNECT_KEY_ID",
