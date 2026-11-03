@@ -2,8 +2,8 @@
 """Export entitlement gate for ios-testflight.yml (RadioShake Phase P1, spec decision 17).
 
 Reads the output of `codesign -d --entitlements :- RadioShake.app` run on the EXPORTED (signed) app and fails unless it
-carries `com.apple.developer.devicecheck.appattest-environment = production`. The archive is unsigned and re-signed at
-export, so this is where a dropped entitlement would show up, before anything is uploaded.
+carries `com.apple.developer.devicecheck.appattest-environment = production`. The archive is ad-hoc signed (so entitlements are
+embedded) and re-signed at export, so this is where a dropped entitlement would show up, before anything is uploaded.
 
 Usage: check_export_entitlements.py FILE   (use - for stdin)
 Exit 0: present and production. Exit 1: "entitlements missing at export" (absent, another value, or unreadable output).

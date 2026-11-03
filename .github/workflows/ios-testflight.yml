@@ -39,7 +39,7 @@ on:
         default: ''
         type: string
       mode:
-        description: 'release = archive+upload+distribute, archive_only = signed archive, no upload, resume = poll and distribute an already uploaded build'
+        description: 'release = archive+upload+distribute, archive_only = ad-hoc signed archive, no upload, resume = poll and distribute an already uploaded build'
         required: false
         default: release
         type: choice
@@ -375,7 +375,7 @@ jobs:
             || { echo "::error::the decoded App Store Connect key is not a valid private key"; exit 1; }
           echo "App Store Connect key prepared (mode 600)"
 
-      - name: Archive (unsigned), verify, export (signed) and upload
+      - name: Archive (ad-hoc signed), verify, export (signed) and upload
         id: archive
         if: ${{ inputs.mode != 'resume' }}
         working-directory: src/ios
@@ -417,8 +417,12 @@ jobs:
               }, fh)
           PY
 
-          # Signing happens only at export (cloud-managed distribution signing through the API
-          # key), so no development provisioning or registered device is needed.
+          # The archive carries an ad-hoc signature (no identity, no team id, no profile) only so the
+          # entitlements are embedded and carried through to export; distribution signing still
+          # happens only at export (cloud-managed signing through the API key), so no development
+          # provisioning or registered device is needed. A fully unsigned archive
+          # embeds no entitlements, and export then had nothing to carry over (run 41579626789: the
+          # signed app lacked appattest-environment).
           export_flags=(-allowProvisioningUpdates -authenticationKeyPath "$ASC_KEY_PATH"
                         -authenticationKeyID "$ASC_KEY_ID" -authenticationKeyIssuerID "$ASC_ISSUER_ID")
 
@@ -435,7 +439,8 @@ jobs:
             xcodebuild archive \
               -project RadioShake.xcodeproj -scheme RadioShake -configuration Release \
               -destination 'generic/platform=iOS' -archivePath "$ARCHIVE" \
-              DEVELOPMENT_TEAM="$TEAM" CODE_SIGN_STYLE=Automatic CODE_SIGNING_ALLOWED=NO \
+              DEVELOPMENT_TEAM="$TEAM" CODE_SIGNING_ALLOWED=YES CODE_SIGNING_REQUIRED=NO \
+              CODE_SIGN_IDENTITY=- CODE_SIGN_STYLE=Manual AD_HOC_CODE_SIGNING_ALLOWED=YES \
               CURRENT_PROJECT_VERSION="$1" \
               > "$RUNNER_TEMP/archive.log" 2>&1
           }
@@ -492,8 +497,9 @@ jobs:
 
           # Phase P1 (spec decision 17): the upload export gives no app to inspect, so the same archive is first
           # exported to disk (destination export, same signing) and the signed app's entitlements are checked: the App
-          # Attest entitlement must be `production`, else nothing is uploaded. Fallback if it is dropped: runbook
-          # "App Attest, distributed builds" (5c decision 16 (c) ad-hoc-signed archive, then (d) owner decision).
+          # Attest entitlement must be `production`, else nothing is uploaded. The archive is already ad-hoc signed
+          # (5c decision 16 (c)); if the entitlement is still dropped: runbook "Distributed builds and the entitlement"
+          # step (d), an owner decision.
           gate_entitlements() {
             local gate_dir="$RUNNER_TEMP/export-gate" gate_opts="$RUNNER_TEMP/ExportOptionsGate.plist"
             local gate_app="$RUNNER_TEMP/gate-app" ents="$RUNNER_TEMP/gate-entitlements.txt" ipa app message applies=0
@@ -568,7 +574,7 @@ jobs:
           n=""
           for attempt in 1 2; do
             n=$(allocate "$rejected") || fail "could not allocate a build number from App Store Connect"
-            echo "Attempt ${attempt}: archiving ${VERSION} (${n}) unsigned"
+            echo "Attempt ${attempt}: archiving ${VERSION} (${n}) ad-hoc signed"
             if ! do_archive "$n"; then
               echo "::error::xcodebuild archive failed (compiler diagnostics only follow)"
               show "$RUNNER_TEMP/archive.log"
@@ -710,7 +716,7 @@ jobs:
               echo "| Release run (resume provenance) | [$(safe "$RELEASE_RUN")](https://github.com/${GITHUB_REPOSITORY}/actions/runs/$(safe "$RELEASE_RUN")) |"
             fi
             echo "| What to Test | $(val "$WHATS_NEW" 'n/a') |"
-            echo "| Archive | unsigned (CODE_SIGNING_ALLOWED=NO), signed at export with automatic cloud signing |"
+            echo "| Archive | ad-hoc signed (CODE_SIGN_IDENTITY=-, no team id) so entitlements reach export, re-signed at export with automatic cloud signing |"
             echo "| Export options | method app-store-connect, destination upload, signingStyle automatic, uploadSymbols true, manageAppVersionAndBuildNumber false |"
             echo
             if [ "${STATE:-}" = "PENDING" ] || [ "${READINESS:-}" = "pending" ]; then

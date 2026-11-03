@@ -1,6 +1,7 @@
 """Dry checks of the export entitlement gate against fabricated `codesign -d --entitlements :-` output.
 Run: python3 -m unittest discover -s .github/scripts"""
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -101,6 +102,26 @@ class DeclaredEntitlementTests(unittest.TestCase):
         body = text[start:text.index("classify_export_failure() {")]
         self.assertIn("check_export_entitlements.py\" --declared", body)
         self.assertLess(body.index("--declared"), body.index("xcodebuild -exportArchive"))
+
+    def test_the_archive_is_ad_hoc_signed_so_entitlements_reach_export(self):
+        # Run 41579626789: a CODE_SIGNING_ALLOWED=NO archive embeds no entitlements, so export had nothing to carry
+        # over. 5c decision 16 (c): the archive carries an ad-hoc signature (no identity, no team id, no profile).
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(root, "workflows", "ios-testflight.yml"), encoding="utf-8") as fh:
+            text = fh.read()
+        start = text.index("do_archive() {")
+        body = text[start:text.index("# Mach-O or dSYM bundle", start)]
+        self.assertIn("xcodebuild archive", body)
+        for setting in ("CODE_SIGNING_ALLOWED=YES", "CODE_SIGNING_REQUIRED=NO", "CODE_SIGN_IDENTITY=-",
+                        "CODE_SIGN_STYLE=Manual", "AD_HOC_CODE_SIGNING_ALLOWED=YES"):
+            self.assertRegex(body, r"(?<![\w=])" + re.escape(setting) + r"(?=\s|\\)", setting)
+        self.assertNotIn("CODE_SIGNING_ALLOWED=NO", body)
+        self.assertNotIn("CODE_SIGN_STYLE=Automatic", body)
+        # The team id still comes from the secret through the step env (masked), never a literal.
+        self.assertIn('DEVELOPMENT_TEAM="$TEAM"', body)
+        self.assertNotIn("CODE_SIGNING_ALLOWED=NO", text)
+        # The gate stays in front of the uploading export.
+        self.assertLess(text.index("gate_entitlements\n"), text.index("if do_export; then"))
 
 
 if __name__ == "__main__":
