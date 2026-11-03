@@ -11,6 +11,9 @@ except ImportError:  # pragma: no cover
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 WORKFLOW = os.path.join(ROOT, ".github", "workflows", "ios-shared-validate.yml")
+VALIDATE_UNIT_STEP = "Run XCTest unit tests (no retry)"
+VALIDATE_UI_STEP = "Run XCTest UI tests (shard 0, retry once)"
+RETRY_FLAGS = "-retry-tests-on-failure -test-iterations 2"
 SHARED_STEPS = [
     "Clone source from private host",
     "Set up JDK 21",
@@ -90,15 +93,49 @@ class WorkflowTests(unittest.TestCase):
         run = self.steps(shard)["Run XCTest UI tests (shard)"]["run"]
         self.assertIn("-skip-testing:RadioShakeUITests/ScreenshotTourUITests", run)
         self.assertIn("tee /tmp/ios-logs/xctest.log", run)
-        validate_run = self.steps(self.jobs["validate"])["Run XCTest unit + UI tests"]["run"]
-        self.assertIn("-only-testing:RadioShakeTests", validate_run)
+        validate_run = self.steps(self.jobs["validate"])[VALIDATE_UI_STEP]["run"]
+        self.assertNotIn("-only-testing:RadioShakeTests", validate_run)
         self.assertIn("-skip-testing:RadioShakeUITests/ScreenshotTourUITests", validate_run)
+        unit_run = self.steps(self.jobs["validate"])[VALIDATE_UNIT_STEP]["run"]
+        self.assertIn("-only-testing:RadioShakeTests", unit_run)
+        self.assertNotIn("-only-testing:RadioShakeUITests", unit_run)
 
     GUARD = "Screenshot tour did not run in the public job"
 
+    def test_only_ui_test_invocations_retry(self):
+        ui = [self.steps(self.jobs["validate"])[VALIDATE_UI_STEP]["run"],
+              self.steps(self.jobs["ui-shard"])["Run XCTest UI tests (shard)"]["run"]]
+        for run in ui:
+            self.assertIn(RETRY_FLAGS, run)
+        unit = self.steps(self.jobs["validate"])[VALIDATE_UNIT_STEP]["run"]
+        self.assertNotIn("-retry-tests-on-failure", unit)
+        self.assertNotIn("-test-iterations", unit)
+        # No other xcodebuild test invocation may carry retry flags.
+        for name, step in self.steps(self.jobs["validate"]).items():
+            if name != VALIDATE_UI_STEP:
+                self.assertNotIn("-retry-tests-on-failure", step.get("run", ""), name)
+
+    def test_unit_log_and_bundle_are_kept_and_storefront_reads_unit_log(self):
+        unit = self.steps(self.jobs["validate"])[VALIDATE_UNIT_STEP]["run"]
+        self.assertIn("tee /tmp/ios-logs/xctest-unit.log", unit)
+        self.assertIn("/tmp/ios-app-unit-test.xcresult", self.wf["jobs"]["validate"]["env"]["EVIDENCE_PATHS"])
+        sk = self.steps(self.jobs["validate"])["StoreKit storefront test ran and was not skipped"]["run"]
+        self.assertIn("LOG=/tmp/ios-logs/xctest-unit.log", sk)
+
+    def test_guards_scan_every_xctest_log(self):
+        for job in ("validate", "ui-shard"):
+            self.assertIn("/tmp/ios-logs/xctest*.log", self.steps(self.jobs[job])[self.GUARD]["run"], job)
+
+    def test_both_jobs_report_retried_tests_without_gating_on_success(self):
+        for job in ("validate", "ui-shard"):
+            step = self.steps(self.jobs[job])["Report UI tests that needed a retry"]
+            self.assertEqual(step["if"], "always()")
+            self.assertIn("report_flaky_tests.py --log /tmp/ios-logs/xctest.log", step["run"])
+            self.assertNotIn("continue-on-error", step)
+
     def test_both_jobs_skip_the_store_screenshot_class(self):
         shard = self.steps(self.jobs["ui-shard"])["Run XCTest UI tests (shard)"]["run"]
-        validate = self.steps(self.jobs["validate"])["Run XCTest unit + UI tests"]["run"]
+        validate = self.steps(self.jobs["validate"])[VALIDATE_UI_STEP]["run"]
         for run in (shard, validate):
             self.assertIn("-skip-testing:RadioShakeUITests/ScreenshotTourUITests", run)
             self.assertIn("-skip-testing:RadioShakeUITests/StoreScreenshotsUITests", run)

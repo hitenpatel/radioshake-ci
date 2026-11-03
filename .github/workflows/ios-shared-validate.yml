@@ -122,6 +122,7 @@ jobs:
         src/shared/build/test-results/
         /tmp/ios-logs/
         /tmp/ios-app-build.xcresult
+        /tmp/ios-app-unit-test.xcresult
         /tmp/ios-app-test.xcresult
         /tmp/ios-app-build-release.xcresult
         /tmp/ios-app-bundle-sha256.txt
@@ -598,7 +599,28 @@ jobs:
             --weights ci/.github/scripts/ui_test_weights.json \
             --out /tmp/ui-shard-args.txt | tee /tmp/ios-logs/ui-shard-classes.log
 
-      - name: Run XCTest unit + UI tests
+      # Unit tests and UI tests run as two xcodebuild invocations so that only the UI tests get
+      # -retry-tests-on-failure (a unit test that fails once is a real bug, not a timing flake).
+      # The second invocation reuses the first one's derived data, so it only re-links.
+      - name: Run XCTest unit tests (no retry)
+        working-directory: src/ios
+        run: |
+          set -euo pipefail
+          xcodebuild test \
+            -project RadioShake.xcodeproj \
+            -scheme RadioShake \
+            -configuration Debug \
+            -destination "platform=iOS Simulator,OS=${SIM_OS},name=iPhone 17" \
+            -derivedDataPath /tmp/derived-data \
+            -resultBundlePath /tmp/ios-app-unit-test.xcresult \
+            -only-testing:RadioShakeTests \
+            CODE_SIGNING_ALLOWED=NO 2>&1 | tee /tmp/ios-logs/xctest-unit.log
+
+      # GitHub's macOS runners are slow enough that one timing-sensitive UI test fails on almost
+      # every run, at random. xcodebuild re-runs a failed UI test once (-test-iterations 2); a test
+      # that passes on retry leaves this step green and is listed by "Report UI tests that needed a
+      # retry" below. A test that fails both times still fails the step.
+      - name: Run XCTest UI tests (shard 0, retry once)
         working-directory: src/ios
         run: |
           set -euo pipefail
@@ -612,11 +634,15 @@ jobs:
             -destination "platform=iOS Simulator,OS=${SIM_OS},name=iPhone 17" \
             -derivedDataPath /tmp/derived-data \
             -resultBundlePath /tmp/ios-app-test.xcresult \
-            -only-testing:RadioShakeTests \
             "${ONLY[@]}" \
             -skip-testing:RadioShakeUITests/ScreenshotTourUITests \
             -skip-testing:RadioShakeUITests/StoreScreenshotsUITests \
+            -retry-tests-on-failure -test-iterations 2 \
             CODE_SIGNING_ALLOWED=NO 2>&1 | tee /tmp/ios-logs/xctest.log
+
+      - name: Report UI tests that needed a retry
+        if: always()
+        run: python3 ci/.github/scripts/report_flaky_tests.py --log /tmp/ios-logs/xctest.log --label "validate (UI shard 0)"
 
       - name: Every selected UI test class ran
         run: python3 ci/.github/scripts/check_shard_ran.py --args /tmp/ui-shard-args.txt --log /tmp/ios-logs/xctest.log
@@ -628,12 +654,12 @@ jobs:
         run: |
           set -euo pipefail
           # Match executed test cases only: xcodebuild echoes its own command line,
-          # which contains the -skip-testing argument.
-          if grep -qE "Test Case '-\\[RadioShakeUITests\\.ScreenshotTourUITests" /tmp/ios-logs/xctest.log; then
+          # which contains the -skip-testing argument. xctest*.log covers the unit log too.
+          if grep -qE "Test Case '-\\[RadioShakeUITests\\.ScreenshotTourUITests" /tmp/ios-logs/xctest*.log; then
             echo "::error::ScreenshotTourUITests ran in the public job; its screenshots would be uploaded unencrypted"
             exit 1
           fi
-          if grep -qE "Test Case '-\\[RadioShakeUITests\\.StoreScreenshotsUITests" /tmp/ios-logs/xctest.log; then
+          if grep -qE "Test Case '-\\[RadioShakeUITests\\.StoreScreenshotsUITests" /tmp/ios-logs/xctest*.log; then
             echo "::error::StoreScreenshotsUITests ran in the public job; its screenshots would be uploaded unencrypted"
             exit 1
           fi
@@ -645,7 +671,8 @@ jobs:
       - name: StoreKit storefront test ran and was not skipped
         run: |
           set -euo pipefail
-          LOG=/tmp/ios-logs/xctest.log
+          # StoreKitStorefrontTests lives in RadioShakeTests, so it is in the (non-retried) unit log.
+          LOG=/tmp/ios-logs/xctest-unit.log
           if grep -E "Test Case '.*StoreKitStorefrontTests.*' skipped" "$LOG"; then
             echo "::error::StoreKitStorefrontTests was skipped on CI (no simulator storefront)"
             exit 1
@@ -1133,6 +1160,8 @@ jobs:
             --weights ci/.github/scripts/ui_test_weights.json \
             --out /tmp/ui-shard-args.txt | tee /tmp/ios-logs/ui-shard-classes.log
 
+      # Retry once on failure (see the validate job's UI step); retried-then-passed tests are
+      # listed by "Report UI tests that needed a retry".
       - name: Run XCTest UI tests (shard)
         working-directory: src/ios
         env:
@@ -1153,7 +1182,14 @@ jobs:
             "${ONLY[@]}" \
             -skip-testing:RadioShakeUITests/ScreenshotTourUITests \
             -skip-testing:RadioShakeUITests/StoreScreenshotsUITests \
+            -retry-tests-on-failure -test-iterations 2 \
             CODE_SIGNING_ALLOWED=NO 2>&1 | tee /tmp/ios-logs/xctest.log
+
+      - name: Report UI tests that needed a retry
+        if: always()
+        env:
+          SHARD: ${{ matrix.shard }}
+        run: python3 ci/.github/scripts/report_flaky_tests.py --log /tmp/ios-logs/xctest.log --label "ui-shard-${SHARD}"
 
       - name: Every selected UI test class ran
         run: python3 ci/.github/scripts/check_shard_ran.py --args /tmp/ui-shard-args.txt --log /tmp/ios-logs/xctest.log
@@ -1165,12 +1201,12 @@ jobs:
         run: |
           set -euo pipefail
           # Match executed test cases only: xcodebuild echoes its own command line,
-          # which contains the -skip-testing argument.
-          if grep -qE "Test Case '-\\[RadioShakeUITests\\.ScreenshotTourUITests" /tmp/ios-logs/xctest.log; then
+          # which contains the -skip-testing argument. xctest*.log covers the unit log too.
+          if grep -qE "Test Case '-\\[RadioShakeUITests\\.ScreenshotTourUITests" /tmp/ios-logs/xctest*.log; then
             echo "::error::ScreenshotTourUITests ran in the public job; its screenshots would be uploaded unencrypted"
             exit 1
           fi
-          if grep -qE "Test Case '-\\[RadioShakeUITests\\.StoreScreenshotsUITests" /tmp/ios-logs/xctest.log; then
+          if grep -qE "Test Case '-\\[RadioShakeUITests\\.StoreScreenshotsUITests" /tmp/ios-logs/xctest*.log; then
             echo "::error::StoreScreenshotsUITests ran in the public job; its screenshots would be uploaded unencrypted"
             exit 1
           fi
