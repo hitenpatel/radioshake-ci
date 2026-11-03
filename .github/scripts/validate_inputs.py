@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Validate ios-testflight workflow_dispatch inputs (anchored regexes, from env only).
 
-Reads SHA, VALIDATED_RUN, MODE, RESUME_BUILD, RELEASE_RUN, NOTES from the environment and
+Reads SHA, VALIDATED_RUN, MODE, RESUME_BUILD, RELEASE_RUN, NOTES, DIAGNOSTICS from the environment and
 exits non-zero with a GitHub ::error:: annotation on the first violation.
 Nothing from the inputs is echoed back except the validated, constrained values.
 """
@@ -21,6 +21,7 @@ def check(env):
     resume = env.get("RESUME_BUILD", "")
     release_run = env.get("RELEASE_RUN", "")
     notes = env.get("NOTES", "")
+    diagnostics = env.get("DIAGNOSTICS", "false")
     if not re.fullmatch(r"[0-9a-f]{40}", sha):
         errors.append("sha must be a full 40-character lowercase hex commit id")
     if not re.fullmatch(r"[1-9][0-9]{0,19}", run):
@@ -37,6 +38,10 @@ def check(env):
             errors.append("resume_build is only allowed with mode=resume")
         if release_run:
             errors.append("release_run is only allowed with mode=resume")
+    if diagnostics not in ("true", "false"):
+        errors.append("diagnostics must be true or false")
+    elif diagnostics == "true" and mode == "resume":
+        errors.append("diagnostics is only allowed when the run builds (release or archive_only)")
     if len(notes) > NOTES_MAX_CHARS:
         errors.append(f"notes must be at most {NOTES_MAX_CHARS} characters")
     if CONTROL.search(notes):

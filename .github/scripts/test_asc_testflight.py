@@ -362,13 +362,20 @@ class InputTests(unittest.TestCase):
         self.assertEqual(self.errs(), [])
         self.assertEqual(self.errs(MODE="resume", RESUME_BUILD="7", RELEASE_RUN="99"), [])
         self.assertEqual(self.errs(NOTES="a\nb\tc"), [])
+        self.assertEqual(self.errs(DIAGNOSTICS="true"), [])
+        self.assertEqual(self.errs(DIAGNOSTICS="true", MODE="archive_only"), [])
+        self.assertEqual(self.errs(DIAGNOSTICS="false", MODE="resume", RESUME_BUILD="7", RELEASE_RUN="99"), [])
+        import validate_inputs as v
+        self.assertEqual(v.check({k: val for k, val in self.OK.items()}), [], "no DIAGNOSTICS means off")
 
     def test_rejects(self):
         for kw in ({"SHA": "A" * 40}, {"SHA": "a" * 39}, {"SHA": "a" * 40 + "\n"}, {"SHA": "main"},
                    {"VALIDATED_RUN": "12 3"}, {"VALIDATED_RUN": "0"}, {"VALIDATED_RUN": "1\n2"},
                    {"MODE": "Release"}, {"MODE": "resume"}, {"MODE": "resume", "RESUME_BUILD": "x", "RELEASE_RUN": "9"},
                    {"MODE": "resume", "RESUME_BUILD": "7"}, {"MODE": "resume", "RESUME_BUILD": "7", "RELEASE_RUN": "x"},
-                   {"RESUME_BUILD": "5"}, {"RELEASE_RUN": "5"}, {"NOTES": "x" * 4001}, {"NOTES": "a\x00b"}):
+                   {"RESUME_BUILD": "5"}, {"RELEASE_RUN": "5"}, {"NOTES": "x" * 4001}, {"NOTES": "a\x00b"},
+                   {"DIAGNOSTICS": "yes"}, {"DIAGNOSTICS": "True"}, {"DIAGNOSTICS": ""}, {"DIAGNOSTICS": "true\n"},
+                   {"DIAGNOSTICS": "true", "MODE": "resume", "RESUME_BUILD": "7", "RELEASE_RUN": "99"}):
             self.assertTrue(self.errs(**kw), kw)
 
 
@@ -601,3 +608,32 @@ class JwtTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DiagnosticsWorkflowTests(unittest.TestCase):
+    """ios-testflight.yml: RS_DIAGNOSTICS reaches the archive only through the boolean input, default off."""
+
+    def setUp(self):
+        here = os.path.dirname(os.path.abspath(__file__))
+        with open(os.path.join(here, "..", "workflows", "ios-testflight.yml"), encoding="utf-8") as fh:
+            self.text = fh.read()
+
+    def test_input_is_a_boolean_defaulting_to_false(self):
+        block = self.text.split("      diagnostics:\n", 1)[1].split("\npermissions:", 1)[0]
+        self.assertIn("type: boolean", block)
+        self.assertIn("default: false", block)
+
+    def test_flag_is_added_only_when_the_input_is_true(self):
+        self.assertEqual(self.text.count("RS_DIAGNOSTICS'"), 1)
+        guarded = self.text.split('if [ "$DIAGNOSTICS" = "true" ]; then', 1)[1].split("fi", 1)[0]
+        self.assertIn("diagnostics_flags=('SWIFT_ACTIVE_COMPILATION_CONDITIONS=$(inherited) RS_DIAGNOSTICS')", guarded)
+        self.assertIn("diagnostics_flags=()", self.text.split('if [ "$DIAGNOSTICS" = "true" ]', 1)[0])
+        archive = self.text.split("do_archive() {", 1)[1].split("\n          }\n", 1)[0]
+        self.assertIn('${diagnostics_flags[@]+"${diagnostics_flags[@]}"}', archive)
+
+    def test_every_input_validation_and_the_archive_step_read_the_input(self):
+        self.assertEqual(self.text.count("DIAGNOSTICS: ${{ inputs.diagnostics }}"), 3)
+
+    def test_run_name_is_unchanged_so_resume_provenance_still_parses(self):
+        self.assertIn("run-name: ios-testflight ${{ inputs.mode }} ${{ inputs.sha }} (validated ${{ inputs.validated_run }})",
+                      self.text)

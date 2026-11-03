@@ -15,7 +15,11 @@
 #   gh workflow run ios-testflight.yml -R hitenpatel/radioshake-ci \
 #     -f sha=<40-hex> -f validated_run=<ios-shared-validate run id> \
 #     [-f notes='What to Test'] [-f mode=release|archive_only|resume] \
-#     [-f resume_build=<n> -f release_run=<id of the run that uploaded it>]
+#     [-f resume_build=<n> -f release_run=<id of the run that uploaded it>] [-f diagnostics=true]
+#
+# diagnostics=true (internal TestFlight only, never for an App Review build): the archive is built with
+# SWIFT_ACTIVE_COMPILATION_CONDITIONS="$(inherited) RS_DIAGNOSTICS", which adds the Song ID log (Settings > About).
+# Default false: the archive is the normal Release build. Not allowed with mode=resume (nothing is built).
 
 name: ios-testflight
 
@@ -57,6 +61,11 @@ on:
         required: false
         default: ''
         type: string
+      diagnostics:
+        description: 'Internal TestFlight diagnostics build: compile RS_DIAGNOSTICS (Song ID log). Never for App Review.'
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -108,6 +117,7 @@ jobs:
           RESUME_BUILD: ${{ inputs.resume_build }}
           RELEASE_RUN: ${{ inputs.release_run }}
           NOTES: ${{ inputs.notes }}
+          DIAGNOSTICS: ${{ inputs.diagnostics }}
         run: python3 ci/.github/scripts/validate_inputs.py
 
       - name: Verify the validated run (trusted validator revision, first clone line)
@@ -210,6 +220,7 @@ jobs:
           RESUME_BUILD: ${{ inputs.resume_build }}
           RELEASE_RUN: ${{ inputs.release_run }}
           NOTES: ${{ inputs.notes }}
+          DIAGNOSTICS: ${{ inputs.diagnostics }}
         run: python3 ci/.github/scripts/validate_inputs.py
 
       - name: Clone source at the gated SHA
@@ -386,6 +397,7 @@ jobs:
           MODE: ${{ inputs.mode }}
           SHA: ${{ inputs.sha }}
           VERSION: ${{ steps.clone.outputs.version }}
+          DIAGNOSTICS: ${{ inputs.diagnostics }}
         run: |
           set -euo pipefail
           SCRIPTS="$GITHUB_WORKSPACE/ci/.github/scripts"
@@ -434,6 +446,15 @@ jobs:
             printf '%s' "$n"
           }
 
+          # Internal diagnostics builds only (input diagnostics=true): RS_DIAGNOSTICS adds the Song ID log.
+          diagnostics_flags=()
+          if [ "$DIAGNOSTICS" = "true" ]; then
+            diagnostics_flags=('SWIFT_ACTIVE_COMPILATION_CONDITIONS=$(inherited) RS_DIAGNOSTICS')
+            echo "Diagnostics build: RS_DIAGNOSTICS is compiled in (internal TestFlight only, not for App Review)"
+          else
+            echo "Diagnostics: off (normal Release archive)"
+          fi
+
           do_archive() {
             rm -rf "$ARCHIVE"
             xcodebuild archive \
@@ -441,7 +462,7 @@ jobs:
               -destination 'generic/platform=iOS' -archivePath "$ARCHIVE" \
               DEVELOPMENT_TEAM="$TEAM" CODE_SIGNING_ALLOWED=YES CODE_SIGNING_REQUIRED=NO \
               CODE_SIGN_IDENTITY=- CODE_SIGN_STYLE=Manual AD_HOC_CODE_SIGNING_ALLOWED=YES \
-              CURRENT_PROJECT_VERSION="$1" \
+              CURRENT_PROJECT_VERSION="$1" ${diagnostics_flags[@]+"${diagnostics_flags[@]}"} \
               > "$RUNNER_TEMP/archive.log" 2>&1
           }
 
