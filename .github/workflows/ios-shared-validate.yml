@@ -562,6 +562,10 @@ jobs:
           XLIFF=$(find /tmp/xcloc -name 'de.xliff' | head -1)
           test -n "$XLIFF" || { echo "::error::no de.xliff exported"; exit 1; }
           python3 ../scripts/check_xcstrings.py App/Localizable.xcstrings --xliff "$XLIFF"
+          # Phase 5c: the widget extension has its own catalogue, checked against its own exported file.
+          if [ -f Widgets/Localizable.xcstrings ]; then
+            python3 ../scripts/check_xcstrings.py Widgets/Localizable.xcstrings --xliff "$XLIFF"
+          fi
 
       - name: Verify app has no distribution signature
         run: |
@@ -833,6 +837,40 @@ jobs:
           fi
           python3 scripts/ios_privacy_audit.py \
             --inventory ios/privacy/required-reason-inventory.json "$SIM" "$DEV"
+
+      - name: Widget extension archive probe (Phase 5c decision 16 a)
+        # Phase 5c: a Release device archive with an ad-hoc signature that carries entitlements proves, on a branch, that the
+        # archive keeps the App Group (the testflight workflow only accepts shas on main). Skipped for sources without the
+        # widget extension (main before 5c).
+        if: ${{ !cancelled() && steps.clone.outcome == 'success' }}
+        working-directory: src
+        run: |
+          set -euo pipefail
+          if ! grep -qE '^[[:space:]]+RadioShakeWidgets:[[:space:]]*$' ios/project.yml; then
+            echo "Source ref defines no RadioShakeWidgets target: probe skipped"
+            exit 0
+          fi
+          rm -rf shared/build/XCFrameworks/current/RadioShakeShared.xcframework
+          ln -sfn "$PWD/shared/build/XCFrameworks/release/RadioShakeShared.xcframework" \
+                  "$PWD/shared/build/XCFrameworks/current/RadioShakeShared.xcframework"
+          cd ios
+          rm -rf /tmp/widget-probe.xcarchive
+          mkdir -p /tmp/ios-logs
+          xcodebuild archive \
+            -project RadioShake.xcodeproj \
+            -scheme RadioShake \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath /tmp/widget-probe.xcarchive \
+            CODE_SIGNING_ALLOWED=YES CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY=- \
+            CODE_SIGN_STYLE=Manual AD_HOC_CODE_SIGNING_ALLOWED=YES 2>&1 | tee /tmp/ios-logs/widget-probe-archive.log
+          cd ..
+          rm -rf shared/build/XCFrameworks/current/RadioShakeShared.xcframework
+          ln -sfn "$PWD/shared/build/XCFrameworks/debug/RadioShakeShared.xcframework" \
+                  "$PWD/shared/build/XCFrameworks/current/RadioShakeShared.xcframework"
+          APP=/tmp/widget-probe.xcarchive/Products/Applications/RadioShake.app
+          test -d "$APP" || { echo "::error::probe archive has no app"; exit 1; }
+          python3 "$GITHUB_WORKSPACE/ci/.github/scripts/check_widget_archive.py" --project-yml ios/project.yml "$APP"
 
       # ── Full regression suite ───────────────────────────────────────
       - name: Run JVM + Android + Wear regression tests

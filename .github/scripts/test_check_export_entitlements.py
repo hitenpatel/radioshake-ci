@@ -392,7 +392,7 @@ class WidgetsProbeWorkflowTests(unittest.TestCase):
                         self.text.index("- name: Widget extension archive probe"))
 
     def test_the_widget_catalogue_is_checked_when_it_exists(self):
-        self.assertIn("ios/Widgets/Localizable.xcstrings", self.text)
+        self.assertIn("-f Widgets/Localizable.xcstrings", self.text)
         self.assertRegex(self.text, r"check_xcstrings.py Widgets/Localizable.xcstrings --xliff")
 
 

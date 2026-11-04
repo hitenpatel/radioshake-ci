@@ -470,7 +470,7 @@ jobs:
           uuids() { dwarfdump --uuid "$1" 2>/dev/null | awk '/^UUID:/ {print $2 " " $3}' | sort; }
 
           verify_archive() {
-            local n="$1" plist actual bin dsym fw_bin fw_dsym fw_uuids sym_count
+            local n="$1" plist actual bin dsym fw_bin fw_dsym fw_uuids sym_count appex
             plist="$APP/Info.plist"
             [ -f "$plist" ] || fail "archive has no app Info.plist"
             pb() { /usr/libexec/PlistBuddy -c "Print :$1" "$plist"; }
@@ -507,6 +507,28 @@ jobs:
                 echo "standalone RadioShakeShared dSYM also present"
               fi
             fi
+
+            # Phase 5c (decision 16 b): the widget extension, only when the archive has one (a sha from before 5c has none).
+            appex="$APP/PlugIns/RadioShakeWidgets.appex"
+            if [ -d "$appex" ]; then
+              local appex_plist="$appex/Info.plist" appex_bin appex_dsym
+              [ -f "$appex_plist" ] || fail "widget extension has no Info.plist"
+              apb() { /usr/libexec/PlistBuddy -c "Print :$1" "$appex_plist"; }
+              [ "$(apb CFBundleIdentifier)" = "$BUNDLE_ID.widgets" ] || fail "widget extension bundle id is not $BUNDLE_ID.widgets"
+              [ "$(apb CFBundleShortVersionString)" = "$(pb CFBundleShortVersionString)" ] || fail "widget extension marketing version differs from the app's"
+              [ "$(apb CFBundleVersion)" = "$n" ] || fail "widget extension build number differs from $n"
+              [ "$(apb RSAppGroup)" = "$(pb RSAppGroup)" ] || fail "widget extension RSAppGroup differs from the app's"
+              appex_bin="$appex/RadioShakeWidgets"
+              appex_dsym="$ARCHIVE/dSYMs/RadioShakeWidgets.appex.dSYM"
+              [ -f "$appex_bin" ] || fail "widget extension has no executable"
+              [ -d "$appex_dsym" ] || fail "archive has no widget extension dSYM"
+              actual=$(uuids "$appex_bin")
+              [ -n "$actual" ] || fail "could not read the widget extension binary UUID"
+              [ "$actual" = "$(uuids "$appex_dsym")" ] || fail "widget extension dSYM UUID does not match the widget extension binary"
+              echo "widget extension checked: bundle id, versions, App Group, dSYM UUID"
+            else
+              echo "no widget extension in the archive (a sha from before Phase 5c)"
+            fi
           }
 
           do_export() {
@@ -523,14 +545,23 @@ jobs:
           # step (d), an owner decision.
           gate_entitlements() {
             local gate_dir="$RUNNER_TEMP/export-gate" gate_opts="$RUNNER_TEMP/ExportOptionsGate.plist"
-            local gate_app="$RUNNER_TEMP/gate-app" ents="$RUNNER_TEMP/gate-entitlements.txt" ipa app message applies=0
-            # Only a source that declares the entitlement is gated (main before Phase P1 merges has none).
-            python3 "$SCRIPTS/check_export_entitlements.py" --declared "$GITHUB_WORKSPACE/src/ios/project.yml" || applies=$?
-            case "$applies" in
-              0) ;;
-              4) echo "gate not applicable at ${SHA}"; return 0 ;;
+            local gate_app="$RUNNER_TEMP/gate-app" ents="$RUNNER_TEMP/gate-entitlements.txt" ipa app message attest=0 widgets=0
+            # Only a source that declares the App Attest entitlement (main before Phase P1 has none) or the widget extension
+            # (main before Phase 5c has none) is gated; with neither, nothing is exported here.
+            python3 "$SCRIPTS/check_export_entitlements.py" --declared "$GITHUB_WORKSPACE/src/ios/project.yml" || attest=$?
+            python3 "$SCRIPTS/check_export_entitlements.py" --widgets-declared "$GITHUB_WORKSPACE/src/ios/project.yml" || widgets=$?
+            case "$attest" in
+              0|4) ;;
               *) fail "could not decide whether the entitlement gate applies (project.yml unreadable)" ;;
             esac
+            case "$widgets" in
+              0|4) ;;
+              *) fail "could not decide whether the widget extension guard applies (project.yml unreadable)" ;;
+            esac
+            if [ "$attest" = 4 ] && [ "$widgets" = 4 ]; then
+              echo "gate not applicable at ${SHA}"
+              return 0
+            fi
             rm -rf "$gate_dir" "$gate_app"
             python3 - "$OPTIONS" "$gate_opts" <<'PY'
           import plistlib, sys
@@ -551,12 +582,22 @@ jobs:
             unzip -q "$ipa" 'Payload/*' -d "$gate_app" || fail "entitlements missing at export (the gate ipa could not be read)"
             app=$(ls -d "$gate_app"/Payload/*.app 2>/dev/null | head -n 1 || true)
             [ -n "$app" ] || fail "entitlements missing at export (no app in the gate ipa)"
-            codesign -d --entitlements :- "$app" > "$ents" 2>/dev/null || true
-            if message=$(python3 "$SCRIPTS/check_export_entitlements.py" "$ents"); then
+            if [ "$attest" = 0 ]; then
+              codesign -d --entitlements :- "$app" > "$ents" 2>/dev/null || true
+              if message=$(python3 "$SCRIPTS/check_export_entitlements.py" "$ents"); then
+                echo "$message"
+              else
+                echo "$message"
+                fail "entitlements missing at export: the signed app lacks appattest-environment = production; see the runbook, App Attest distributed builds"
+              fi
+            fi
+            # Phase 5c (decision 16 b): the App Group on the app and the widget extension. Bundle-based: an exported app
+            # without the extension and without RSAppGroup passes as "pre-5c app, guard skipped". Entitlement keys only.
+            if message=$(python3 "$SCRIPTS/check_export_entitlements.py" --widgets "$app"); then
               echo "$message"
             else
               echo "$message"
-              fail "entitlements missing at export: the signed app lacks appattest-environment = production; see the runbook, App Attest distributed builds"
+              fail "entitlements missing at export: the signed app or the widget extension lacks the App Group; see the runbook, App Group and the widget extension"
             fi
             rm -rf "$gate_dir" "$gate_app"
           }
