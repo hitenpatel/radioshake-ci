@@ -527,7 +527,14 @@ jobs:
               [ "$actual" = "$(uuids "$appex_dsym")" ] || fail "widget extension dSYM UUID does not match the widget extension binary"
               echo "widget extension checked: bundle id, versions, App Group, dSYM UUID"
             else
-              echo "no widget extension in the archive (a sha from before Phase 5c)"
+              local widgets_rc=0
+              python3 "$SCRIPTS/check_export_entitlements.py" --widgets-declared "$GITHUB_WORKSPACE/src/ios/project.yml" \
+                > /dev/null || widgets_rc=$?
+              case "$widgets_rc" in
+                4) echo "no widget extension in the archive (a sha from before Phase 5c)" ;;
+                0) fail "project.yml defines RadioShakeWidgets but the archive has no PlugIns/RadioShakeWidgets.appex" ;;
+                *) fail "could not decide whether the archive needs the widget extension (project.yml unreadable)" ;;
+              esac
             fi
           }
 
@@ -591,13 +598,15 @@ jobs:
                 fail "entitlements missing at export: the signed app lacks appattest-environment = production; see the runbook, App Attest distributed builds"
               fi
             fi
-            # Phase 5c (decision 16 b): the App Group on the app and the widget extension. Bundle-based: an exported app
-            # without the extension and without RSAppGroup passes as "pre-5c app, guard skipped". Entitlement keys only.
-            if message=$(python3 "$SCRIPTS/check_export_entitlements.py" --widgets "$app"); then
+            # Phase 5c (decision 16 b): the App Group on the app and the widget extension, and the universal links domain on
+            # the app when project.yml declares it. An exported app without the extension and without RSAppGroup passes as
+            # "pre-5c app, guard skipped" unless project.yml defines RadioShakeWidgets. Entitlement keys only.
+            if message=$(python3 "$SCRIPTS/check_export_entitlements.py" --widgets "$app" \
+                           --project-yml "$GITHUB_WORKSPACE/src/ios/project.yml"); then
               echo "$message"
             else
               echo "$message"
-              fail "entitlements missing at export: the signed app or the widget extension lacks the App Group; see the runbook, App Group and the widget extension"
+              fail "entitlements missing at export: the signed app or the widget extension lacks the App Group or the associated domain; see the runbook, App Group and the widget extension"
             fi
             rm -rf "$gate_dir" "$gate_app"
           }

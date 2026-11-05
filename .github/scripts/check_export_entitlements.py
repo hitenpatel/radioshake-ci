@@ -21,6 +21,10 @@ Phase 5c (spec decision 16 b), the widget extension:
       its Info.plist) passes with "pre-5c app, guard skipped". Otherwise the app and the appex must both carry
       com.apple.security.application-groups with the release group, else "entitlements missing at export". Prints entitlement
       KEYS only, never values, never a provisioning profile. Exit 0: pass or skipped. Exit 1: fail.
+  check_export_entitlements.py --widgets EXPORTED_APP --project-yml PROJECT_YML
+      As above, plus the released source decides: when it defines the RadioShakeWidgets target, an app without the appex
+      fails instead of being skipped; when it declares applinks:radioshake.media, the app must carry
+      com.apple.developer.associated-domains with it. An unreadable PROJECT_YML fails (never a silent skip).
 """
 import os
 import plistlib
@@ -34,6 +38,8 @@ GROUPS_KEY = "com.apple.security.application-groups"
 RELEASE_GROUP = "group.com.radioshake"
 APPEX_DIR = "PlugIns/RadioShakeWidgets.appex"
 APPEX_NAME = "RadioShakeWidgets.appex"
+DOMAINS_KEY = "com.apple.developer.associated-domains"
+APPLINKS = "applinks:radioshake.media"
 
 
 def parse(raw: bytes) -> dict:
@@ -69,10 +75,18 @@ def codesign_entitlements(path: str) -> bytes:
     return result.stdout
 
 
-def _groups(raw: bytes) -> list:
-    entitlements = parse(raw)
-    value = entitlements.get(GROUPS_KEY)
+def links_declared(project_yml: str) -> bool:
+    """True when an uncommented line of the XcodeGen spec names the universal links domain."""
+    return any(APPLINKS in line for line in project_yml.splitlines() if not line.lstrip().startswith("#"))
+
+
+def _strings(raw: bytes, key: str) -> list:
+    value = parse(raw).get(key)
     return [v for v in value if isinstance(v, str)] if isinstance(value, list) else []
+
+
+def _groups(raw: bytes) -> list:
+    return _strings(raw, GROUPS_KEY)
 
 
 def _plist(path: str) -> dict:
@@ -83,8 +97,23 @@ def _plist(path: str) -> dict:
     return loaded
 
 
-def check_widgets(app_dir: str, codesign=codesign_entitlements) -> tuple:
-    """Returns (status, message): status is "pass", "skip" or "fail". `codesign(path)` returns the entitlements output."""
+def check_widgets(app_dir: str, codesign=codesign_entitlements, project_yml=None) -> tuple:
+    """Returns (status, message): status is "pass", "skip" or "fail". `codesign(path)` returns the entitlements output.
+    `project_yml` (the released XcodeGen spec's text, optional) makes the appex required when the spec defines the widget
+    target and the associated domain required on the app when the spec declares it."""
+    status, message = _check_app_group(app_dir, codesign, project_yml is not None and widgets_declared(project_yml))
+    if status == "fail" or project_yml is None or not links_declared(project_yml):
+        return status, message
+    try:
+        domains = _strings(codesign(app_dir), DOMAINS_KEY)
+    except Exception:
+        return "fail", "entitlements missing at export (codesign printed no readable entitlements for RadioShake.app)"
+    if APPLINKS not in domains:
+        return "fail", f"entitlements missing at export (RadioShake.app lacks {DOMAINS_KEY} with the universal links domain)"
+    return "pass", f"{message}; RadioShake.app carries {DOMAINS_KEY}"
+
+
+def _check_app_group(app_dir: str, codesign, required: bool) -> tuple:
     fail = "entitlements missing at export"
     try:
         info = _plist(os.path.join(app_dir, "Info.plist"))
@@ -93,6 +122,8 @@ def check_widgets(app_dir: str, codesign=codesign_entitlements) -> tuple:
     appex = os.path.join(app_dir, APPEX_DIR)
     group = info.get("RSAppGroup")
     if group is None and not os.path.isdir(appex):
+        if required:
+            return "fail", f"{fail} (the released source defines RadioShakeWidgets but the exported app has no {APPEX_NAME})"
         return "skip", "pre-5c app, guard skipped"
     if group != RELEASE_GROUP:
         return "fail", f"{fail} (the app's RSAppGroup is not {RELEASE_GROUP})"
@@ -152,8 +183,16 @@ def main(argv) -> int:
             return 0
         print("no widget extension in the released source: widget guard not applicable")
         return 4
-    if len(argv) == 3 and argv[1] == "--widgets":
-        status, message = check_widgets(argv[2])
+    if argv[1:2] == ["--widgets"] and (len(argv) == 3 or (len(argv) == 5 and argv[3] == "--project-yml")):
+        project_yml = None
+        if len(argv) == 5:
+            try:
+                with open(argv[4], encoding="utf-8") as fh:
+                    project_yml = fh.read()
+            except OSError as exc:
+                print(f"::error::entitlements missing at export (cannot read {argv[4]} to decide what the guard needs: {exc})")
+                return 1
+        status, message = check_widgets(argv[2], project_yml=project_yml)
         if status == "fail":
             print(f"::error::{message}")
             return 1

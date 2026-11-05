@@ -239,6 +239,57 @@ class WidgetsGuardTests(unittest.TestCase):
         self.assertIn("RSAppGroup", message)
 
 
+DOMAINS = b"<key>com.apple.developer.associated-domains</key><array><string>applinks:radioshake.media</string></array>"
+SPEC_5C = ("targets:\n  RadioShake:\n    entitlements:\n      properties:\n"
+           "        com.apple.developer.associated-domains:\n          - applinks:radioshake.media\n"
+           "    dependencies:\n      - target: RadioShakeWidgets\n  RadioShakeWidgets:\n    type: app-extension\n")
+SPEC_PRE_5C = "targets:\n  RadioShake:\n    type: application\n"
+
+
+class WidgetsGuardWithProjectSpecTests(unittest.TestCase):
+    """With the released project.yml, the guard also requires the appex when the spec defines it and the universal links
+    domain on the app when the spec declares it."""
+
+    def check(self, spec, **kwargs):
+        ents_app = kwargs.pop("app_ents", output(attest(b"production"), groups(GROUP), DOMAINS))
+        ents_appex = kwargs.pop("appex_ents", output(groups(GROUP)))
+        with tempfile.TemporaryDirectory() as root:
+            app = make_app(root, **kwargs)
+            return gate.check_widgets(app, codesign_for(ents_app, ents_appex), project_yml=spec)
+
+    def test_a_5c_export_with_groups_and_domain_passes(self):
+        status, message = self.check(SPEC_5C)
+        self.assertEqual(status, "pass", message)
+        self.assertIn("com.apple.developer.associated-domains", message)
+        self.assertNotIn("applinks:radioshake.media", message)
+
+    def test_a_dropped_associated_domain_fails(self):
+        status, message = self.check(SPEC_5C, app_ents=output(attest(b"production"), groups(GROUP)))
+        self.assertEqual(status, "fail")
+        self.assertIn("entitlements missing at export", message)
+        self.assertIn("com.apple.developer.associated-domains", message)
+
+    def test_another_domain_fails(self):
+        other = b"<key>com.apple.developer.associated-domains</key><array><string>applinks:example.com</string></array>"
+        status, _ = self.check(SPEC_5C, app_ents=output(groups(GROUP), other))
+        self.assertEqual(status, "fail")
+
+    def test_a_missing_appex_fails_when_the_spec_defines_the_target(self):
+        status, message = self.check(SPEC_5C, app_group=None, appex=False)
+        self.assertEqual(status, "fail")
+        self.assertIn("RadioShakeWidgets.appex", message)
+
+    def test_a_pre_5c_spec_and_app_are_skipped(self):
+        status, message = self.check(SPEC_PRE_5C, app_group=None, appex=False, app_ents=output(attest(b"production")))
+        self.assertEqual(status, "skip")
+        self.assertIn("pre-5c app, guard skipped", message)
+
+    def test_a_missing_app_group_still_fails_first(self):
+        status, message = self.check(SPEC_5C, appex_ents=output(OTHER))
+        self.assertEqual(status, "fail")
+        self.assertIn("RadioShakeWidgets.appex", message)
+
+
 class WidgetsCommandLineTests(unittest.TestCase):
     SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "check_export_entitlements.py")
 
@@ -273,6 +324,26 @@ class WidgetsCommandLineTests(unittest.TestCase):
             result = self._run(app, self._fake_codesign(root, output(OTHER), output(OTHER)))
             self.assertEqual(result.returncode, 0)
             self.assertIn("pre-5c app, guard skipped", result.stdout)
+
+    def test_project_yml_option(self):
+        good_app = output(groups(GROUP), DOMAINS)
+        with tempfile.TemporaryDirectory() as root:
+            spec = os.path.join(root, "project.yml")
+            with open(spec, "w") as fh:
+                fh.write(SPEC_5C)
+            app = make_app(root)
+            env = dict(os.environ, RS_CODESIGN=self._fake_codesign(root, good_app, output(groups(GROUP))))
+            run = lambda *extra: subprocess.run([sys.executable, self.SCRIPT, "--widgets", app, *extra],
+                                                capture_output=True, text=True, env=env)
+            result = run("--project-yml", spec)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            env["RS_CODESIGN"] = self._fake_codesign(root, output(groups(GROUP)), output(groups(GROUP)))
+            result = run("--project-yml", spec)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("entitlements missing at export", result.stdout)
+            result = run("--project-yml", os.path.join(root, "missing.yml"))
+            self.assertEqual(result.returncode, 1, "an unreadable project.yml is never a silent skip")
+            self.assertEqual(run("--bogus", spec).returncode, 2)
 
     def test_an_unreadable_app_is_an_error_not_a_skip(self):
         result = subprocess.run([sys.executable, self.SCRIPT, "--widgets", "/nonexistent/RadioShake.app"],
@@ -333,6 +404,15 @@ class WidgetsWorkflowTests(unittest.TestCase):
         self.assertIn('check_export_entitlements.py" --widgets "$app"', body)
         self.assertLess(body.index("codesign -d --entitlements"), body.index("--widgets \"$app\""))
         self.assertLess(self.text.index("gate_entitlements\n"), self.text.index("if do_export; then"))
+
+    def test_the_gate_passes_the_released_project_yml_to_the_widgets_guard(self):
+        self.assertRegex(self.gate_body(),
+                         r'--widgets "\$app" \\\n\s+--project-yml "\$GITHUB_WORKSPACE/src/ios/project.yml"')
+
+    def test_verify_archive_fails_when_the_spec_defines_the_appex_but_the_archive_lacks_it(self):
+        body = self.verify_body()
+        self.assertIn('check_export_entitlements.py" --widgets-declared', body)
+        self.assertIn("project.yml defines RadioShakeWidgets but the archive has no", body)
 
     def test_the_app_attest_check_still_runs_when_declared(self):
         body = self.gate_body()
