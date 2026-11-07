@@ -147,6 +147,48 @@ class FetchTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp, patch.object(d,'decrypt',return_value=b.getvalue()), contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(d.execute_fetch(REQ,api,Path(tmp),1),1)
 
+    def native_failure_bundle(self, *, result_present=False, stage_exit=65, xcode_exit=65, log=True, outcome='incomplete', bad_hash=False, omit_exit=False):
+        with tarfile.open(fileobj=io.BytesIO(self.fixture()),mode='r:gz') as original:
+            manifest=json.load(original.extractfile('manifest.json'))
+        manifest['stages']['test']=stage_exit
+        manifest['execution']=dict(outcome=outcome,xcode_exit=xcode_exit,xcresult_present=result_present,passed=0,failed=0,skipped=0)
+        manifest['file_hashes']={'test.log':('0'*64 if bad_hash else hashlib.sha256(b'generic').hexdigest())} if log else {}
+        if omit_exit: del manifest['execution']['xcode_exit']
+        b=io.BytesIO()
+        with tarfile.open(fileobj=b,mode='w:gz') as t:
+            members=[('manifest.json',json.dumps(manifest).encode())]
+            if log: members.append(('test.log',b'generic'))
+            for name,data in members:
+                info=tarfile.TarInfo(name); info.size=len(data); t.addfile(info,io.BytesIO(data))
+            if result_present:
+                info=tarfile.TarInfo('tests.xcresult'); info.type=tarfile.DIRTYPE; t.addfile(info)
+        return b.getvalue()
+
+    def test_native_compilation_failure_returns_one_and_reports_retained_evidence(self):
+        for present in (False, True):
+            with self.subTest(result_present=present):
+                api=FakeAPI(archive=zipdata(['key.enc','bundle.tgz.enc']))
+                with tempfile.TemporaryDirectory() as tmp, patch.object(d,'decrypt',return_value=self.native_failure_bundle(result_present=present)), contextlib.redirect_stdout(io.StringIO()) as output:
+                    self.assertEqual(d.execute_fetch(REQ,api,Path(tmp),1),1)
+                    evidence=list(Path(tmp).glob('attempt-*/evidence'))
+                    self.assertEqual(len(evidence),1)
+                    self.assertIn('evidence='+str(evidence[0]),output.getvalue())
+                    self.assertTrue((evidence[0]/'test.log').is_file())
+                    self.assertEqual(api.deleted,[d.API+'/actions/artifacts/5'])
+
+    def test_native_incomplete_with_missing_or_inconsistent_evidence_is_unverifiable(self):
+        cases=[dict(stage_exit=0,xcode_exit=0),dict(log=False),dict(stage_exit=65,xcode_exit=1),dict(stage_exit=65,xcode_exit='65'),dict(stage_exit=65,xcode_exit=None),dict(stage_exit=True,xcode_exit=True),dict(bad_hash=True),dict(omit_exit=True)]
+        for case in cases:
+            with self.subTest(case=case):
+                api=FakeAPI(archive=zipdata(['key.enc','bundle.tgz.enc']))
+                with tempfile.TemporaryDirectory() as tmp:
+                    root=Path(tmp); work=root/RID; work.mkdir()
+                    descriptor=work/'request.json'; descriptor.write_text(json.dumps(REQ))
+                    with patch.object(d,'ROOT',root), patch.object(d,'token_from_config',return_value='fake'), patch.object(d,'Transport',return_value=api), patch.object(d,'decrypt',return_value=self.native_failure_bundle(**case)), contextlib.redirect_stdout(io.StringIO()) as output, contextlib.redirect_stderr(io.StringIO()):
+                        self.assertEqual(d.main(['fetch',str(descriptor)]),2)
+                    self.assertEqual(api.deleted,[])
+                    self.assertNotIn('DIAGNOSTIC_PASS',output.getvalue())
+
     def test_duplicate_request_on_later_page_is_rejected(self):
         class Pages(FakeAPI):
             def json(self,method,url,data=None):

@@ -135,6 +135,15 @@ def verify_manifest(root, req, run):
         order = [stages[k] for k in ('clone','toolchain','gradle','generate','simulator','test')]
         if ex['outcome'] == 'incomplete' and run['conclusion'] == 'failure':
             failures = [i for i,v in enumerate(order) if v is not None and v != 0]
+            result_path = root/'tests.xcresult'
+            if (order[:5] == [0]*5 and type(order[5]) is int and order[5] > 0 and
+                type(ex['xcode_exit']) is int and ex['xcode_exit'] == order[5] and
+                all(type(ex[k]) is int and ex[k] == 0 for k in ('passed','failed','skipped')) and
+                'test.log' in files and (root/'test.log').is_file() and
+                type(ex['xcresult_present']) is bool and
+                ((ex['xcresult_present'] and result_path.is_dir()) or
+                 (not ex['xcresult_present'] and not result_path.exists()))):
+                return 1
             if (len(failures) == 1 and failures[0] < 5 and all(v == 0 for v in order[:failures[0]]) and
                 all(v is None for v in order[failures[0]+1:]) and ex['xcode_exit'] is None and
                 ex['xcresult_present'] is False and all(ex[k] == 0 and type(ex[k]) is int for k in ('passed','failed','skipped'))):
