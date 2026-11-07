@@ -169,6 +169,8 @@ def _audit(source_root, source_sha, ref_sha256, ci_sha, debug_app, release_app, 
         if git(root, 'rev-parse', 'HEAD').strip() != source_sha.encode('ascii'):
             fail('GIT_HEAD_MISMATCH')
         source = read_bounded(root / profile['source_path'], 2 * 1024 * 1024)
+        if not source:
+            fail('SOURCE_EMPTY')
         blob = source_sha + ':' + profile['source_path']
         blob_size = git(root, 'cat-file', '-s', blob).strip()
         if not blob_size.isdigit() or int(blob_size) > 2 * 1024 * 1024:

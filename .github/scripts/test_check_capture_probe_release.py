@@ -98,6 +98,14 @@ class CaptureAuditTests(unittest.TestCase):
         self.assertEqual(result['status'], 'NOT_APPLICABLE')
         self.assertEqual(result['binary_result'], 'NOT_RUN')
 
+    def test_empty_tracked_source_fails_closed(self):
+        p = self.root / 'Synthetic.swift'
+        p.write_bytes(b'')
+        subprocess.run(['git', '-C', str(self.root), 'add', 'Synthetic.swift'], check=True)
+        subprocess.run(['git', '-C', str(self.root), '-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '-qm', 'empty'], check=True)
+        self.head = subprocess.check_output(['git', '-C', str(self.root), 'rev-parse', 'HEAD'], text=True).strip()
+        self.assertEqual(self.run_audit()['reason'], 'SOURCE_EMPTY')
+
     def test_slot_digest_rejected(self):
         self.profile['slots'][0] = (2, 'struct', '0' * 64)
         self.assertEqual(self.run_audit()['reason'], 'SOURCE_SLOT_INVALID')
@@ -124,11 +132,6 @@ class CaptureAuditTests(unittest.TestCase):
         self.head = '0' * 40
         self.assertEqual(self.run_audit()['status'], 'FAIL')
 
-
-if __name__ == '__main__':
-    unittest.main()
-
-class CaptureAuditFailureTests(CaptureAuditTests):
     def test_bad_plists_and_companions(self):
         plist = self.release / 'Info.plist'
         good = plist.read_bytes()
@@ -207,3 +210,78 @@ class CaptureAuditFailureTests(CaptureAuditTests):
         with mock.patch('sys.stderr', new_callable=__import__('io').StringIO) as err:
             self.assertEqual(audit.main(['--private-canary']), 2)
             self.assertNotIn('private-canary', err.getvalue())
+
+    def test_oversized_source_fails_before_git_blob_read(self):
+        p = self.root / 'Synthetic.swift'
+        with p.open('wb') as stream:
+            stream.truncate(2 * 1024 * 1024 + 1)
+        self.assertEqual(self.run_audit()['reason'], 'FILE_SIZE_INVALID')
+
+    def test_each_plist_field_is_checked_for_each_app(self):
+        expected = {'CFBundleIdentifier': 'com.radioshake.debug', 'CFBundleExecutable': 'RadioShake', 'DTPlatformName': 'iphonesimulator'}
+        for app, bundle in ((self.debug, 'com.radioshake.debug'), (self.release, 'com.radioshake')):
+            expected['CFBundleIdentifier'] = bundle
+            p = app / 'Info.plist'
+            original = p.read_bytes()
+            for field in expected:
+                with self.subTest(app=bundle, field=field):
+                    data = dict(expected)
+                    data[field] = 'wrong'
+                    p.write_bytes(plistlib.dumps(data))
+                    self.assertEqual(self.run_audit()['reason'], 'PLIST_INVALID')
+            p.write_bytes(original)
+
+    def test_swapped_artifacts_rejected(self):
+        self.debug, self.release = self.release, self.debug
+        self.assertEqual(self.run_audit()['reason'], 'PLIST_INVALID')
+
+    def test_equal_hash_guard_rejects_even_if_scan_reports_equal_hashes(self):
+        original = audit.scan
+        def scan_with_equal_hash(path, kind, markers):
+            result = original(path, kind, markers)
+            result['sha256'] = 'a' * 64
+            return result
+        with mock.patch.object(audit, 'scan', side_effect=scan_with_equal_hash):
+            self.assertEqual(self.run_audit()['reason'], 'IDENTICAL_BINARIES')
+
+    def test_receipt_leaf_symlink_rejected_without_touching_target(self):
+        target = self.root / 'target'
+        target.write_text('sentinel')
+        link = self.root / 'receipt'
+        link.symlink_to(target)
+        with self.assertRaises(audit.AuditError):
+            audit.write_receipt(link, {'status': 'FAIL'})
+        self.assertEqual(target.read_text(), 'sentinel')
+
+    def test_actual_source_binary_plist_and_exception_canaries_stay_private(self):
+        import io
+        receipt = self.root / 'receipt.json'
+        args = ['--source-root', str(self.root), '--source-sha', self.head, '--ref-sha256', 'b' * 64, '--ci-sha', 'c' * 40, '--debug-app', str(self.debug), '--release-app', str(self.release), '--receipt', str(receipt)]
+        def run():
+            with mock.patch.object(audit, 'PROFILE', self.profile), mock.patch('sys.stdout', new_callable=io.StringIO) as out, mock.patch('sys.stderr', new_callable=io.StringIO) as err:
+                status = audit.main(args)
+                return status, out.getvalue() + err.getvalue() + receipt.read_text()
+        # Source and binary marker are synthetic private canaries observed by real audit logic.
+        binary = self.release / 'RadioShake'
+        binary.write_bytes(binary.read_bytes() + self.markers[0])
+        status, output = run()
+        self.assertEqual(status, 1)
+        self.assertNotIn(self.markers[0].decode(), output)
+        self.assertNotIn(self.source.decode(), output)
+        self.assertNotIn(str(self.root), output)
+        binary.write_bytes(binary.read_bytes()[:-len(self.markers[0])])
+        plist = self.release / 'Info.plist'
+        data = plistlib.loads(plist.read_bytes())
+        data['CFBundleIdentifier'] = 'private-plist-canary'
+        plist.write_bytes(plistlib.dumps(data))
+        status, output = run()
+        self.assertEqual(status, 1)
+        self.assertNotIn('private-plist-canary', output)
+        with mock.patch.object(audit, 'audit', side_effect=RuntimeError('private-exception-canary')):
+            status, output = run()
+        self.assertEqual(status, 1)
+        self.assertNotIn('private-exception-canary', output)
+
+
+if __name__ == '__main__':
+    unittest.main()
