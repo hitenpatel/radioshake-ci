@@ -244,6 +244,21 @@ class CaptureAuditTests(unittest.TestCase):
         with mock.patch.object(audit, 'scan', side_effect=scan_with_equal_hash):
             self.assertEqual(self.run_audit()['reason'], 'IDENTICAL_BINARIES')
 
+    def test_input_symlink_then_parent_rejected(self):
+        alias = self.root / 'alias'
+        alias.symlink_to(self.root, target_is_directory=True)
+        self.debug = alias / '..' / self.debug.name
+        self.assertEqual(self.run_audit()['reason'], 'UNSAFE_PATH')
+
+    def test_receipt_symlink_then_parent_rejected_without_touching_target(self):
+        alias = self.root / 'alias'
+        alias.symlink_to(self.root, target_is_directory=True)
+        target = self.root / 'receipt'
+        target.write_text('sentinel')
+        with self.assertRaises(audit.AuditError):
+            audit.write_receipt(alias / '..' / 'receipt', {'status': 'FAIL'})
+        self.assertEqual(target.read_text(), 'sentinel')
+
     def test_receipt_leaf_symlink_rejected_without_touching_target(self):
         target = self.root / 'target'
         target.write_text('sentinel')

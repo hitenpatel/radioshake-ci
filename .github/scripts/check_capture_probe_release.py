@@ -46,6 +46,8 @@ def digest(data):
 
 
 def safe_path(path, directory=False):
+    if '..' in Path(path).parts:
+        fail('UNSAFE_PATH')
     path = Path(os.path.abspath(path))
     current = Path(path.anchor)
     for part in path.parts[1:]:
@@ -220,6 +222,8 @@ def audit(source_root, source_sha, ref_sha256, ci_sha, debug_app, release_app):
 
 
 def write_receipt(path, receipt):
+    if '..' in Path(path).parts:
+        fail('UNSAFE_PATH')
     path = Path(os.path.abspath(path))
     parent = safe_path(path.parent, directory=True)
     if os.path.lexists(path):
