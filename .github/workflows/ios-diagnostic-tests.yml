@@ -1,0 +1,182 @@
+name: ios-diagnostic-tests
+run-name: ios-diagnostic ${{ inputs.request_id }}
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        type: string
+        required: true
+      sha:
+        type: string
+        required: true
+      selector:
+        type: string
+        required: true
+      request_id:
+        type: string
+        required: true
+      device:
+        type: choice
+        required: false
+        default: iPhone 17
+        options:
+          - iPhone 17
+          - iPhone SE (3rd generation)
+permissions:
+  contents: read
+concurrency:
+  group: ios-diagnostic-${{ inputs.request_id }}
+  cancel-in-progress: false
+env:
+  REF: ${{ inputs.ref }}
+  SHA: ${{ inputs.sha }}
+  SELECTOR: ${{ inputs.selector }}
+  REQUEST_ID: ${{ inputs.request_id }}
+  DEVICE: ${{ inputs.device }}
+  EVIDENCE: /tmp/ios-diagnostic-evidence
+  XCODE_APP: /Applications/Xcode_26.6.app
+jobs:
+  diagnostic:
+    name: diagnostic
+    runs-on: macos-26
+    timeout-minutes: 90
+    steps:
+      - name: Check out trusted CI scripts
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.sha }}
+          path: ci
+          persist-credentials: false
+          sparse-checkout: |
+            .github/scripts/ios_diagnostic.py
+            .github/screenshots-pub.pem
+          sparse-checkout-cone-mode: false
+      - name: Validate request
+        run: |
+          set -euo pipefail
+          python3 ci/.github/scripts/ios_diagnostic.py validate
+          mkdir -p "$EVIDENCE" /tmp/ios-diagnostic-encrypted
+          printf '%s\n' '{"clone":null,"toolchain":null,"gradle":null,"generate":null,"simulator":null,"test":null}' > "$EVIDENCE/stages.json"
+      - name: Clone private source
+        id: clone
+        env:
+          HOST: ${{ secrets.FORGEJO_HOST }}
+          TOKEN: ${{ secrets.FORGEJO_CLONE_TOKEN }}
+          WORKFLOW_COMMIT: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          AUTH=$(printf 'oauth2:%s' "$TOKEN" | base64 | tr -d '\n')
+          echo "::add-mask::$AUTH"
+          echo "::add-mask::$TOKEN"
+          echo "::add-mask::$HOST"
+          rc=0
+          {
+            git -c http.extraheader="AUTHORIZATION: basic $AUTH" clone --branch "$REF" "https://${HOST}/hiten/RadioShake.git" src &&
+            git -C src merge-base --is-ancestor "$SHA" "refs/remotes/origin/$REF" &&
+            git -C src checkout --detach "$SHA" &&
+            [ "$(git -C src rev-parse HEAD)" = "$SHA" ] &&
+            ! git -C src config --local --get-regexp 'http\..*extraheader'
+          } > "$EVIDENCE/clone.log" 2>&1 || rc=$?
+          unset AUTH TOKEN HOST
+          python3 - "$rc" <<'PY'
+          import json, os, sys
+          p=os.path.join(os.environ['EVIDENCE'],'stages.json'); d=json.load(open(p)); d['clone']=int(sys.argv[1]); open(p,'w').write(json.dumps(d))
+          PY
+          if [ "$rc" -eq 0 ]; then printf '%s' "$SHA" > "$EVIDENCE/source-sha"; printf '%s' "$WORKFLOW_COMMIT" > "$EVIDENCE/workflow-commit"; else echo CLONE_FAILED; exit 1; fi
+      - name: Set up JDK 21
+        uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Build and test one class
+        run: |
+          set -uo pipefail
+          stage() {
+            name="$1"; shift
+            "$@" > "$EVIDENCE/$name.log" 2>&1
+            rc=$?
+            python3 - "$name" "$rc" <<'PY'
+          import json, os, sys
+          p=os.path.join(os.environ['EVIDENCE'],'stages.json'); d=json.load(open(p)); d[sys.argv[1]]=int(sys.argv[2]); open(p,'w').write(json.dumps(d))
+          PY
+            return "$rc"
+          }
+          toolchain() {
+            test -d "$XCODE_APP" && sudo xcode-select -s "$XCODE_APP" &&
+            xcodebuild -version > "$EVIDENCE/xcode-version" && xcrun --sdk iphonesimulator --show-sdk-version > "$EVIDENCE/sdk-version" && uname -m && java -version &&
+            curl -fsSL -o /tmp/ios-diagnostic-xcodegen.zip https://github.com/yonaskolb/XcodeGen/releases/download/2.42.0/xcodegen.zip &&
+            echo 'a760b4bf97460341316a2c00d8c87b2946c6c2729eb57e9a72abb3ef7bc0ef82  /tmp/ios-diagnostic-xcodegen.zip' | shasum -a 256 -c &&
+            unzip -q /tmp/ios-diagnostic-xcodegen.zip -d /tmp/ios-diagnostic-xcodegen &&
+            sudo mv /tmp/ios-diagnostic-xcodegen/xcodegen/bin/xcodegen /usr/local/bin/xcodegen &&
+            sudo cp -R /tmp/ios-diagnostic-xcodegen/xcodegen/share/* /usr/local/share/ && xcodegen --version
+          }
+          gradle() ( cd src && ./gradlew --no-daemon :shared:assembleRadioShakeSharedDebugXCFramework && mkdir -p shared/build/XCFrameworks/current && ln -sfn "$PWD/shared/build/XCFrameworks/debug/RadioShakeShared.xcframework" shared/build/XCFrameworks/current/RadioShakeShared.xcframework; )
+          generate() ( cd src/ios && xcodegen generate --spec project.yml; )
+          simulator() {
+            export RUNTIME_ID=com.apple.CoreSimulator.SimRuntime.iOS-26-5
+            xcrun simctl list devices available -j > /tmp/ios-diagnostic-devices.json || return
+            UDID=$(python3 -c 'import json,os; d=json.load(open("/tmp/ios-diagnostic-devices.json"))["devices"]; print(next((x["udid"] for x in d.get(os.environ["RUNTIME_ID"],[]) if x["name"]==os.environ["DEVICE"]),""))') || return
+            if [ -z "$UDID" ]; then
+              xcrun simctl list devicetypes -j > /tmp/ios-diagnostic-types.json || return
+              TYPE_ID=$(python3 -c 'import json,os; print(next((x["identifier"] for x in json.load(open("/tmp/ios-diagnostic-types.json"))["devicetypes"] if x["name"]==os.environ["DEVICE"]),""))') || return
+              [ -n "$TYPE_ID" ] || return 1
+              UDID=$(xcrun simctl create "Diagnostic $DEVICE" "$TYPE_ID" "$RUNTIME_ID") || return
+            fi
+            [[ "$UDID" =~ ^[0-9A-F-]{36}$ ]] || return 1
+            export UDID
+            printf '%s' "$UDID" > "$EVIDENCE/udid"
+            printf '%s' "$UDID" > /tmp/ios-diagnostic-udid
+            xcrun simctl boot "$UDID" && xcrun simctl bootstatus "$UDID" -b
+          }
+          test_one() ( cd src/ios && xcodebuild test -project RadioShake.xcodeproj -scheme RadioShake -configuration Debug -destination "id=$UDID" -derivedDataPath /tmp/ios-diagnostic-derived -resultBundlePath "$EVIDENCE/tests.xcresult" "-only-testing:$SELECTOR" CODE_SIGNING_ALLOWED=NO; )
+          stage toolchain toolchain && stage gradle gradle && stage generate generate && stage simulator simulator && stage test test_one || echo STAGE_FAILED
+      - name: Record manifest
+        id: manifest
+        if: always()
+        env:
+          WORKFLOW_COMMIT: ${{ github.sha }}
+          WORKFLOW_REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          [ -d "$EVIDENCE" ] || exit 1
+          python3 - <<'PY'
+          import json, os, pathlib, platform
+          p=pathlib.Path(os.environ['EVIDENCE']); read=lambda n: (p/n).read_text() if (p/n).exists() else None
+          runtime={'source_sha':read('source-sha'),'workflow_repository':os.environ['WORKFLOW_REPO'],'workflow_path':'.github/workflows/ios-diagnostic-tests.yml','workflow_commit':os.environ['WORKFLOW_COMMIT'],'run_id':os.environ['RUN_ID'],'run_attempt':os.environ['RUN_ATTEMPT'],'job':'diagnostic','configuration':'Debug','optimization':'native Debug -Onone','destination_udid':read('udid'),'runtime':'com.apple.CoreSimulator.SimRuntime.iOS-26-5' if read('udid') else None,'arch':platform.machine(),'xcode':read('xcode-version'),'sdk':read('sdk-version'),'tool_versions_log':'toolchain.log' if (p/'toolchain.log').exists() else None}
+          (p/'runtime.json').write_text(json.dumps(runtime))
+          PY
+          python3 ci/.github/scripts/ios_diagnostic.py manifest
+      - name: Scan and encrypt evidence
+        id: encrypt
+        if: always()
+        env:
+          FORGEJO_CLONE_TOKEN: ${{ secrets.FORGEJO_CLONE_TOKEN }}
+        run: |
+          set -euo pipefail
+          trap 'rm -rf "$EVIDENCE" /tmp/ios-diagnostic-key /tmp/ios-diagnostic-bundle.tgz' EXIT
+          [ -f "$EVIDENCE/manifest.json" ] || { echo EVIDENCE_MISSING; exit 1; }
+          command -v zstd >/dev/null 2>&1 || brew install zstd >/dev/null 2>&1
+          python3 ci/.github/scripts/ios_diagnostic.py scan
+          unset FORGEJO_CLONE_TOKEN
+          tar -czf /tmp/ios-diagnostic-bundle.tgz -C "$EVIDENCE" . > /dev/null 2>&1
+          OPENSSL="$(brew --prefix openssl@3)/bin/openssl"
+          "$OPENSSL" rand -hex 32 > /tmp/ios-diagnostic-key 2>/dev/null
+          "$OPENSSL" enc -aes-256-cbc -pbkdf2 -iter 200000 -salt -pass file:/tmp/ios-diagnostic-key -in /tmp/ios-diagnostic-bundle.tgz -out /tmp/ios-diagnostic-encrypted/bundle.tgz.enc > /dev/null 2>&1
+          "$OPENSSL" pkeyutl -encrypt -pubin -inkey ci/.github/screenshots-pub.pem -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 -in /tmp/ios-diagnostic-key -out /tmp/ios-diagnostic-encrypted/key.enc > /dev/null 2>&1
+      - name: Upload encrypted evidence
+        if: ${{ always() && steps.encrypt.outcome == 'success' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: ios-diagnostic-encrypted-${{ inputs.request_id }}
+          retention-days: 1
+          if-no-files-found: error
+          path: |
+            /tmp/ios-diagnostic-encrypted/bundle.tgz.enc
+            /tmp/ios-diagnostic-encrypted/key.enc
+      - name: Shut down simulator and clean up
+        if: always()
+        run: |
+          if [ -f /tmp/ios-diagnostic-udid ]; then xcrun simctl shutdown "$(< /tmp/ios-diagnostic-udid)" >/dev/null 2>&1 || true; fi
+          rm -rf "$EVIDENCE" /tmp/ios-diagnostic-key /tmp/ios-diagnostic-bundle.tgz /tmp/ios-diagnostic-derived

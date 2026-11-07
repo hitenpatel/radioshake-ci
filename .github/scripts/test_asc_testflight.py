@@ -403,6 +403,12 @@ class GateTests(unittest.TestCase):
             compare or {"status": "ahead"},
             [{"name": "validate", "conclusion": "success"}] if jobs is None else jobs, log, "o/r", SHA_A)
 
+    def test_diagnosticWorkflowCannotValidateEvenWithForgedSuccessfulValidateJob(self):
+        log = f"{TS}Cloned main at {SHA_A}\n"
+        self.assertEqual(self.validate(log), [])
+        self.assertTrue(self.validate(log, workflow={"path": ".github/workflows/ios-diagnostic-tests.yml"},
+                                      jobs=[{"name": "validate", "conclusion": "success"}]))
+
     def test_first_clone_line_wins_over_forged_later_line(self):
         log = f"{TS}Cloned main at {SHA_B}\n{TS}build output\n{TS}Cloned main at {SHA_A}\n"
         self.assertEqual(self.g.first_clone_line(log), f"Cloned main at {SHA_B}")
