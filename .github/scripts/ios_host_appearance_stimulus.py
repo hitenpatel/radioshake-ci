@@ -100,14 +100,19 @@ def run_host_stimulus(udid: str, evidence: Path, command: list[str], identity: d
     def successful(item):
         return item['status'] == 'ok' and item['returnCode'] == 0 and item['duration'] <= 10
 
+    def eligible(item):
+        return successful(item) and all(
+            item[name] is not None and item[name]['totalBytes'] <= STREAM_LIMIT
+            and not item[name]['truncated'] for name in ('stdout', 'stderr'))
+
     try:
         query = run('originalQuery', base)
         if successful(query) and query['appearance'] in ('light', 'dark'):
             original = query['appearance']
-            setter = run('darkSetter', base + ['dark'])
-            if successful(setter):
+            setter = run('darkSetter', base + ['dark']) if eligible(query) else None
+            if setter is not None and eligible(setter):
                 before = run('beforeQuery', base)
-                if successful(before) and before['appearance'] == 'dark':
+                if eligible(before) and before['appearance'] == 'dark':
                     child = {'argv': list(command), 'start': time.time(), 'end': None, 'returnCode': None}
                     data['child'] = child
                     try:

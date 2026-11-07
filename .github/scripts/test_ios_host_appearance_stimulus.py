@@ -128,19 +128,20 @@ class HostTests(unittest.TestCase):
         self.assertEqual(result['duration'], 10)
 
     def test_sidecar_overflow_fallback_is_incomplete(self):
-        # A long identity forces the bounded same-schema fallback while fitting it.
-        identity = dict(IDENTITY, requestId='r' * 7000)
+        selector = 'RadioShakeUITests/HostAppearanceStimulusUITests/test_hostDark_beforeInvocation_noModifier_coldReference'
+        udid = '23C8F95C-765D-46A9-AE82-0BEE2921C8D7'
+        identity = {'requestId':'12345678-1234-4234-8234-123456789abc', 'sourceSHA':'a'*40,
+                    'workflowSHA':'b'*40, 'selector':selector, 'destinationUDID':udid}
+        native = ['xcodebuild','test','-project','RadioShake.xcodeproj','-scheme','RadioShake','-configuration','Debug','-destination','id='+udid,'-derivedDataPath','/tmp/ios-diagnostic-derived','-resultBundlePath','/tmp/ios-diagnostic-evidence/tests.xcresult','-only-testing:'+selector,'CODE_SIGNING_ALLOWED=NO']
         def command(argv):
-            value = 'light' if len(self.calls) in (0, 5) else 'dark'
-            self.calls.append(argv)
-            return record(argv, value * 300)
-        # Preserve parseable query values while retaining large actual streams.
-        def bounded(argv):
-            i = len(self.calls)
-            result = command(argv)
-            result['appearance'] = 'light' if i in (0, 5) else 'dark'
-            return result
-        rc = host.run_host_stimulus('device', self.path, ['native'], identity, run_command=bounded, run_child=lambda _: 65)
+            i = len(self.calls); self.calls.append(argv)
+            value = 'light' if i in (0,5) else 'dark'
+            item = record(argv, value)
+            raw = value.encode() + b' '*(1024-len(value))
+            item['stdout'] = {'prefixBase64':base64.b64encode(raw).decode(),'totalBytes':1024,'truncated':False}
+            item['stderr'] = {'prefixBase64':base64.b64encode(b'x'*1024).decode(),'totalBytes':1024,'truncated':False}
+            return item
+        rc = host.run_host_stimulus(udid, self.path, native, identity, run_command=command, run_child=lambda _: 65)
         data = json.loads((self.path / 'host-appearance-stimulus.json').read_text())
         self.assertEqual(rc, 65)
         self.assertTrue(data['outputOmitted'])
@@ -151,6 +152,44 @@ class HostTests(unittest.TestCase):
             self.assertEqual(item['stdout']['prefixBase64'], '')
             self.assertTrue(item['stdout']['truncated'])
             self.assertGreater(item['stdout']['totalBytes'], 0)
+
+    def test_preflight_stream_bounds_stop_before_child_and_preserve_cleanup(self):
+        base = ['xcrun','simctl','ui','device','appearance']
+        for slot in (0,1,2):
+            for stream in ('stdout','stderr'):
+                for kind in ('overflow','unavailable'):
+                    with self.subTest(slot=slot,stream=stream,kind=kind):
+                        self.calls = []
+                        def command(argv):
+                            index = len(self.calls); self.calls.append(argv)
+                            value = 'light' if index in (0, slot+2 if slot < 2 else 4) else 'dark'
+                            item = record(argv, value)
+                            if index == slot:
+                                item[stream] = None if kind == 'unavailable' else {'prefixBase64':base64.b64encode(b'x'*1024).decode(), 'totalBytes':1025, 'truncated':True}
+                                if stream == 'stdout' and kind == 'overflow': item['appearance'] = None
+                            return item
+                        started = []
+                        rc = host.run_host_stimulus('device', self.path, ['native'], IDENTITY, run_command=command, run_child=lambda _: started.append(True) or 0)
+                        data = json.loads((self.path/'host-appearance-stimulus.json').read_text())
+                        self.assertEqual((rc, data['child'], started), (74, None, []))
+                        known = not (slot == 0 and stream == 'stdout' and kind == 'overflow')
+                        self.assertEqual(data['commands']['restoreSetter']['status'] != 'notAttempted', known)
+                        if known: self.assertEqual(self.calls[-2], base+['light'])
+
+    def test_exact_1024_preflight_streams_allow_child(self):
+        self.calls = []
+        def command(argv):
+            index = len(self.calls); self.calls.append(argv)
+            text = 'light' if index in (0,5) else 'dark'
+            item = record(argv, text)
+            raw = text.encode() + b' '*(1024-len(text))
+            item['stdout'] = {'prefixBase64':base64.b64encode(raw).decode(), 'totalBytes':1024, 'truncated':False}
+            item['stderr'] = {'prefixBase64':base64.b64encode(b'x'*1024).decode(), 'totalBytes':1024, 'truncated':False}
+            return item
+        calls = []
+        rc = host.run_host_stimulus('device', self.path, ['native'], IDENTITY, run_command=command, run_child=lambda _: calls.append(True) or 65)
+        self.assertEqual((rc,calls), (65,[True]))
+        self.assertEqual(json.loads((self.path/'host-appearance-stimulus.json').read_text())['child']['returnCode'], 65)
 
     def test_command_exception_preserves_actual_elapsed_and_overrun(self):
         answers = iter([OSError('failed'), ('light',)])
