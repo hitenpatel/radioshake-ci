@@ -27,6 +27,27 @@ def suite(cls='ExampleTests', result='passed', count=1, failures=0):
             f"\t Executed {count} tests, with {failures} failures (0 unexpected) in 0.001 (0.002) seconds\n")
 
 class DiagnosticTests(unittest.TestCase):
+    def test_selected_manifest_validates_before_reporting_native_result(self):
+        from test_ios_appearance_boundary import ObserverTests, UDID
+        observer=ObserverTests(); self.addCleanup(observer.doCleanups)
+        selector='RadioShakeUITests/ThemeUITests/test_system_coldUnforcedLaunch_onDarkDevice'
+        for rc in (0,65):
+            root,env,_,_,_,_=observer.exercise(duration=3,code=rc)
+            (root/'tests.xcresult').mkdir(); (root/'attachments-export.log').write_text('export')
+            (root/'runtime.json').write_text(json.dumps({'destination_udid':UDID}))
+            (root/'stages.json').write_text(json.dumps(dict(clone=0,toolchain=0,gradle=0,generate=0,simulator=0,test=rc,attachments=0)))
+            result='passed' if rc==0 else 'failed'
+            (root/'test.log').write_text(case('test_system_coldUnforcedLaunch_onDarkDevice',cls='ThemeUITests',result=result,module='RadioShakeUITests')+suite('ThemeUITests',result=result,failures=int(rc!=0)))
+            with mock.patch.dict(os.environ,{**env,'EVIDENCE':str(root)}), mock.patch.object(sys,'argv',['ios_diagnostic.py','manifest']), contextlib.redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(d.main(),int(rc!=0))
+            self.assertIn('DIAGNOSTIC_'+result.upper(),output.getvalue())
+            (root/'appearance-boundary/status.json').unlink()
+            with mock.patch.dict(os.environ,{**env,'EVIDENCE':str(root)}), mock.patch.object(sys,'argv',['ios_diagnostic.py','manifest']), contextlib.redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(d.main(),1)
+            self.assertIn('DIAGNOSTIC_ERROR',output.getvalue())
+            self.assertNotIn('DIAGNOSTIC_PASSED',output.getvalue())
+            self.assertTrue((root/'manifest.json').is_file())
+
     def inputs(self, **kw):
         args = dict(ref=REF, sha=SHA, selector=SELECTOR, request_id=UUID, device='iPhone 17')
         args.update(kw)
@@ -136,6 +157,29 @@ class DiagnosticTests(unittest.TestCase):
             self.assertNotIn(s,output.getvalue())
 
 class StructureTests(unittest.TestCase):
+    def test_workflow_wraps_only_exact_method_without_changing_native_arguments(self):
+        import yaml
+        workflow=yaml.safe_load((Path(__file__).resolve().parents[1]/'workflows'/'ios-diagnostic-tests.yml').read_text())
+        script=next(s['run'] for s in workflow['jobs']['diagnostic']['steps'] if s.get('name')=='Build and test one class')
+        function=next(line.strip() for line in script.splitlines() if line.strip().startswith('test_one()'))
+        selected='RadioShakeUITests/ThemeUITests/test_system_coldUnforcedLaunch_onDarkDevice'
+        udid='12345678-1234-4234-8234-123456789ABC'
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp); (root/'src/ios').mkdir(parents=True); (root/'bin').mkdir()
+            for executable in ('python3','xcodebuild'):
+                stub=root/'bin'/executable
+                stub.write_text('#!/bin/sh\nprintf "%s\\n" "$0" "$@" > "$CALLS"\nexit 65\n'); stub.chmod(0o755)
+            for selector in (selected,'RadioShakeUITests/ThemeUITests/test_other'):
+                env={**os.environ,'PATH':str(root/'bin')+os.pathsep+os.environ['PATH'],'GITHUB_WORKSPACE':str(root),'CALLS':str(root/'calls'),'UDID':udid,'EVIDENCE':str(root/'evidence'),'SELECTOR':selector}
+                result=subprocess.run(['bash','-u','-c',function+'\ntest_one'],cwd=root,env=env,capture_output=True,text=True)
+                self.assertEqual(result.returncode,65,result.stderr)
+                args=(root/'calls').read_text().splitlines()
+                native=['xcodebuild','test','-project','RadioShake.xcodeproj','-scheme','RadioShake','-configuration','Debug','-destination','id='+udid,'-derivedDataPath','/tmp/ios-diagnostic-derived','-resultBundlePath',str(root/'evidence/tests.xcresult'),'-only-testing:'+selector,'CODE_SIGNING_ALLOWED=NO']
+                if selector == selected:
+                    self.assertEqual(args,[str(root/'bin/python3'),str(root/'ci/.github/scripts/ios_appearance_boundary.py'),udid,str(root/'evidence'),'--']+native)
+                else:
+                    self.assertEqual(args,[str(root/'bin/xcodebuild')]+native[1:])
+
     def test_private_attachment_export_runs_for_present_results(self):
         import yaml
         wf=yaml.safe_load((Path(__file__).resolve().parents[1]/'workflows'/'ios-diagnostic-tests.yml').read_text())

@@ -20,6 +20,7 @@ import uuid
 import zipfile
 
 from ios_diagnostic import validate_inputs
+from ios_appearance_boundary import SELECTOR as BOUNDARY_SELECTOR, validate_boundary_evidence
 
 REPO = 'hitenpatel/radioshake-ci'
 WORKFLOW = '.github/workflows/ios-diagnostic-tests.yml'
@@ -131,6 +132,8 @@ def verify_manifest(root, req, run):
         if m['schema_version'] != 1 or m['inputs'] != expected or any(rt.get(k)!=v for k,v in fields.items()): raise DiagnosticError()
         files={str(p.relative_to(root)):hashlib.sha256(p.read_bytes()).hexdigest() for p in root.rglob('*') if p.is_file() and p != root/'manifest.json'}
         if files != m['file_hashes']: raise DiagnosticError()
+        if req['selector'] == BOUNDARY_SELECTOR:
+            validate_boundary_evidence(root, expected, rt, ex['xcode_exit'])
         base_stages = {'clone','toolchain','gradle','generate','simulator','test'}
         legacy = req['workflow_sha'] == '602eda30c1330ee9c89ace87e4772c3d9b8fbf1c' and set(stages) == base_stages
         if not legacy and set(stages) != base_stages | {'attachments'}: raise DiagnosticError()

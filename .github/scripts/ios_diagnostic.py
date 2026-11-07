@@ -11,6 +11,7 @@ import subprocess
 import sys
 import uuid
 from pathlib import Path
+from ios_appearance_boundary import SELECTOR as BOUNDARY_SELECTOR, validate_boundary_evidence
 
 SELECTOR = re.compile(r'(RadioShakeTests|RadioShakeUITests)/([A-Za-z_][A-Za-z0-9_]*)(?:/([A-Za-z_][A-Za-z0-9_]*))?')
 CASE = re.compile(r"^Test Case '-\[(?:(RadioShakeTests|RadioShakeUITests)\.)?([A-Za-z_][A-Za-z0-9_]*) ([A-Za-z_][A-Za-z0-9_]*)\]' (passed|failed|skipped) \([0-9.]+ seconds\)\.$")
@@ -114,6 +115,8 @@ def main():
             print('DIAGNOSTIC_ERROR'); return 1
         if not execution['xcresult_present'] and ('attachments' not in stages or stages['attachments'] is not None):
             print('DIAGNOSTIC_ERROR'); return 1
+        if inputs['selector'] == BOUNDARY_SELECTOR:
+            validate_boundary_evidence(root, inputs, runtime, execution['xcode_exit'])
         print_summary(execution)
         return 0 if execution['outcome'] == 'passed' and all(v == 0 for v in stages.values()) else 1
     except Exception:

@@ -49,6 +49,7 @@ jobs:
           persist-credentials: false
           sparse-checkout: |
             .github/scripts/ios_diagnostic.py
+            .github/scripts/ios_appearance_boundary.py
             .github/screenshots-pub.pem
           sparse-checkout-cone-mode: false
       - name: Validate request
@@ -137,7 +138,7 @@ jobs:
             esac
             xcrun simctl bootstatus "$UDID" -b
           }
-          test_one() ( cd src/ios && xcodebuild test -project RadioShake.xcodeproj -scheme RadioShake -configuration Debug -destination "id=$UDID" -derivedDataPath /tmp/ios-diagnostic-derived -resultBundlePath "$EVIDENCE/tests.xcresult" "-only-testing:$SELECTOR" CODE_SIGNING_ALLOWED=NO; )
+          test_one() ( cd src/ios || return; if [ "$SELECTOR" = 'RadioShakeUITests/ThemeUITests/test_system_coldUnforcedLaunch_onDarkDevice' ]; then set -- python3 "$GITHUB_WORKSPACE/ci/.github/scripts/ios_appearance_boundary.py" "$UDID" "$EVIDENCE" --; else set --; fi; "$@" xcodebuild test -project RadioShake.xcodeproj -scheme RadioShake -configuration Debug -destination "id=$UDID" -derivedDataPath /tmp/ios-diagnostic-derived -resultBundlePath "$EVIDENCE/tests.xcresult" "-only-testing:$SELECTOR" CODE_SIGNING_ALLOWED=NO; )
           stage toolchain toolchain && stage gradle gradle && stage generate generate && stage simulator simulator && stage test test_one || echo STAGE_FAILED
       - name: Export attachments
         if: always()
