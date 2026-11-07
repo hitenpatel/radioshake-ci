@@ -81,10 +81,12 @@ def _bounded_command(argv, timeout):
     return dict(returncode=process.returncode, timedOut=timed_out, **decoded,
                 stdoutTruncated=truncated['stdout'], stderrTruncated=truncated['stderr'])
 
-def appearance_query(udid, timeout):
+def appearance_query(udid, timeout, deadline=None):
     _udid(udid)
     argv = ['xcrun', 'simctl', 'ui', udid, 'appearance']
     start = dict(wall=time.time(), monotonic=time.monotonic())
+    if deadline is not None: timeout=min(timeout,deadline-start['monotonic'])
+    if timeout <= 0: return None
     try:
         result = _bounded_command(argv, timeout)
     except Cancelled:
@@ -96,7 +98,7 @@ def appearance_query(udid, timeout):
     value = result['stdout'].strip().lower()
     parsed = value if result['returncode'] == 0 and not result['timedOut'] and value in ('light', 'dark') else 'unknown'
     jump = abs((end['wall']-start['wall'])-(end['monotonic']-start['monotonic'])) > 0.25
-    return dict(argv=argv, udid=udid, hostPID=os.getpid(), start=start, end=end, wallClockDivergence=jump,
+    return dict(argv=argv, udid=udid, hostPID=os.getpid(), start=start, end=end, wallClockDivergence=jump, requestedTimeout=timeout,
                 appearance=parsed, **result)
 
 def scalar(value, present=True):
@@ -160,19 +162,34 @@ def _configuration(udid, directory):
         comparison['bundleIdentityMatch'] = built['values']['CFBundleIdentifier'] == installed['values']['CFBundleIdentifier']
     return comparison
 
-def _trigger(path, offset):
+def _trigger(path, offset, state, deadline=None):
+    """Scan incrementally, keeping only a bounded candidate line between polls."""
     try:
         with path.open('rb') as log:
             log.seek(offset)
-            while True:
-                position = log.tell(); line = log.readline(4097)
-                if not line: return None, position
-                if not line.endswith(b'\n'):
+            budget=65536
+            while budget and (deadline is None or time.monotonic() < deadline):
+                position=log.tell()
+                if 'line_start' not in state: state['line_start']=position
+                chunk=log.readline(min(4096,budget))
+                if not chunk:
+                    state['hasMore']=False
                     return None, position
-                if (line.startswith(b"Test Suite 'Selected tests' started") or
-                    line.startswith(b"Test Suite 'ThemeUITests' started")):
-                    return {'line':line[:4096].decode('utf-8','replace'), 'offset':position,
-                            'detected':{'wall':time.time(), 'monotonic':time.monotonic()}}, log.tell()
+                budget-=len(chunk)
+                if not state.get('discard',False):
+                    pending=state.get('pending',b'')+chunk
+                    if len(pending)>4096:
+                        state['discard']=True; state.pop('pending',None)
+                    else: state['pending']=pending
+                if chunk.endswith(b'\n'):
+                    line=state.get('pending',b''); line_start=state['line_start']
+                    state.clear()
+                    if (line.startswith(b"Test Suite 'Selected tests' started") or
+                        line.startswith(b"Test Suite 'ThemeUITests' started")):
+                        return {'line':line.decode('utf-8','replace'), 'offset':line_start,
+                                'detected':{'wall':time.time(), 'monotonic':time.monotonic()}}, log.tell()
+            state['hasMore']=budget == 0
+            return None,log.tell()
     except FileNotFoundError:
         return None, offset
 
@@ -202,7 +219,12 @@ def run(udid, evidence, command):
         nonlocal previous_sample
         remaining=deadline-time.monotonic()
         if remaining <= 0: return None
-        result=appearance_query(udid,min(2,remaining)); result['phase']=kind
+        timeout=min(2,remaining)
+        result=appearance_query(udid,timeout,deadline)
+        if result is None: return None
+        result['phase']=kind
+        result['durationOverrun']=result['end']['monotonic']-result['start']['monotonic'] > 2
+        result['deadlineOverrun']=result['end']['monotonic'] > deadline
         result['wallClockDivergenceSincePrevious'] = bool(previous_sample and abs(
             (result['start']['wall']-previous_sample['end']['wall']) -
             (result['start']['monotonic']-previous_sample['end']['monotonic'])) > 0.25)
@@ -234,18 +256,19 @@ def run(udid, evidence, command):
         else:
             status['capability']='unknown'
         native=subprocess.Popen(command, start_new_session=True)
-        next_query=time.monotonic()+10; fast_end=None; offset=0
+        next_query=time.monotonic()+10; fast_end=None; offset=0; scan_state={}
         status['cadenceTransitions'].append({'kind':'coarse','monotonic':time.monotonic()})
         while native.poll() is None:
             now=time.monotonic()
             if now >= deadline: status['termination']='deadline'; break
             if fast_end is not None and now >= fast_end: status['termination']='fastWindowEnded'; break
             if status['trigger'] is None:
-                trigger,offset=_trigger(evidence/'test.log',offset)
+                trigger,offset=_trigger(evidence/'test.log',offset,scan_state,min(deadline,next_query))
                 if trigger:
                     detected=trigger['detected']['monotonic']
                     status['trigger']=trigger; fast_end=detected+120; next_query=detected
                     status['cadenceTransitions'].append({'kind':'fast','monotonic':detected})
+                now=time.monotonic()
             if now >= next_query:
                 kind='fast' if fast_end is not None else 'coarse'
                 if sum(status['counts'].values()) >= MAX_RECORDS:
@@ -257,13 +280,16 @@ def run(udid, evidence, command):
                     status['termination']='deadline'; break
                 next_query=max(record['start']['monotonic']+(1 if kind=='fast' else 10), time.monotonic())
             else:
+                if status['trigger'] is None and scan_state.pop('hasMore',False):
+                    continue
                 try: native.wait(timeout=min(1, max(0, next_query-now), max(0,deadline-now)))
                 except subprocess.TimeoutExpired: pass
         if status['termination'] == 'initializing': status['termination']='invocationEnded'
         rc=native.wait()
         if time.monotonic() >= deadline: status['finalRead']='notAttemptedDeadline'
         elif sum(status['counts'].values()) >= MAX_RECORDS: status['finalRead']='notAttemptedBudget'
-        elif sample('invocationEnd'): status['finalRead']='attemptedAfterInvocationAndTeardown'
+        else:
+            status['finalRead']='attemptedAfterInvocationAndTeardown' if sample('invocationEnd') else 'notAttemptedDeadline'
         status['observerExit']='complete'
     except Cancelled:
         cancelled=True; status['termination']='cancelled'
@@ -327,13 +353,19 @@ def validate_boundary_evidence(root, inputs, runtime, native_exit):
             entry=json.loads(line); phase=entry['phase']; observed[phase]+=1
             if entry['udid'] != udid or entry['argv'] != ['xcrun','simctl','ui',udid,'appearance'] or entry['appearance'] not in ('light','dark','unknown'): raise ValueError()
             if len(entry['stdout'].encode()) > 4096 or len(entry['stderr'].encode()) > 4096: raise ValueError()
-            if any(type(entry[k]) is not bool for k in ('timedOut','stdoutTruncated','stderrTruncated','wallClockDivergence','wallClockDivergenceSincePrevious')): raise ValueError()
+            if any(type(entry[k]) is not bool for k in ('timedOut','stdoutTruncated','stderrTruncated','wallClockDivergence','wallClockDivergenceSincePrevious','durationOverrun','deadlineOverrun')): raise ValueError()
             if entry['returncode'] is not None and type(entry['returncode']) is not int: raise ValueError()
             if type(entry['hostPID']) is not int or entry['hostPID'] <= 0: raise ValueError()
             for bracket in ('start','end'):
                 if any(type(entry[bracket][key]) not in (int,float) or not math.isfinite(entry[bracket][key]) for key in ('wall','monotonic')): raise ValueError()
             start=entry['start']['monotonic']; end=entry['end']['monotonic']
-            if end < start or (previous_end is not None and start < previous_end) or start >= status['deadlineMonotonic']: raise ValueError()
+            requested=entry['requestedTimeout']
+            if type(requested) not in (int,float) or not math.isfinite(requested) or not 0 < requested <= 2: raise ValueError()
+            if requested > status['deadlineMonotonic']-start: raise ValueError()
+            duration_overrun=end-start > 2
+            deadline_overrun=end > status['deadlineMonotonic']
+            if entry['durationOverrun'] != duration_overrun or entry['deadlineOverrun'] != deadline_overrun: raise ValueError()
+            if end < start or duration_overrun or deadline_overrun or (previous_end is not None and start < previous_end) or start >= status['deadlineMonotonic']: raise ValueError()
             if start < status['startedMonotonic']: raise ValueError()
             if phase in ('coarse','fast'):
                 cadence=10 if phase=='coarse' else 1
@@ -392,6 +424,71 @@ def validate_boundary_evidence(root, inputs, runtime, native_exit):
     except Exception:
         raise BoundaryValidationError() from None
 
+def _validate_context(context):
+    defaults_keys={'theme_mode','AppleInterfaceStyle','UIUserInterfaceStyle','NSInterfaceStyle','AppleInterfaceStyleSwitchesAutomatically'}
+    env_base=defaults_keys-{'theme_mode'}
+    env_keys=env_base | {'SIMCTL_CHILD_'+key for key in env_base}
+    bundle_keys={'bundleIdentifier','CFBundleVersion','CFBundleShortVersionString','UIUserInterfaceStyle'}
+    option_keys={'-RSForceColorScheme','-RSKeepTheme','-AppleInterfaceStyle','-UIUserInterfaceStyle','-NSInterfaceStyle','-AppleInterfaceStyleSwitchesAutomatically'}
+    def scalar_value(item):
+        if not isinstance(item,dict): raise ValueError()
+        state=item.get('state')
+        if state=='absent':
+            if set(item) != {'state'}: raise ValueError()
+        elif state=='unsupported':
+            if set(item) != {'state','type'} or not isinstance(item['type'],str) or len(item['type'].encode()) > 256: raise ValueError()
+        elif state=='value':
+            kind=item.get('type'); value=item.get('value')
+            if kind=='string':
+                if set(item) != {'state','type','value','truncated'} or not isinstance(value,str) or len(value.encode()) > 256 or type(item['truncated']) is not bool: raise ValueError()
+            elif kind=='bool':
+                if set(item) != {'state','type','value'} or type(value) is not bool: raise ValueError()
+            elif kind=='integer':
+                if set(item) != {'state','type','value'} or type(value) is not int: raise ValueError()
+            elif kind=='number':
+                if set(item) != {'state','type','value'} or type(value) not in (int,float) or not math.isfinite(value): raise ValueError()
+            else: raise ValueError()
+        else: raise ValueError()
+    def scalar_map(item,keys):
+        if not isinstance(item,dict) or set(item) != keys: raise ValueError()
+        for value in item.values(): scalar_value(value)
+    def truncated(item): return item == {'state':'truncated'}
+    if set(context) != {'pid','storeMode','bundle','arguments','environment','defaults','start','end'}: raise ValueError()
+    if type(context['pid']) is not int or context['pid'] <= 0 or not isinstance(context['storeMode'],str) or len(context['storeMode'].encode())>256: raise ValueError()
+    for bracket in ('start','end'):
+        value=context[bracket]
+        if not isinstance(value,dict) or set(value) != {'wall','uptime'} or any(type(value[k]) not in (int,float) or not math.isfinite(value[k]) for k in value): raise ValueError()
+    if not truncated(context['bundle']): scalar_map(context['bundle'],bundle_keys)
+    if not truncated(context['environment']):
+        scalar_map(context['environment'],env_keys)
+        for item in context['environment'].values():
+            if item['state'] not in ('absent','value') or (item['state']=='value' and item['type']!='string'): raise ValueError()
+    defaults=context['defaults']
+    if not truncated(defaults):
+        if not isinstance(defaults,dict) or set(defaults) != {'effective','app','global','argument','registration'}: raise ValueError()
+        scalar_map(defaults['effective'],defaults_keys)
+        for name in ('app','global','argument','registration'):
+            domain=defaults[name]
+            if domain == {'state':'absent'}: continue
+            if not isinstance(domain,dict) or set(domain) != {'state','values'} or domain['state'] != 'present': raise ValueError()
+            scalar_map(domain['values'],defaults_keys)
+    args=context['arguments']
+    if not truncated(args):
+        if not isinstance(args,dict) or set(args) != {'occurrences','total','truncated','fixtureEndpoints','skipOnboarding'}: raise ValueError()
+        if any(type(args[k]) is not bool for k in ('truncated','fixtureEndpoints','skipOnboarding')): raise ValueError()
+        occurrences=args['occurrences']; total=args['total']
+        if not isinstance(occurrences,list) or len(occurrences)>16 or type(total) is not int or total<len(occurrences): raise ValueError()
+        if args['truncated'] != (total>len(occurrences)) or (args['truncated'] and len(occurrences)!=16): raise ValueError()
+        previous=-1
+        for entry in occurrences:
+            if not isinstance(entry,dict) or set(entry) != {'index','option','value'} or type(entry['index']) is not int or entry['index'] <= previous or entry['option'] not in option_keys: raise ValueError()
+            previous=entry['index']
+            if entry['option']=='-RSKeepTheme':
+                if entry['value'] != {'state':'flag'}: raise ValueError()
+            else:
+                scalar_value(entry['value'])
+                if entry['value']['state'] not in ('absent','value') or (entry['value']['state']=='value' and entry['value']['type']!='string'): raise ValueError()
+
 def validate_runner_attachments(root,udid):
     try:
         directory=Path(root)/'attachments'
@@ -422,35 +519,29 @@ def validate_runner_attachments(root,udid):
             'test_system_coldUnforcedLaunch_onDarkDevice'}
         for sequence,phase in enumerate(phases,1):
             record=selected[phase]
+            base={'phase','sequence','pid','testName','matcherSelfCheck','device'}
+            if phase in ('attachedSettings','effectiveCheckpoint'):
+                base |= {'effective','effectiveExists','effectiveTruncated','systemSelected','systemSelectionExists','boundary','boundaryTruncated'}
+            if phase=='effectiveCheckpoint': base.add('waitResult')
+            if set(record) != base: raise ValueError()
             if (record.get('phase') != phase or record.get('testName') not in accepted or
                 record.get('matcherSelfCheck') is not True or record.get('sequence') != sequence or
                 type(record.get('pid')) is not int or record['pid'] <= 0): raise ValueError()
             device=record['device']
-            if type(device['raw']) is not int or not isinstance(device['interpretation'],str): raise ValueError()
+            if set(device) != {'raw','interpretation','start','end','clockBackward','wallClockDivergence'} or type(device['raw']) is not int or device['interpretation'] not in ('light','dark','unknown'): raise ValueError()
+            if type(device['clockBackward']) is not bool or type(device['wallClockDivergence']) is not bool: raise ValueError()
             for bracket in ('start','end'):
-                if any(type(device[bracket][key]) not in (int,float) or not math.isfinite(device[bracket][key]) for key in ('wall','uptime')): raise ValueError()
+                if set(device[bracket]) != {'wall','uptime'} or any(type(device[bracket][key]) not in (int,float) or not math.isfinite(device[bracket][key]) for key in ('wall','uptime')): raise ValueError()
             if phase in ('attachedSettings','effectiveCheckpoint'):
                 if not isinstance(record['effective'],str) or len(record['effective'].encode()) > 256 or type(record['systemSelected']) is not bool or not isinstance(record['boundary'],str): raise ValueError()
+                if any(type(record[k]) is not bool for k in ('effectiveExists','effectiveTruncated','systemSelectionExists','boundaryTruncated')): raise ValueError()
                 match=re.search(r'(?:^|;)appearanceContext=([^;]+)',record['boundary'])
                 if not match: raise ValueError()
                 context=base64.b64decode(match.group(1),validate=True)
                 if len(context)>12*1024: raise ValueError()
                 context=json.loads(context)
-                if set(context) != {'pid','storeMode','bundle','arguments','environment','defaults','start','end'}: raise ValueError()
-                if type(context['pid']) is not int or context['pid'] <= 0 or not isinstance(context['storeMode'],str) or len(context['storeMode'].encode())>256: raise ValueError()
-                if any(not isinstance(context[key],dict) for key in ('bundle','arguments','environment','defaults')): raise ValueError()
-                def check_scalar_caps(value):
-                    if isinstance(value,str):
-                        if len(value.encode()) > 256: raise ValueError()
-                    elif isinstance(value,dict):
-                        for k,v in value.items(): check_scalar_caps(k); check_scalar_caps(v)
-                    elif isinstance(value,list):
-                        for item in value: check_scalar_caps(item)
-                    elif isinstance(value,float) and not math.isfinite(value): raise ValueError()
-                    elif value is not None and type(value) not in (bool,int,float): raise ValueError()
-                check_scalar_caps(context)
-                for bracket in ('start','end'):
-                    if any(type(context[bracket][key]) not in (int,float) or not math.isfinite(context[bracket][key]) for key in ('wall','uptime')): raise ValueError()
+                if not isinstance(context,dict): raise ValueError()
+                _validate_context(context)
             if phase == 'effectiveCheckpoint' and type(record.get('waitResult')) is not bool: raise ValueError()
     except Exception:
         raise BoundaryValidationError() from None

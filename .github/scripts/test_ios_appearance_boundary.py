@@ -9,19 +9,81 @@ import ios_appearance_boundary as b
 
 UDID = '12345678-1234-4234-8234-123456789ABC'
 
+DEFAULT_KEYS=('theme_mode','AppleInterfaceStyle','UIUserInterfaceStyle','NSInterfaceStyle','AppleInterfaceStyleSwitchesAutomatically')
+ENV_KEYS=('AppleInterfaceStyle','UIUserInterfaceStyle','NSInterfaceStyle','AppleInterfaceStyleSwitchesAutomatically')
+def absent(): return {'state':'absent'}
+def value(text): return {'state':'value','type':'string','value':text,'truncated':False}
+def sample_context():
+    effective={key:absent() for key in DEFAULT_KEYS}; effective['theme_mode']=value('LIGHT')
+    domain={'state':'present','values':{key:absent() for key in DEFAULT_KEYS}}
+    return dict(pid=88,storeMode='AUTO',
+        bundle={'bundleIdentifier':value('com.radioshake.debug'),'CFBundleVersion':value('1'),
+                'CFBundleShortVersionString':value('1.0'),'UIUserInterfaceStyle':absent()},
+        arguments={'occurrences':[{'index':1,'option':'-RSKeepTheme','value':{'state':'flag'}}],
+                   'total':1,'truncated':False,'fixtureEndpoints':True,'skipOnboarding':True},
+        environment={key:absent() for key in ENV_KEYS+tuple('SIMCTL_CHILD_'+x for x in ENV_KEYS)},
+        defaults={'effective':effective,'app':domain,'global':{'state':'absent'},'argument':domain,'registration':domain},
+        start=dict(wall=1,uptime=1),end=dict(wall=2,uptime=2))
+
 def make_attachments(root):
     directory=root/'attachments'; directory.mkdir(exist_ok=True)
     records=[]
-    context=dict(pid=88,storeMode='auto',bundle={},arguments={},environment={},defaults={},start=dict(wall=1,uptime=1),end=dict(wall=2,uptime=2))
+    context=sample_context()
     encoded=base64.b64encode(json.dumps(context).encode()).decode()
     for index,phase in enumerate(('beforeLaunch','afterLaunch','attachedSettings','effectiveCheckpoint'),1):
         body=dict(phase=phase,testName='-[RadioShakeUITests.ThemeUITests test_system_coldUnforcedLaunch_onDarkDevice]',matcherSelfCheck=True,sequence=index,pid=44,
-                  device=dict(raw=2,interpretation='dark',start=dict(wall=1,uptime=1),end=dict(wall=2,uptime=2)))
-        if index > 2: body.update(effective='light',systemSelected=True,boundary='attached=1;appearanceContext='+encoded)
+                  device=dict(raw=2,interpretation='dark',start=dict(wall=1,uptime=1),end=dict(wall=2,uptime=2),clockBackward=False,wallClockDivergence=False))
+        if index > 2: body.update(effective='light',effectiveExists=True,effectiveTruncated=False,systemSelected=False,systemSelectionExists=True,boundary='attached=1;appearanceContext='+encoded,boundaryTruncated=False)
         if index==4: body['waitResult']=False
         name=f'{index}.txt'; (directory/name).write_text(json.dumps(body))
         records.append(dict(exportedFileName=name,deviceId=UDID,suggestedHumanReadableName='system-appearance-'+phase+'_0_random.txt'))
     (directory/'manifest.json').write_text(json.dumps([dict(testIdentifier='ThemeUITests/test_system_coldUnforcedLaunch_onDarkDevice()',testIdentifierURL='test://com.apple.xcode/RadioShake/RadioShakeUITests/ThemeUITests/test_system_coldUnforcedLaunch_onDarkDevice',attachments=records)]))
+
+class TriggerTests(unittest.TestCase):
+    def poll(self,path,offset,state):
+        return b._trigger(path,offset,state)
+
+    def test_long_complete_line_then_trigger_retains_actual_offset(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path=Path(tmp)/'test.log'; prefix=b'x'*5000+b'\n'; line=b"Test Suite 'Selected tests' started at now.\n"
+            path.write_bytes(prefix+line); state={}
+            trigger,offset=self.poll(path,0,state)
+            self.assertIsNotNone(trigger)
+            self.assertEqual(trigger['line'],line.decode())
+            self.assertEqual(trigger['offset'],len(prefix))
+            self.assertEqual(offset,len(prefix)+len(line))
+
+    def test_partial_long_line_continuation_is_not_a_new_trigger(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path=Path(tmp)/'test.log'; path.write_bytes(b'x'*5000); state={}
+            trigger,offset=self.poll(path,0,state); self.assertIsNone(trigger)
+            with path.open('ab') as f: f.write(b"Test Suite 'Selected tests' started fake\nordinary\nTest Suite 'ThemeUITests' started real\n")
+            trigger,offset=self.poll(path,offset,state)
+            self.assertIsNotNone(trigger)
+            self.assertEqual(trigger['line'],"Test Suite 'ThemeUITests' started real\n")
+            self.assertEqual(trigger['offset'],path.read_bytes().index(b"Test Suite 'ThemeUITests'"))
+            self.assertEqual(offset,path.stat().st_size)
+
+    def test_large_log_returns_bounded_progress_per_poll(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path=Path(tmp)/'test.log'; path.write_bytes(b'x'*2_000_000); state={}
+            trigger,offset=self.poll(path,0,state)
+            self.assertIsNone(trigger)
+            self.assertGreater(offset,0)
+            self.assertLessEqual(offset,65536)
+
+    def test_partial_trigger_is_retained_and_scan_respects_deadline(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path=Path(tmp)/'test.log'; path.write_bytes(b"Test Suite 'Selected tests' started"); state={}
+            trigger,offset=self.poll(path,0,state); self.assertIsNone(trigger)
+            self.assertEqual(offset,path.stat().st_size)
+            with path.open('ab') as stream: stream.write(b' at now.\n')
+            with mock.patch.object(b.time,'monotonic',return_value=10):
+                trigger,held=b._trigger(path,offset,state,deadline=10)
+            self.assertIsNone(trigger); self.assertEqual(held,offset)
+            trigger,offset=self.poll(path,held,state)
+            self.assertEqual(trigger['line'],"Test Suite 'Selected tests' started at now.\n")
+            self.assertEqual(trigger['offset'],0)
 
 class BoundaryTests(unittest.TestCase):
     def test_read_only_appearance_command_uses_exact_device(self):
@@ -30,6 +92,16 @@ class BoundaryTests(unittest.TestCase):
         self.assertEqual(command.call_args.args[0], ['xcrun', 'simctl', 'ui', UDID, 'appearance'])
         self.assertEqual(record['appearance'], 'dark')
         with self.assertRaises(ValueError): b.appearance_query('booted', 2)
+
+    def test_query_timeout_is_clipped_to_remaining_deadline(self):
+        response={'returncode':0,'stdout':'Dark\n','stderr':'','stdoutTruncated':False,'stderrTruncated':False,'timedOut':False}
+        with mock.patch.object(b.time,'monotonic',side_effect=[4199.5,4199.75]), mock.patch.object(b.time,'time',return_value=100), mock.patch.object(b,'_bounded_command',return_value=response) as command:
+            record=b.appearance_query(UDID,2,4200)
+        self.assertEqual(record['requestedTimeout'],0.5)
+        self.assertEqual(command.call_args.args[1],0.5)
+        with mock.patch.object(b.time,'monotonic',return_value=4200), mock.patch.object(b,'_bounded_command') as command:
+            self.assertIsNone(b.appearance_query(UDID,2,4200))
+            command.assert_not_called()
 
     def test_plist_projection_excludes_unrelated_secrets_and_records_types(self):
         result = b.project_plist({'CFBundleIdentifier':'com.radioshake.debug', 'UIUserInterfaceStyle':'Light', 'MinimumOSVersion':['private-canary']})
@@ -83,23 +155,26 @@ class FakeNative:
         self.clock.now=max(self.clock.now,self.end); self.returncode=self.code; return self.code
 
 class ObserverTests(unittest.TestCase):
-    def exercise(self, *, duration=30, code=0, trigger=None, query_duration=0, cancel=False, record_cap=542, initial_kind='dark'):
+    def exercise(self, *, duration=30, code=0, trigger=None, query_duration=0, cancel=False, record_cap=542, initial_kind='dark', overrun_at=None, timeout_at=None):
         clock=FakeClock(); tmp=tempfile.TemporaryDirectory(); self.addCleanup(tmp.cleanup); root=Path(tmp.name)
         log=root/'test.log'; log.write_text('')
         command=['xcodebuild','test','-project','RadioShake.xcodeproj','-scheme','RadioShake','-configuration','Debug','-destination','id='+UDID,'-derivedDataPath','/tmp/ios-diagnostic-derived','-resultBundlePath',str(root/'tests.xcresult'),'-only-testing:'+b.SELECTOR,'CODE_SIGNING_ALLOWED=NO']
         native=FakeNative(clock,duration,code); seen=[]
-        def query(udid, timeout):
+        def query(udid, timeout, deadline):
             start=clock.monotonic(); seen.append((start,timeout))
+            timeout=min(timeout,deadline-start)
             if cancel and len(seen)==2: raise b.Cancelled()
             clock.now += min(query_duration,timeout)
+            if len(seen)==overrun_at: clock.now+=2.5
             first=len(seen)==1
-            supported=first and initial_kind=='dark' and query_duration<=timeout
-            returncode=-9 if query_duration>timeout else (1 if first and initial_kind=='unsupported' else 0)
-            return dict(argv=['xcrun','simctl','ui',udid,'appearance'],udid=udid,hostPID=123,
+            timed_out=query_duration>timeout or len(seen)==timeout_at
+            supported=first and initial_kind=='dark' and not timed_out
+            returncode=-9 if timed_out else (1 if first and initial_kind=='unsupported' else 0)
+            return dict(argv=['xcrun','simctl','ui',udid,'appearance'],udid=udid,hostPID=123,requestedTimeout=timeout,
                         start={'wall':1_700_000_000+start,'monotonic':start},end={'wall':clock.wall(),'monotonic':clock.now},
-                        wallClockDivergence=False,appearance='dark' if supported else 'unknown',returncode=returncode,timedOut=query_duration>timeout,
+                        wallClockDivergence=False,appearance='dark' if supported else 'unknown',returncode=returncode,timedOut=timed_out,
                         stdout='Dark\n' if supported else ('private-canary' if first else ''),stderr='',stdoutTruncated=False,stderrTruncated=False)
-        def trigger_read(path, offset):
+        def trigger_read(path, offset, state, deadline):
             if trigger is not None and clock.now >= trigger:
                 return {'line':"Test Suite 'Selected tests' started.\n",'offset':0,'detected':{'wall':clock.wall(),'monotonic':clock.now}}, 1
             return None,offset
@@ -148,6 +223,27 @@ class ObserverTests(unittest.TestCase):
         self.assertTrue(all(seen[i+1][0]-seen[i][0] >= 2 for i in range(len(seen)-1)))
         self.assertLessEqual(status['counts']['fast'],7)
 
+    def test_query_cleanup_overrun_is_retained_and_native_exit_unchanged(self):
+        root,env,_,_,result,status=self.exercise(duration=10,code=65,trigger=0,overrun_at=2)
+        self.assertEqual(result,65)
+        self.assertEqual(status['nativeExit'],65)
+        records=[json.loads(line) for line in (root/'appearance-boundary/host-samples.jsonl').read_text().splitlines()]
+        self.assertTrue(records[1]['durationOverrun'])
+        self.assertEqual(records[1]['requestedTimeout'],2)
+        with self.assertRaises(b.BoundaryValidationError):
+            b.validate_boundary_evidence(root,{k.lower():v for k,v in env.items()},{'destination_udid':UDID},65)
+        self.assertTrue((root/'appearance-boundary/status.json').exists())
+
+    def test_exact_two_second_queries_are_within_the_cap(self):
+        root,env,_,_,result,_=self.exercise(duration=10,query_duration=2)
+        b.validate_boundary_evidence(root,{k.lower():v for k,v in env.items()},{'destination_udid':UDID},result)
+
+    def test_later_timeout_is_explicit_and_valid_within_bounds(self):
+        root,env,_,_,result,_=self.exercise(duration=8,trigger=0,timeout_at=2)
+        records=[json.loads(line) for line in (root/'appearance-boundary/host-samples.jsonl').read_text().splitlines()]
+        self.assertTrue(records[1]['timedOut']); self.assertEqual(records[1]['appearance'],'unknown')
+        b.validate_boundary_evidence(root,{k.lower():v for k,v in env.items()},{'destination_udid':UDID},result)
+
     def test_missing_trigger_and_unproved_or_unsupported_initial_read(self):
         root,env,_,_,code,status=self.exercise(duration=30,trigger=None)
         self.assertEqual(status['counts']['fast'],0)
@@ -180,6 +276,44 @@ class ObserverTests(unittest.TestCase):
         self.assertNotIn('private-canary',str(exc.exception))
         path.unlink()
         with self.assertRaises(b.BoundaryValidationError): b.validate_boundary_evidence(root,inputs,runtime,0)
+
+    def test_validator_rejects_each_phase_over_duration_or_deadline(self):
+        import hashlib
+        for phase in ('initial','coarse','fast','invocationEnd'):
+            for violation in ('duration','deadline'):
+                with self.subTest(phase=phase,violation=violation):
+                    root,env,_,_,_,status=self.exercise(duration=50,trigger=25)
+                    inputs={k.lower():v for k,v in env.items()}; runtime={'destination_udid':UDID}
+                    b.validate_boundary_evidence(root,inputs,runtime,0)
+                    directory=root/'appearance-boundary'; path=directory/'host-samples.jsonl'
+                    records=[json.loads(line) for line in path.read_text().splitlines()]
+                    index=next(i for i,r in enumerate(records) if r['phase']==phase)
+                    if violation=='duration':
+                        records[index]['end']['monotonic']+=3; records[index]['end']['wall']+=3
+                        records[index]['durationOverrun']=True
+                        for entry in records[index+1:]:
+                            for end in ('start','end'): entry[end]['monotonic']+=3; entry[end]['wall']+=3
+                        if phase in ('initial','coarse'):
+                            status['trigger']['detected']['monotonic']+=3; status['trigger']['detected']['wall']+=3
+                            status['cadenceTransitions'][1]['monotonic']+=3
+                    else:
+                        records=records[:index+1]
+                        entry=records[-1]; shift=4199-entry['start']['monotonic']
+                        entry['start']['monotonic']+=shift; entry['start']['wall']+=shift
+                        entry['end']['monotonic']=4200.5; entry['end']['wall']=1_700_004_200.5
+                        entry['deadlineOverrun']=True
+                        entry['requestedTimeout']=1
+                        if phase=='fast':
+                            status['trigger']['detected']={'wall':1_700_004_199,'monotonic':4199}
+                            status['cadenceTransitions'][1]['monotonic']=4199
+                        elif phase in ('initial','coarse'):
+                            status['trigger']=None; status['cadenceTransitions']=status['cadenceTransitions'][:1]
+                        status['counts']={k:sum(r['phase']==k for r in records) for k in status['counts']}
+                        if phase!='invocationEnd': status['finalRead']='notAttemptedDeadline'
+                    path.write_text(''.join(json.dumps(r)+'\n' for r in records))
+                    status['files'][path.name]=hashlib.sha256(path.read_bytes()).hexdigest()
+                    (directory/'status.json').write_text(json.dumps(status))
+                    with self.assertRaises(b.BoundaryValidationError): b.validate_boundary_evidence(root,inputs,runtime,0)
 
 class BoundedProcessTests(unittest.TestCase):
     def test_drains_and_caps_both_streams(self):
@@ -220,6 +354,42 @@ class BoundedProcessTests(unittest.TestCase):
                 self.assertEqual(status['capability'],'supported')
 
 class AttachmentTests(unittest.TestCase):
+    def test_context_schema_rejects_missing_and_unrelated_fields_and_runner_flags(self):
+        for mutation in ('missing-domain','missing-state','unknown-bundle','unknown-default','unknown-env','env-type','unknown-option','bad-count','bad-scalar','missing-clock','missing-exists','missing-truncated'):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as tmp:
+                root=Path(tmp); make_attachments(root); path=root/'attachments/4.txt'; record=json.loads(path.read_text())
+                context=sample_context()
+                if mutation=='missing-domain': del context['defaults']['argument']
+                if mutation=='missing-state': context['defaults']['app']={}
+                if mutation=='unknown-bundle': context['bundle']['secret-canary']=value('x')
+                if mutation=='unknown-default': context['defaults']['unrelated']='secret-canary'
+                if mutation=='unknown-env': context['environment']['unrelated']=value('secret-canary')
+                if mutation=='env-type': context['environment']['AppleInterfaceStyle']={'state':'value','type':'bool','value':True}
+                if mutation=='unknown-option': context['arguments']['occurrences'][0]['option']='--unrelated'
+                if mutation=='bad-count': context['arguments']['total']=2
+                if mutation=='bad-scalar': context['environment']['AppleInterfaceStyle']={'state':'value','value':'x'}
+                if mutation=='missing-clock': del record['device']['clockBackward']
+                if mutation=='missing-exists': del record['systemSelectionExists']
+                if mutation=='missing-truncated': del record['boundaryTruncated']
+                record['boundary']='appearanceContext='+base64.b64encode(json.dumps(context).encode()).decode()
+                path.write_text(json.dumps(record))
+                with self.assertRaises(b.BoundaryValidationError) as error: b.validate_runner_attachments(root,UDID)
+                self.assertNotIn('secret-canary',str(error.exception))
+
+    def test_valid_explicit_absence_unsupported_truncation_and_false_values(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp); make_attachments(root); path=root/'attachments/4.txt'; record=json.loads(path.read_text())
+            context=sample_context()
+            context['bundle']['UIUserInterfaceStyle']={'state':'unsupported','type':'Array<String>'}
+            context['defaults']['global']={'state':'absent'}
+            context['defaults']['argument']['values']['theme_mode']={'state':'value','type':'string','value':'x'*256,'truncated':True}
+            record['device']['interpretation']='unknown'; record['effective']='light'; record['systemSelected']=False; record['waitResult']=False
+            record['boundary']='appearanceContext='+base64.b64encode(json.dumps(context).encode()).decode(); path.write_text(json.dumps(record))
+            b.validate_runner_attachments(root,UDID)
+            context.update({k:{'state':'truncated'} for k in ('bundle','arguments','environment','defaults')})
+            record['boundary']='appearanceContext='+base64.b64encode(json.dumps(context).encode()).decode(); path.write_text(json.dumps(record))
+            b.validate_runner_attachments(root,UDID)
+
     def test_rejects_missing_or_bad_runner_proof_without_disclosing_payload(self):
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp); directory=root/'attachments'; directory.mkdir()

@@ -41,6 +41,25 @@ class DiagnosticTests(unittest.TestCase):
             with mock.patch.dict(os.environ,{**env,'EVIDENCE':str(root)}), mock.patch.object(sys,'argv',['ios_diagnostic.py','manifest']), contextlib.redirect_stdout(io.StringIO()) as output:
                 self.assertEqual(d.main(),int(rc!=0))
             self.assertIn('DIAGNOSTIC_'+result.upper(),output.getvalue())
+            attachment=root/'attachments/4.txt'; original=attachment.read_bytes()
+            record=json.loads(original); del record['effectiveExists']; attachment.write_text(json.dumps(record))
+            with mock.patch.dict(os.environ,{**env,'EVIDENCE':str(root)}), mock.patch.object(sys,'argv',['ios_diagnostic.py','manifest']), contextlib.redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(d.main(),1)
+            self.assertIn('DIAGNOSTIC_ERROR',output.getvalue())
+            self.assertNotIn('DIAGNOSTIC_PASSED',output.getvalue())
+            attachment.write_bytes(original)
+            sample_path=root/'appearance-boundary/host-samples.jsonl'; sample_bytes=sample_path.read_bytes()
+            status_path=root/'appearance-boundary/status.json'; status_bytes=status_path.read_bytes()
+            samples=[json.loads(line) for line in sample_bytes.decode().splitlines()]
+            samples[0]['end']['wall']+=3; samples[0]['end']['monotonic']+=3; samples[0]['durationOverrun']=True
+            sample_path.write_text(''.join(json.dumps(sample)+'\n' for sample in samples))
+            sidecar=json.loads(status_bytes); sidecar['files']['host-samples.jsonl']=hashlib.sha256(sample_path.read_bytes()).hexdigest()
+            status_path.write_text(json.dumps(sidecar))
+            with mock.patch.dict(os.environ,{**env,'EVIDENCE':str(root)}), mock.patch.object(sys,'argv',['ios_diagnostic.py','manifest']), contextlib.redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(d.main(),1)
+            self.assertIn('DIAGNOSTIC_ERROR',output.getvalue())
+            self.assertEqual(json.loads((root/'manifest.json').read_text())['execution']['xcode_exit'],rc)
+            sample_path.write_bytes(sample_bytes); status_path.write_bytes(status_bytes)
             (root/'appearance-boundary/status.json').unlink()
             with mock.patch.dict(os.environ,{**env,'EVIDENCE':str(root)}), mock.patch.object(sys,'argv',['ios_diagnostic.py','manifest']), contextlib.redirect_stdout(io.StringIO()) as output:
                 self.assertEqual(d.main(),1)

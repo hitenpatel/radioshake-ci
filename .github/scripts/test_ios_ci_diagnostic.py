@@ -1,3 +1,4 @@
+import base64
 import hashlib
 import io
 import json
@@ -155,9 +156,24 @@ class FetchTest(unittest.TestCase):
             files={'test.log':b'generic','attachments-export.log':b'export'}
             files.update({str(p.relative_to(evidence)):p.read_bytes() for p in (evidence/'appearance-boundary').iterdir()})
             files.update({str(p.relative_to(evidence)):p.read_bytes() for p in (evidence/'attachments').iterdir()})
-            for corrupt in (False,True):
+            for corrupt in (None,'samples','context','flags','timing'):
                 contents=dict(files)
-                if corrupt: contents['appearance-boundary/host-samples.jsonl']+=b'private-canary'
+                if corrupt=='samples': contents['appearance-boundary/host-samples.jsonl']+=b'private-canary'
+                if corrupt=='timing':
+                    sample_path='appearance-boundary/host-samples.jsonl'; status_path='appearance-boundary/status.json'
+                    samples=[json.loads(line) for line in contents[sample_path].decode().splitlines()]
+                    samples[0]['end']['wall']+=3; samples[0]['end']['monotonic']+=3; samples[0]['durationOverrun']=True
+                    contents[sample_path]=''.join(json.dumps(sample)+'\n' for sample in samples).encode()
+                    updated_status=json.loads(contents[status_path]); updated_status['files']['host-samples.jsonl']=hashlib.sha256(contents[sample_path]).hexdigest()
+                    contents[status_path]=json.dumps(updated_status).encode()
+                if corrupt in ('context','flags'):
+                    record=json.loads(contents['attachments/4.txt'])
+                    if corrupt=='flags': del record['effectiveExists']
+                    else:
+                        context=json.loads(base64.b64decode(record['boundary'].split('appearanceContext=')[1]))
+                        context['defaults']['unrelated']='private-canary'
+                        record['boundary']='appearanceContext='+base64.b64encode(json.dumps(context).encode()).decode()
+                    contents['attachments/4.txt']=json.dumps(record).encode()
                 manifest['file_hashes']={name:hashlib.sha256(data).hexdigest() for name,data in contents.items()}
                 buf=io.BytesIO()
                 with tarfile.open(fileobj=buf,mode='w:gz') as archive:
@@ -168,7 +184,7 @@ class FetchTest(unittest.TestCase):
                 conclusion='success' if native_code==0 else 'failure'
                 api=FakeAPI(selected=run(head_sha=workflow_sha,conclusion=conclusion),jobs=[dict(name='diagnostic',status='completed',conclusion=conclusion)],archive=zipdata(['key.enc','bundle.tgz.enc']))
                 with self.subTest(native_code=native_code,corrupt=corrupt), tempfile.TemporaryDirectory() as tmp, patch.object(d,'decrypt',return_value=buf.getvalue()), contextlib.redirect_stdout(io.StringIO()) as out:
-                    if corrupt:
+                    if corrupt is not None:
                         with self.assertRaises(d.DiagnosticError): d.execute_fetch(req,api,Path(tmp),1)
                         self.assertEqual(api.deleted,[])
                     else:
