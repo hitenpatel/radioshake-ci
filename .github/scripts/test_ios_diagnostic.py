@@ -35,10 +35,21 @@ class DiagnosticTests(unittest.TestCase):
     def test_strict_inputs(self):
         self.assertEqual(self.inputs()['sha'], SHA)
         self.assertEqual(self.inputs(selector='RadioShakeUITests/ExampleTests')['selector'], 'RadioShakeUITests/ExampleTests')
-        for field, values in {'ref': ['', '-x', 'a..b', 'a\nb', 'a;ls', 'a.lock', 'a'*201], 'sha': ['', 'a'*39, 'A'*40], 'selector': ['', 'RadioShakeTests/A/test', 'RadioShakeTests/A*', 'RadioShakeTests/A\n', 'RadioShakeTests/A,Other/B', '--help'], 'request_id': ['', UUID.upper(), '12345678-1234-1234-8234-123456789abc'], 'device': ['', 'iPhone 18']}.items():
+        for field, values in {'ref': ['', '-x', 'a..b', 'a\nb', 'a;ls', 'a.lock', 'a'*201], 'sha': ['', 'a'*39, 'A'*40], 'selector': ['', 'RadioShakeTests/A/test()', 'RadioShakeTests/A/test/extra', 'RadioShakeTests/A/test --flag', 'RadioShakeTests/A*', 'RadioShakeTests/A\n', 'RadioShakeTests/A,Other/B', '--help'], 'request_id': ['', UUID.upper(), '12345678-1234-1234-8234-123456789abc'], 'device': ['', 'iPhone 18']}.items():
             for value in values:
                 with self.subTest(field=field, value=value), self.assertRaises(ValueError):
                     self.inputs(**{field:value})
+
+    def test_exact_method_selection_and_raw_terminal_counts(self):
+        for target in ('RadioShakeTests', 'RadioShakeUITests'):
+            selector = target + '/ExampleTests/testOne'
+            self.assertEqual(self.inputs(selector=selector)['selector'], selector)
+            self.assertEqual(d.summarize_execution(selector, 0, case(module=target)+suite(), True)['outcome'], 'passed')
+            for log in (case('testTwo',module=target)+suite(), case(module=target)+case('testTwo',module=target)+suite(count=2), case(module=target)+case(module=target)+suite(), case(module=target)+case(module='').replace('[.', '[')+suite(count=2), case(module=target,cls='Other')+suite(), case(module='Other')+suite(), '', case(module=target,result='skipped')+suite(), case(module=target)+'Test Case malformed\n'+suite(), case(module=target)+suite(count=2)):
+                self.assertEqual(d.summarize_execution(selector, 0, log, True)['outcome'], 'incomplete')
+            result = d.summarize_execution(selector, 0, case(module=target)+case('testTwo',module=target)+suite(count=2), True)
+            self.assertEqual(result['passed'], 2)
+            self.assertEqual(d.summarize_execution(selector, 1, case(module=target,result='failed')+suite(result='failed',failures=1), True)['outcome'], 'failed')
 
     def test_result_requires_complete_matching_non_skipped_cases(self):
         for log, rc, present in [('',0,True), (suite(),0,True), (case(result='skipped')+suite(),0,True), (case(cls='OtherTests')+suite('OtherTests'),0,True), (case()+suite(),1,True), (case()+suite(),0,False), (case()+case(cls='OtherTests')+suite(),0,True)]:
@@ -67,7 +78,8 @@ class DiagnosticTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp); nested=root/'tests.xcresult'/'Data'/'manifest.json'; nested.parent.mkdir(parents=True)
             nested.write_text('nested evidence')
-            (root/'stages.json').write_text(json.dumps({'test': 0}))
+            (root/'attachments').mkdir(); (root/'attachments-export.log').write_text('')
+            (root/'stages.json').write_text(json.dumps({'test': 0, 'attachments': 0}))
             (root/'runtime.json').write_text('{}')
             (root/'test.log').write_text(case()+suite())
             env={'EVIDENCE':tmp, 'REF':REF, 'SHA':SHA, 'SELECTOR':SELECTOR, 'REQUEST_ID':UUID, 'DEVICE':'iPhone 17'}
@@ -124,6 +136,65 @@ class DiagnosticTests(unittest.TestCase):
             self.assertNotIn(s,output.getvalue())
 
 class StructureTests(unittest.TestCase):
+    def test_private_attachment_export_runs_for_present_results(self):
+        import yaml
+        wf=yaml.safe_load((Path(__file__).resolve().parents[1]/'workflows'/'ios-diagnostic-tests.yml').read_text())
+        steps=wf['jobs']['diagnostic']['steps']
+        export=next(x for x in steps if x.get('name') == 'Export attachments')
+        self.assertEqual(export['if'], 'always()')
+        self.assertLess(steps.index(export), next(i for i,x in enumerate(steps) if x.get('name')=='Record manifest'))
+        for present, code in ((True,0),(True,17),(False,0)):
+            with self.subTest(present=present,code=code), tempfile.TemporaryDirectory() as tmp:
+                root=Path(tmp); (root/'stages.json').write_text(json.dumps(dict(attachments=None)))
+                if present: (root/'tests.xcresult').mkdir()
+                stub=root/'xcrun'
+                stub.write_text("#!/bin/sh\nprintf 'private-export-canary' >&2\nprintf 'text' > \"$7/manifest.json\"\nprintf 'png' > \"$7/image.png\"\nprintf 'movie' > \"$7/video.mov\"\nexit "+str(code)+"\n")
+                stub.chmod(0o755)
+                env={**os.environ,'PATH':tmp+os.pathsep+os.environ['PATH'],'EVIDENCE':tmp}
+                proc=subprocess.run(['bash','-c',export['run']],env=env,capture_output=True,text=True)
+                self.assertNotIn('private-export-canary',proc.stdout+proc.stderr)
+                self.assertEqual(json.loads((root/'stages.json').read_text())['attachments'],code if present else None)
+                if present:
+                    self.assertEqual((root/'attachments/manifest.json').read_bytes(),b'text')
+                    self.assertEqual((root/'attachments/image.png').read_bytes(),b'png')
+                    self.assertEqual((root/'attachments/video.mov').read_bytes(),b'movie')
+                    self.assertIn('private-export-canary',(root/'attachments-export.log').read_text())
+                else: self.assertFalse((root/'attachments-export.log').exists())
+
+    def test_export_failure_never_prints_passed(self):
+        for selector, log in ((SELECTOR, case()+suite()),
+                              ('RadioShakeUITests/ExampleTests/testOne', case(module='RadioShakeUITests')+suite())):
+            with self.subTest(selector=selector), tempfile.TemporaryDirectory() as tmp:
+                root=Path(tmp); (root/'tests.xcresult').mkdir(); (root/'attachments').mkdir()
+                (root/'attachments-export.log').write_text('private-canary')
+                (root/'stages.json').write_text(json.dumps(dict(clone=0,toolchain=0,gradle=0,generate=0,simulator=0,test=0,attachments=9)))
+                (root/'runtime.json').write_text('{}'); (root/'test.log').write_text(log)
+                env={'EVIDENCE':tmp,'REF':REF,'SHA':SHA,'SELECTOR':selector,'REQUEST_ID':UUID,'DEVICE':'iPhone 17'}
+                with mock.patch.dict(os.environ,env), mock.patch.object(sys,'argv',['ios_diagnostic.py','manifest']), contextlib.redirect_stdout(io.StringIO()) as output:
+                    self.assertEqual(d.main(),1)
+                self.assertIn('DIAGNOSTIC_ERROR',output.getvalue())
+                self.assertNotIn('DIAGNOSTIC_PASSED',output.getvalue())
+                self.assertNotIn('private-canary',output.getvalue())
+                self.assertEqual(json.loads((root/'manifest.json').read_text())['execution']['outcome'],'passed')
+
+    def test_attachment_bytes_and_export_log_are_hashed_and_scanned(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp); (root/'tests.xcresult').mkdir(); (root/'attachments').mkdir()
+            files={'attachments/manifest.json':b'nested manifest','attachments/image.png':b'PNG bytes','attachments/video.mov':b'movie bytes','attachments-export.log':b'private exporter log'}
+            for name,data in files.items(): (root/name).write_bytes(data)
+            (root/'stages.json').write_text(json.dumps(dict(clone=0,toolchain=0,gradle=0,generate=0,simulator=0,test=0,attachments=0)))
+            (root/'runtime.json').write_text('{}'); (root/'test.log').write_text(case()+suite())
+            env={'EVIDENCE':tmp,'REF':REF,'SHA':SHA,'SELECTOR':SELECTOR,'REQUEST_ID':UUID,'DEVICE':'iPhone 17'}
+            with mock.patch.dict(os.environ,env), mock.patch.object(sys,'argv',['ios_diagnostic.py','manifest']), contextlib.redirect_stdout(io.StringIO()): self.assertEqual(d.main(),0)
+            hashes=json.loads((root/'manifest.json').read_text())['file_hashes']
+            for name,data in files.items(): self.assertEqual(hashes[name],hashlib.sha256(data).hexdigest())
+            with mock.patch.object(d.shutil,'which',return_value='/fake/zstd'):
+                self.assertTrue(d.scan(tmp,'secret-token'))
+                for name,data in files.items():
+                    (root/name).write_bytes(data+b'secret-token')
+                    self.assertFalse(d.scan(tmp,'secret-token'),name)
+                    (root/name).write_bytes(data)
+
     def test_simulator_state_and_failures(self):
         import yaml
         p=Path(__file__).resolve().parents[1]/'workflows'/'ios-diagnostic-tests.yml'
@@ -158,6 +229,8 @@ else: sys.exit(3)
         p=Path(__file__).resolve().parents[1]/'workflows'/'ios-diagnostic-tests.yml'
         text=p.read_text(); wf=yaml.safe_load(text); on=wf.get('on',wf.get(True))
         self.assertEqual(list(on),['workflow_dispatch'])
+        self.assertEqual(set(on['workflow_dispatch']['inputs']), {'ref','sha','selector','request_id','device'})
+        self.assertEqual(text.count('-only-testing:'), 1)
         self.assertEqual(list(wf['jobs']),['diagnostic'])
         self.assertEqual(wf['permissions'],{'contents':'read'})
         self.assertEqual(wf['jobs']['diagnostic']['runs-on'],'macos-26')

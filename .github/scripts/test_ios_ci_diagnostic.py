@@ -15,7 +15,7 @@ import ios_ci_diagnostic as d
 
 RID = '12345678-1234-4234-8234-123456789abc'
 SHA = 'a' * 40
-CI = 'b' * 40
+CI = '602eda30c1330ee9c89ace87e4772c3d9b8fbf1c'
 REQ = dict(ref='feature/test', sha=SHA, selector='RadioShakeTests/Example', request_id=RID, device='iPhone 17', workflow_sha=CI)
 
 
@@ -43,6 +43,46 @@ class DiagnosticTest(unittest.TestCase):
             result=subprocess.run([str(link),'--help'],capture_output=True,text=True)
             self.assertEqual(result.returncode,0,result.stderr)
 
+    def test_new_export_evidence_precedes_every_native_outcome(self):
+        new_sha='b'*40
+        req=dict(REQ,workflow_sha=new_sha)
+        for outcome, result_present in (('passed',True),('failed',True),('incomplete',True),('incomplete',False)):
+            for value in (None, True, '0', 7, 0):
+                with self.subTest(outcome=outcome,present=result_present,value=value), tempfile.TemporaryDirectory() as tmp:
+                    root=Path(tmp); (root/'test.log').write_bytes(b'generic')
+                    if result_present:
+                        (root/'tests.xcresult').mkdir(); (root/'attachments').mkdir()
+                        (root/'attachments-export.log').write_bytes(b'private export')
+                    files={str(p.relative_to(root)):hashlib.sha256(p.read_bytes()).hexdigest() for p in root.rglob('*') if p.is_file()}
+                    failed=outcome != 'passed'; rc=65 if failed else 0
+                    manifest=dict(schema_version=1,inputs={k:req[k] for k in ('ref','sha','selector','request_id','device')},runtime=dict(source_sha=SHA,workflow_repository=d.REPO,workflow_path=d.WORKFLOW,workflow_commit=new_sha,run_id='123',run_attempt='1',job='diagnostic',configuration='Debug',optimization='native Debug -Onone',destination_udid='ABC',runtime='com.apple.CoreSimulator.SimRuntime.iOS-26-5',arch='arm64'),stages=dict(clone=0,toolchain=0,gradle=0,generate=0,simulator=0,test=rc,attachments=value),execution=dict(outcome=outcome,xcode_exit=rc,xcresult_present=result_present,passed=int(not failed),failed=int(outcome=='failed'),skipped=0),file_hashes=files)
+                    (root/'manifest.json').write_text(json.dumps(manifest))
+                    r=run(head_sha=new_sha,conclusion='failure' if failed else 'success')
+                    valid=(type(value) is int and value==0) if result_present else value is None
+                    if valid: self.assertEqual(d.verify_manifest(root,req,r),int(failed))
+                    else:
+                        with self.assertRaises(d.DiagnosticError): d.verify_manifest(root,req,r)
+                    if valid:
+                        missing=dict(manifest); missing['stages']=dict(manifest['stages']); del missing['stages']['attachments']
+                        (root/'manifest.json').write_text(json.dumps(missing))
+                        with self.assertRaises(d.DiagnosticError): d.verify_manifest(root,req,r)
+                        (root/'manifest.json').write_text(json.dumps(manifest))
+                    if result_present and valid:
+                        for missing in ('attachments-export.log','attachments'):
+                            item=root/missing; item.rename(root/(missing+'.hidden'))
+                            with self.assertRaises(d.DiagnosticError): d.verify_manifest(root,req,r)
+                            (root/(missing+'.hidden')).rename(item)
+                        manifest['file_hashes'].pop('attachments-export.log'); (root/'manifest.json').write_text(json.dumps(manifest))
+                        with self.assertRaises(d.DiagnosticError): d.verify_manifest(root,req,r)
+
+    def test_legacy_stage_shape_only_for_deployed_workflow(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp); (root/'tests.xcresult').mkdir(); (root/'test.log').write_bytes(b'generic')
+            manifest=dict(schema_version=1,inputs={k:REQ[k] for k in ('ref','sha','selector','request_id','device')},runtime=dict(source_sha=SHA,workflow_repository=d.REPO,workflow_path=d.WORKFLOW,workflow_commit=CI,run_id='123',run_attempt='1',job='diagnostic',configuration='Debug',optimization='native Debug -Onone',destination_udid='ABC',runtime='com.apple.CoreSimulator.SimRuntime.iOS-26-5',arch='arm64'),stages=dict(clone=0,toolchain=0,gradle=0,generate=0,simulator=0,test=0),execution=dict(outcome='passed',xcode_exit=0,xcresult_present=True,passed=1,failed=0,skipped=0),file_hashes={'test.log':hashlib.sha256(b'generic').hexdigest()})
+            (root/'manifest.json').write_text(json.dumps(manifest)); self.assertEqual(d.verify_manifest(root,REQ,run()),0)
+            sha='b'*40; manifest['runtime']['workflow_commit']=sha; (root/'manifest.json').write_text(json.dumps(manifest))
+            with self.assertRaises(d.DiagnosticError): d.verify_manifest(root,dict(REQ,workflow_sha=sha),run(head_sha=sha))
+
     def test_request_association_rejects_duplicates_wrong_fields_and_main_race(self):
         self.assertEqual(d.select_run([run(), run(id=124, display_title='other')], REQ)['id'], 123)
         for changes in ({'event':'push'}, {'path':'wrong'}, {'head_sha':'c'*40}, {'display_title':'ios-diagnostic different'}):
@@ -62,7 +102,7 @@ class DiagnosticTest(unittest.TestCase):
             with self.assertRaises(d.DiagnosticError): d.unpack_zip(zipdata(names))
 
     def test_tar_rejects_traversal_absolute_and_links(self):
-        for name, kind in [('../escape',tarfile.REGTYPE),('/escape',tarfile.REGTYPE),('link',tarfile.SYMTYPE)]:
+        for name, kind in [('../escape',tarfile.REGTYPE),('/escape',tarfile.REGTYPE),('link',tarfile.SYMTYPE),('attachments/../../escape',tarfile.REGTYPE),('attachments/link',tarfile.SYMTYPE),('attachments/hardlink',tarfile.LNKTYPE)]:
             b=io.BytesIO()
             with tarfile.open(fileobj=b,mode='w:gz') as t:
                 item=tarfile.TarInfo(name); item.type=kind; item.linkname='../escape'; t.addfile(item)
@@ -96,6 +136,9 @@ class FakeAPI:
 class FetchTest(unittest.TestCase):
     def fixture(self, outcome='failed'):
         manifest=dict(schema_version=1,inputs={k:REQ[k] for k in ('ref','sha','selector','request_id','device')}, runtime=dict(source_sha=SHA,workflow_repository=d.REPO,workflow_path=d.WORKFLOW,workflow_commit=CI,run_id='123',run_attempt='1',job='diagnostic',configuration='Debug',optimization='native Debug -Onone',destination_udid='ABC',runtime='com.apple.CoreSimulator.SimRuntime.iOS-26-5',arch='arm64'),stages=dict(clone=0,toolchain=0,gradle=0,generate=0,simulator=0,test=65),execution=dict(outcome=outcome,xcode_exit=65,xcresult_present=True,passed=0,failed=1,skipped=0),file_hashes={'test.log':hashlib.sha256(b'generic').hexdigest()})
+        if outcome == 'passed':
+            manifest['stages']['test']=0
+            manifest['execution'].update(xcode_exit=0,passed=1,failed=0)
         b=io.BytesIO()
         with tarfile.open(fileobj=b,mode='w:gz') as t:
             for name,data in [('manifest.json',json.dumps(manifest).encode()),('test.log',b'generic')]:
@@ -110,6 +153,39 @@ class FetchTest(unittest.TestCase):
             self.assertEqual(len(list(Path(tmp).glob('attempt-*/evidence/manifest.json'))),1)
             self.assertIn('DIAGNOSTIC_FAIL',output.getvalue())
             self.assertEqual(api.deleted,[d.API+'/actions/artifacts/5'])
+
+    def test_legacy_pass_fetches_evidence_and_deletes_matching_artifact(self):
+        api=FakeAPI(selected=run(), jobs=[dict(name='diagnostic',status='completed',conclusion='success')], archive=zipdata(['key.enc','bundle.tgz.enc']))
+        with tempfile.TemporaryDirectory() as tmp, patch.object(d,'decrypt',return_value=self.fixture('passed')), contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(d.execute_fetch(REQ,api,Path(tmp),1),0)
+            self.assertEqual(len(list(Path(tmp).glob('attempt-*/evidence/manifest.json'))),1)
+            self.assertIn('DIAGNOSTIC_PASS',output.getvalue())
+            self.assertEqual(api.deleted,[d.API+'/actions/artifacts/5'])
+
+    def test_new_export_failure_preserves_artifact_and_private_evidence(self):
+        sha='b'*40; req=dict(REQ,workflow_sha=sha,selector='RadioShakeUITests/Example/testOne')
+        for native, export in (('passed',0),('passed',9),('failed',0),('failed',9)):
+            with self.subTest(native=native,export=export), tempfile.TemporaryDirectory() as tmp:
+                failure=native=='failed'; rc=65 if failure else 0
+                entries={'test.log':b'private native', 'attachments-export.log':b'private exporter canary', 'attachments/manifest.json':b'private manifest', 'attachments/image.png':b'png bytes'}
+                manifest=dict(schema_version=1,inputs={k:req[k] for k in ('ref','sha','selector','request_id','device')},runtime=dict(source_sha=SHA,workflow_repository=d.REPO,workflow_path=d.WORKFLOW,workflow_commit=sha,run_id='123',run_attempt='1',job='diagnostic',configuration='Debug',optimization='native Debug -Onone',destination_udid='ABC',runtime='com.apple.CoreSimulator.SimRuntime.iOS-26-5',arch='arm64'),stages=dict(clone=0,toolchain=0,gradle=0,generate=0,simulator=0,test=rc,attachments=export),execution=dict(outcome=native,xcode_exit=rc,xcresult_present=True,passed=int(not failure),failed=int(failure),skipped=0),file_hashes={k:hashlib.sha256(v).hexdigest() for k,v in entries.items()})
+                entries['manifest.json']=json.dumps(manifest).encode(); buf=io.BytesIO()
+                with tarfile.open(fileobj=buf,mode='w:gz') as t:
+                    for directory in ('tests.xcresult','attachments'):
+                        info=tarfile.TarInfo(directory); info.type=tarfile.DIRTYPE; t.addfile(info)
+                    for name,data in entries.items():
+                        info=tarfile.TarInfo(name); info.size=len(data); t.addfile(info,io.BytesIO(data))
+                conclusion='failure' if failure or export else 'success'
+                api=FakeAPI(selected=run(head_sha=sha,conclusion=conclusion),jobs=[dict(name='diagnostic',status='completed',conclusion=conclusion)],archive=zipdata(['key.enc','bundle.tgz.enc']))
+                root=Path(tmp); work=root/RID; work.mkdir(); descriptor=work/'request.json'; descriptor.write_text(json.dumps(req))
+                with patch.object(d,'ROOT',root), patch.object(d,'token_from_config',return_value='fake'), patch.object(d,'Transport',return_value=api), patch.object(d,'decrypt',return_value=buf.getvalue()), contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()) as err:
+                    result=d.main(['fetch',str(descriptor)])
+                self.assertEqual(result,2 if export else int(failure))
+                self.assertEqual(bool(api.deleted),not bool(export))
+                self.assertEqual(len(list(work.glob('attempt-*/evidence/attachments/image.png'))),1)
+                self.assertNotIn('private',out.getvalue()+err.getvalue())
+                if export:
+                    self.assertIn('DIAGNOSTIC_ERROR',err.getvalue()); self.assertNotIn('DIAGNOSTIC_PASS',out.getvalue())
 
     def test_wrong_job_and_decrypt_failure_preserve_remote_artifact(self):
         for api in (FakeAPI(jobs=[dict(name='wrong',status='completed',conclusion='failure')]), FakeAPI(archive=zipdata(['key.enc','bundle.tgz.enc']))):

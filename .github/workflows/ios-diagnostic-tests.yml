@@ -56,7 +56,7 @@ jobs:
           set -euo pipefail
           python3 ci/.github/scripts/ios_diagnostic.py validate
           mkdir -p "$EVIDENCE" /tmp/ios-diagnostic-encrypted
-          printf '%s\n' '{"clone":null,"toolchain":null,"gradle":null,"generate":null,"simulator":null,"test":null}' > "$EVIDENCE/stages.json"
+          printf '%s\n' '{"clone":null,"toolchain":null,"gradle":null,"generate":null,"simulator":null,"test":null,"attachments":null}' > "$EVIDENCE/stages.json"
       - name: Clone private source
         id: clone
         env:
@@ -139,6 +139,18 @@ jobs:
           }
           test_one() ( cd src/ios && xcodebuild test -project RadioShake.xcodeproj -scheme RadioShake -configuration Debug -destination "id=$UDID" -derivedDataPath /tmp/ios-diagnostic-derived -resultBundlePath "$EVIDENCE/tests.xcresult" "-only-testing:$SELECTOR" CODE_SIGNING_ALLOWED=NO; )
           stage toolchain toolchain && stage gradle gradle && stage generate generate && stage simulator simulator && stage test test_one || echo STAGE_FAILED
+      - name: Export attachments
+        if: always()
+        run: |
+          set -uo pipefail
+          if [ -d "$EVIDENCE/tests.xcresult" ]; then
+            rc=0
+            mkdir -p "$EVIDENCE/attachments" > "$EVIDENCE/attachments-export.log" 2>&1 && xcrun xcresulttool export attachments --path "$EVIDENCE/tests.xcresult" --output-path "$EVIDENCE/attachments" >> "$EVIDENCE/attachments-export.log" 2>&1 || rc=$?
+            python3 - "$rc" <<'PYEXPORT'
+          import json, os, sys
+          p=os.path.join(os.environ['EVIDENCE'],'stages.json'); d=json.load(open(p)); d['attachments']=int(sys.argv[1]); open(p,'w').write(json.dumps(d))
+          PYEXPORT
+          fi
       - name: Record manifest
         id: manifest
         if: always()

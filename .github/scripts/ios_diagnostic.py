@@ -12,7 +12,7 @@ import sys
 import uuid
 from pathlib import Path
 
-SELECTOR = re.compile(r'(RadioShakeTests|RadioShakeUITests)/([A-Za-z_][A-Za-z0-9_]*)')
+SELECTOR = re.compile(r'(RadioShakeTests|RadioShakeUITests)/([A-Za-z_][A-Za-z0-9_]*)(?:/([A-Za-z_][A-Za-z0-9_]*))?')
 CASE = re.compile(r"^Test Case '-\[(?:(RadioShakeTests|RadioShakeUITests)\.)?([A-Za-z_][A-Za-z0-9_]*) ([A-Za-z_][A-Za-z0-9_]*)\]' (passed|failed|skipped) \([0-9.]+ seconds\)\.$")
 SUMMARY = re.compile(r'^\s*Executed ([0-9]+) tests?, with (?:([0-9]+) tests? skipped and )?([0-9]+) failures? \([0-9]+ unexpected\) in [0-9.]+ \([0-9.]+\) seconds$')
 SUITE = re.compile(r"^Test Suite '([A-Za-z_][A-Za-z0-9_]*)' (passed|failed) at .+\.$")
@@ -35,7 +35,7 @@ def validate_inputs(ref, sha, selector, request_id, device):
 
 
 def summarize_execution(selector, xcode_exit, log_text, xcresult_present):
-    target, selected = SELECTOR.fullmatch(selector).groups()
+    target, selected, method = SELECTOR.fullmatch(selector).groups()
     counts = dict(passed=0, failed=0, skipped=0)
     seen = set(); invalid = False; suites = []; pending = False; summaries = []
     for line in log_text.splitlines():
@@ -49,16 +49,17 @@ def summarize_execution(selector, xcode_exit, log_text, xcresult_present):
         if m:
             module, cls, name, outcome = m.groups()
             key = (module, cls, name)
-            if cls != selected or (module and module != target) or key in seen:
+            counts[outcome] += 1
+            if cls != selected or (module and module != target) or (method is not None and name != method) or key in seen:
                 invalid = True
             else:
-                seen.add(key); counts[outcome] += 1
+                seen.add(key)
         elif line.startswith('Test Case ') and not line.endswith(' started.'):
             invalid = True
         m = SUITE.fullmatch(line)
         if m and m.group(1) == selected:
             suites.append(m.group(2)); pending = True
-    complete = bool(xcresult_present and len(suites) == 1 and seen and counts['passed'] + counts['failed'] > 0 and not invalid and summaries == [(sum(counts.values()), counts['skipped'], counts['failed'])])
+    complete = bool(xcresult_present and len(suites) == 1 and seen and (method is None or sum(counts.values()) == 1) and counts['passed'] + counts['failed'] > 0 and not invalid and summaries == [(sum(counts.values()), counts['skipped'], counts['failed'])])
     outcome = 'passed' if complete and xcode_exit == 0 and not counts['failed'] and suites == ['passed'] else ('failed' if complete else 'incomplete')
     return dict(xcode_exit=xcode_exit, xcresult_present=bool(xcresult_present), **counts, outcome=outcome)
 
@@ -109,6 +110,10 @@ def main():
         manifest = make_manifest(inputs,runtime,stages,execution)
         manifest['file_hashes'] = {str(f.relative_to(root)): hashlib.sha256(f.read_bytes()).hexdigest() for f in sorted(root.rglob('*')) if f.is_file() and not f.is_symlink() and f != root/'manifest.json'}
         (root/'manifest.json').write_text(json.dumps(manifest,indent=2)+'\n')
+        if execution['xcresult_present'] and (type(stages.get('attachments')) is not int or stages['attachments'] != 0 or not (root/'attachments').is_dir() or not (root/'attachments-export.log').is_file()):
+            print('DIAGNOSTIC_ERROR'); return 1
+        if not execution['xcresult_present'] and ('attachments' not in stages or stages['attachments'] is not None):
+            print('DIAGNOSTIC_ERROR'); return 1
         print_summary(execution)
         return 0 if execution['outcome'] == 'passed' and all(v == 0 for v in stages.values()) else 1
     except Exception:

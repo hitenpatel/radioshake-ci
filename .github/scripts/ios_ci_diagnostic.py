@@ -131,7 +131,18 @@ def verify_manifest(root, req, run):
         if m['schema_version'] != 1 or m['inputs'] != expected or any(rt.get(k)!=v for k,v in fields.items()): raise DiagnosticError()
         files={str(p.relative_to(root)):hashlib.sha256(p.read_bytes()).hexdigest() for p in root.rglob('*') if p.is_file() and p != root/'manifest.json'}
         if files != m['file_hashes']: raise DiagnosticError()
-        if set(stages) != {'clone','toolchain','gradle','generate','simulator','test'} or any(v is not None and (type(v) is not int or v < 0) for v in stages.values()): raise DiagnosticError()
+        base_stages = {'clone','toolchain','gradle','generate','simulator','test'}
+        legacy = req['workflow_sha'] == '602eda30c1330ee9c89ace87e4772c3d9b8fbf1c' and set(stages) == base_stages
+        if not legacy and set(stages) != base_stages | {'attachments'}: raise DiagnosticError()
+        if any(v is not None and (type(v) is not int or v < 0) for v in stages.values()): raise DiagnosticError()
+        if not legacy:
+            present = ex['xcresult_present']
+            if type(present) is not bool: raise DiagnosticError()
+            if present:
+                if (not (root/'tests.xcresult').is_dir() or not (root/'attachments').is_dir() or
+                    'attachments-export.log' not in files or not (root/'attachments-export.log').is_file() or
+                    type(stages['attachments']) is not int or stages['attachments'] != 0): raise DiagnosticError()
+            elif stages['attachments'] is not None or (root/'tests.xcresult').exists(): raise DiagnosticError()
         order = [stages[k] for k in ('clone','toolchain','gradle','generate','simulator','test')]
         if ex['outcome'] == 'incomplete' and run['conclusion'] == 'failure':
             failures = [i for i,v in enumerate(order) if v is not None and v != 0]
