@@ -298,5 +298,54 @@ class CaptureAuditTests(unittest.TestCase):
         self.assertNotIn('private-exception-canary', output)
 
 
+class WorkflowIntegrationTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.workflow = Path(__file__).parents[1] / 'workflows' / 'ios-shared-validate.yml'
+        if cls.workflow.exists():
+            cls.text = cls.workflow.read_text()
+        else:
+            cls.text = subprocess.check_output(['git', '-C', str(Path(__file__).parent), 'show', 'HEAD:.github/workflows/ios-shared-validate.yml'], text=True)
+        cls.validate = cls.text.split('  # UI test shards 1..N-1.')[0]
+
+    def step(self, name):
+        start = self.validate.index('      - name: ' + name)
+        end = self.validate.find('\n      - name:', start + 1)
+        return self.validate[start:end if end >= 0 else None]
+
+    def test_controls_run_after_checkout(self):
+        checkout = self.validate.index('      - name: Check out CI scripts (this repo, scripts only)')
+        controls = self.validate.index('      - name: Capture probe audit controls')
+        self.assertLess(checkout, controls)
+        self.assertIn("python3 -m unittest discover -s ci/.github/scripts -p test_check_capture_probe_release.py", self.step('Capture probe audit controls'))
+
+    def test_audit_follows_release_checksum_and_binds_inputs(self):
+        self.assertLess(self.validate.index('      - name: Record Release app bundle checksum'), self.validate.index('      - name: Audit capture probe in Release binary'))
+        step = self.step('Audit capture probe in Release binary')
+        for fragment in ("${{ inputs.ref || github.event.client_payload.ref || 'feat/task-7-ios-shared-framework' }}", '${{ steps.clone.outputs.head_sha }}', '${{ github.sha }}', 'ci/.github/scripts/check_capture_probe_release.py', '--source-root', '--source-sha', '--ref-sha256', '--ci-sha', '--debug-app', '--release-app', '--receipt', 'derived-data/Build/Products/Debug-iphonesimulator/RadioShake.app', 'derived-data-release/Build/Products/Release-iphonesimulator/RadioShake.app'):
+            self.assertIn(fragment, step)
+        self.assertIn("os.path.realpath('/tmp')", step)
+        self.assertEqual(step.count('realpath('), 1)
+        self.assertIn("hashlib.sha256(os.environ['REQUESTED_REF'].encode('utf-8')).hexdigest()", step)
+        self.assertNotIn('${{ inputs.ref', step.split('        run: |', 1)[1])
+        self.assertIn('rm -f "$RECEIPT"', step)
+        self.assertIn('set -euo pipefail', step)
+        self.assertNotIn('dispatch', step.lower())
+        self.assertNotIn('strings ', step)
+        self.assertNotIn('cat ', step)
+
+    def test_receipt_is_only_new_evidence_and_fixed_deny_is_unchanged(self):
+        evidence = self.validate.split('      EVIDENCE_PATHS: |', 1)[1].split('    outputs:', 1)[0]
+        self.assertEqual(evidence.count('/tmp/capture-probe-release-audit.json'), 1)
+        self.assertNotIn('RadioShake.app', evidence)
+        self.assertNotIn('src/ios/', evidence)
+        self.assertNotIn('derived-data/', evidence)
+        self.assertNotIn('derived-data-release/', evidence)
+        deny = self.step('Audit Release binary for debug-only symbols (TASK-136 + TASK-137)')
+        self.assertEqual(hashlib.sha256((deny + '\n').encode()).hexdigest(), '6bc3089c370162db07e911c7ee7d2a188eaedfcbdf96794ccd8f61e826cb9c15')
+        self.assertEqual(self.validate.count('      - name: Audit capture probe in Release binary'), 1)
+
+
+
 if __name__ == '__main__':
     unittest.main()
