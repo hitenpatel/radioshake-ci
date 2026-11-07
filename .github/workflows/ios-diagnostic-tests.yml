@@ -121,12 +121,21 @@ jobs:
               TYPE_ID=$(python3 -c 'import json,os; print(next((x["identifier"] for x in json.load(open("/tmp/ios-diagnostic-types.json"))["devicetypes"] if x["name"]==os.environ["DEVICE"]),""))') || return
               [ -n "$TYPE_ID" ] || return 1
               UDID=$(xcrun simctl create "Diagnostic $DEVICE" "$TYPE_ID" "$RUNTIME_ID") || return
+              STATE=Shutdown
+            else
+              export UDID
+              STATE=$(python3 -c 'import json,os; d=json.load(open("/tmp/ios-diagnostic-devices.json"))["devices"]; print(next((x["state"] for x in d.get(os.environ["RUNTIME_ID"],[]) if x["udid"]==os.environ["UDID"]),""))') || return
             fi
             [[ "$UDID" =~ ^[0-9A-F-]{36}$ ]] || return 1
             export UDID
             printf '%s' "$UDID" > "$EVIDENCE/udid"
             printf '%s' "$UDID" > /tmp/ios-diagnostic-udid
-            xcrun simctl boot "$UDID" && xcrun simctl bootstatus "$UDID" -b
+            case "$STATE" in
+              Shutdown) xcrun simctl boot "$UDID" || return ;;
+              Booted|Booting) ;;
+              *) return 1 ;;
+            esac
+            xcrun simctl bootstatus "$UDID" -b
           }
           test_one() ( cd src/ios && xcodebuild test -project RadioShake.xcodeproj -scheme RadioShake -configuration Debug -destination "id=$UDID" -derivedDataPath /tmp/ios-diagnostic-derived -resultBundlePath "$EVIDENCE/tests.xcresult" "-only-testing:$SELECTOR" CODE_SIGNING_ALLOWED=NO; )
           stage toolchain toolchain && stage gradle gradle && stage generate generate && stage simulator simulator && stage test test_one || echo STAGE_FAILED

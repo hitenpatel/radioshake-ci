@@ -1,8 +1,11 @@
 import base64
 import contextlib
+import hashlib
 import tempfile
 from unittest import mock
 import io
+import json
+import subprocess
 import os
 import sys
 import unittest
@@ -48,6 +51,31 @@ class DiagnosticTests(unittest.TestCase):
         self.assertEqual(d.summarize_execution(SELECTOR,0,log,True)['outcome'], 'passed')
         mismatch = log.replace('Executed 1 tests', 'Executed 2 tests')
         self.assertNotEqual(d.summarize_execution(SELECTOR,0,mismatch,True)['outcome'], 'passed')
+
+    def test_native_skipped_summary_matches_terminal_counts(self):
+        summary = "\t Executed 2 tests, with 1 test skipped and 0 failures (0 unexpected) in 0.001 (0.002) seconds\n"
+        suite_line = "Test Suite 'ExampleTests' passed at 2026-11-07 07:54:30.810.\n"
+        mixed = case() + case('testTwo', result='skipped') + suite_line + summary
+        result = d.summarize_execution(SELECTOR, 0, mixed, True)
+        self.assertEqual((result['outcome'], result['passed'], result['skipped']), ('passed', 1, 1))
+        all_skipped = case(result='skipped') + suite_line + summary.replace('2 tests', '1 test')
+        self.assertNotEqual(d.summarize_execution(SELECTOR, 0, all_skipped, True)['outcome'], 'passed')
+        mismatch = mixed.replace('1 test skipped', '2 tests skipped')
+        self.assertNotEqual(d.summarize_execution(SELECTOR, 0, mismatch, True)['outcome'], 'passed')
+
+    def test_manifest_hashes_nested_manifest_json(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp); nested=root/'tests.xcresult'/'Data'/'manifest.json'; nested.parent.mkdir(parents=True)
+            nested.write_text('nested evidence')
+            (root/'stages.json').write_text(json.dumps({'test': 0}))
+            (root/'runtime.json').write_text('{}')
+            (root/'test.log').write_text(case()+suite())
+            env={'EVIDENCE':tmp, 'REF':REF, 'SHA':SHA, 'SELECTOR':SELECTOR, 'REQUEST_ID':UUID, 'DEVICE':'iPhone 17'}
+            with mock.patch.dict(os.environ,env), mock.patch.object(sys,'argv',['ios_diagnostic.py','manifest']), contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(d.main(),0)
+            hashes=json.loads((root/'manifest.json').read_text())['file_hashes']
+            self.assertEqual(hashes['tests.xcresult/Data/manifest.json'], hashlib.sha256(b'nested evidence').hexdigest())
+            self.assertNotIn('manifest.json',hashes)
 
     def test_terminal_counts_and_duplicates(self):
         log="Test Case '-[RadioShakeTests.ExampleTests testOne]' started.\n"+case()+case('testTwo',result='failed')+suite(result='failed', count=2, failures=1)
@@ -96,6 +124,35 @@ class DiagnosticTests(unittest.TestCase):
             self.assertNotIn(s,output.getvalue())
 
 class StructureTests(unittest.TestCase):
+    def test_simulator_state_and_failures(self):
+        import yaml
+        p=Path(__file__).resolve().parents[1]/'workflows'/'ios-diagnostic-tests.yml'
+        wf=yaml.safe_load(p.read_text())
+        run=next(x['run'] for x in wf['jobs']['diagnostic']['steps'] if x.get('name')=='Build and test one class')
+        function=run[run.index('simulator() {'):run.index('test_one()')]
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp); stub=root/'xcrun'
+            function=function.replace('/tmp/ios-diagnostic-devices.json',str(root/'devices.json')).replace('/tmp/ios-diagnostic-types.json',str(root/'types.json')).replace('/tmp/ios-diagnostic-udid',str(root/'udid'))
+            stub.write_text("""#!/usr/bin/env python3
+import json, os, sys
+args=sys.argv[1:]
+if args[:3]==['simctl','list','devices']:
+ print(json.dumps({'devices':{'com.apple.CoreSimulator.SimRuntime.iOS-26-5':[{'name':'iPhone 17','udid':'AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA','state':os.environ['SIM_STATE']}]}}))
+elif args[:2]==['simctl','boot']:
+ open(os.environ['CALLS'],'a').write('boot\\n'); sys.exit(int(os.environ['BOOT_RC']))
+elif args[:2]==['simctl','bootstatus']:
+ open(os.environ['CALLS'],'a').write('bootstatus\\n'); sys.exit(int(os.environ['READY_RC']))
+else: sys.exit(3)
+""")
+            stub.chmod(0o755)
+            for state, boot_rc, ready_rc, expected, calls in [('Shutdown',0,0,0,['boot','bootstatus']),('Booted',0,0,0,['bootstatus']),('Shutdown',1,0,1,['boot']),('Booted',0,1,1,['bootstatus'])]:
+                calls_file=root/'calls'; calls_file.write_text('')
+                env={**os.environ,'PATH':tmp+os.pathsep+os.environ['PATH'],'EVIDENCE':tmp,'DEVICE':'iPhone 17','SIM_STATE':state,'BOOT_RC':str(boot_rc),'READY_RC':str(ready_rc),'CALLS':str(calls_file)}
+                p=subprocess.run(['bash','-c',function+'\nsimulator'],env=env,capture_output=True,text=True)
+                with self.subTest(state=state,boot_rc=boot_rc,ready_rc=ready_rc):
+                    self.assertEqual(p.returncode,expected,p.stderr)
+                    self.assertEqual(calls_file.read_text().splitlines(),calls)
+
     def test_workflow_envelope(self):
         import yaml
         p=Path(__file__).resolve().parents[1]/'workflows'/'ios-diagnostic-tests.yml'
