@@ -16,8 +16,8 @@ import tempfile
 SOURCE_PATH = 'ios/App/SongId/StreamAudioCapture.swift'
 PROFILE = {
     'source_path': SOURCE_PATH,
-    'source_sha256': 'acb3030f4b5d06f220280e8a145599382af04e49168cb5a0328f9ba61643483d',
-    'inventory_sha256': 'cc4e955ebef2bc13a47d0112a1dd55cd79bd1706accd8fdeee8f9f887dcb9b0d',
+    'source_sha256': '7365e976ba1150e97018f11f41046b0ef0f8233b64484cb7fcfc4fb1e6710c3d',
+    'inventory_sha256': 'c38458b05a0a2f60642b94e7f8a09207dbe653119a3468abf196c2dc670d4029',
     'lines': 54, 'occurrences': 64,
     'slots': [
         (114, 'struct', '8984ee4a86b539291273a0d17220dd682b82d0aa7f5d43fcea5d559c4c20738f'),
