@@ -130,6 +130,7 @@ jobs:
         /tmp/ios-app-release-bundle-sha256.txt
         /tmp/ios-app-release-bundle-digest.txt
         /tmp/capture-probe-release-audit.json
+        /tmp/capture-probe-release-native-canary.json
     outputs:
       head_sha: ${{ steps.clone.outputs.head_sha }}
 
@@ -769,11 +770,12 @@ jobs:
           DEBUG_APP="$TMP_ROOT/derived-data/Build/Products/Debug-iphonesimulator/RadioShake.app"
           RELEASE_APP="$TMP_ROOT/derived-data-release/Build/Products/Release-iphonesimulator/RadioShake.app"
           RECEIPT="$TMP_ROOT/capture-probe-release-audit.json"
-          rm -f "$RECEIPT"
+          CANARY_RECEIPT="$TMP_ROOT/capture-probe-release-native-canary.json"
+          rm -f "$RECEIPT" "$CANARY_RECEIPT"
           python3 ci/.github/scripts/check_capture_probe_release.py \
             --source-root src --source-sha "$SOURCE_SHA" --ref-sha256 "$REF_SHA256" \
             --ci-sha "$CI_SHA" --debug-app "$DEBUG_APP" --release-app "$RELEASE_APP" \
-            --receipt "$RECEIPT"
+            --receipt "$RECEIPT" --canary-receipt "$CANARY_RECEIPT"
 
       - name: Audit Release binary for debug-only symbols (TASK-136 + TASK-137)
         run: |

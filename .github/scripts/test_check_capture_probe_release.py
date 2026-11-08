@@ -475,7 +475,9 @@ class WorkflowIntegrationTests(unittest.TestCase):
         self.assertEqual(step.count('realpath('), 1)
         self.assertIn("hashlib.sha256(os.environ['REQUESTED_REF'].encode('utf-8')).hexdigest()", step)
         self.assertNotIn('${{ inputs.ref', step.split('        run: |', 1)[1])
-        self.assertIn('rm -f "$RECEIPT"', step)
+        self.assertIn('CANARY_RECEIPT="$TMP_ROOT/capture-probe-release-native-canary.json"', step)
+        self.assertIn('--canary-receipt "$CANARY_RECEIPT"', step)
+        self.assertIn('rm -f "$RECEIPT" "$CANARY_RECEIPT"', step)
         self.assertIn('set -euo pipefail', step)
         self.assertNotIn('dispatch', step.lower())
         self.assertNotIn('strings ', step)
@@ -484,6 +486,8 @@ class WorkflowIntegrationTests(unittest.TestCase):
     def test_receipt_is_only_new_evidence_and_fixed_deny_is_unchanged(self):
         evidence = self.validate.split('      EVIDENCE_PATHS: |', 1)[1].split('    outputs:', 1)[0]
         self.assertEqual(evidence.count('/tmp/capture-probe-release-audit.json'), 1)
+        self.assertEqual(evidence.count('/tmp/capture-probe-release-native-canary.json'), 1)
+        self.assertEqual(len([line for line in evidence.splitlines() if 'capture-probe-' in line]), 2)
         self.assertNotIn('RadioShake.app', evidence)
         self.assertNotIn('src/ios/', evidence)
         self.assertNotIn('derived-data/', evidence)
