@@ -171,7 +171,7 @@ class CaptureAuditTests(unittest.TestCase):
     def test_receipt_replaces_prior_pass_and_discloses_no_canaries(self):
         receipt = self.root / 'receipt.json'
         receipt.write_text('{"status":"PASS"}')
-        args = ['--source-root', str(self.root), '--source-sha', 'bad-private-canary', '--ref-sha256', 'b' * 64, '--ci-sha', 'c' * 40, '--debug-app', str(self.debug), '--release-app', str(self.release), '--receipt', str(receipt)]
+        args = ['--source-root', str(self.root), '--source-sha', 'bad-private-canary', '--ref-sha256', 'b' * 64, '--ci-sha', 'c' * 40, '--debug-app', str(self.debug), '--release-app', str(self.release), '--receipt', str(receipt), '--canary-receipt', str(self.root / 'canary.json')]
         with mock.patch('sys.stdout', new_callable=__import__('io').StringIO) as out, mock.patch('sys.stderr', new_callable=__import__('io').StringIO) as err:
             self.assertEqual(audit.main(args), 1)
             output = out.getvalue() + err.getvalue() + receipt.read_text()
@@ -271,11 +271,11 @@ class CaptureAuditTests(unittest.TestCase):
     def test_actual_source_binary_plist_and_exception_canaries_stay_private(self):
         import io
         receipt = self.root / 'receipt.json'
-        args = ['--source-root', str(self.root), '--source-sha', self.head, '--ref-sha256', 'b' * 64, '--ci-sha', 'c' * 40, '--debug-app', str(self.debug), '--release-app', str(self.release), '--receipt', str(receipt)]
+        args = ['--source-root', str(self.root), '--source-sha', self.head, '--ref-sha256', 'b' * 64, '--ci-sha', 'c' * 40, '--debug-app', str(self.debug), '--release-app', str(self.release), '--receipt', str(receipt), '--canary-receipt', str(self.root / 'canary.json')]
         def run():
             with mock.patch.object(audit, 'PROFILE', self.profile), mock.patch('sys.stdout', new_callable=io.StringIO) as out, mock.patch('sys.stderr', new_callable=io.StringIO) as err:
                 status = audit.main(args)
-                return status, out.getvalue() + err.getvalue() + receipt.read_text()
+                return status, out.getvalue() + err.getvalue() + receipt.read_text() + (self.root / 'canary.json').read_text()
         # Source and binary marker are synthetic private canaries observed by real audit logic.
         binary = self.release / 'RadioShake'
         binary.write_bytes(binary.read_bytes() + self.markers[0])
@@ -296,6 +296,153 @@ class CaptureAuditTests(unittest.TestCase):
             status, output = run()
         self.assertEqual(status, 1)
         self.assertNotIn('private-exception-canary', output)
+
+
+    def test_canary_actual_synthetic_copy_and_cleanup(self):
+        baseline = self.run_audit()
+        original = (self.release / 'RadioShake').read_bytes()
+        original_factory = tempfile.TemporaryDirectory
+        created = []
+        def make_directory(*args, **kwargs):
+            directory = original_factory(*args, **kwargs)
+            created.append(Path(directory.name))
+            return directory
+        with mock.patch.object(audit.tempfile, 'TemporaryDirectory', side_effect=make_directory):
+            result = audit._canary(self.root, self.head, 'b' * 64, 'c' * 40, self.debug, self.release, baseline, 'd' * 64, self.profile)
+        self.assertEqual(len(created), 1)
+        self.assertFalse(created[0].exists())
+        self.assertEqual(result['status'], 'PASS')
+        self.assertEqual(result['observed_reason'], 'RELEASE_PRESENT_M01')
+        self.assertEqual(result['counts'], {f'M{i:02d}': int(i == 1) for i in range(1, 9)})
+        self.assertEqual(result['mutated_sha256'], sha(original + self.markers[0]))
+        self.assertEqual(result['mutated_size'], len(original) + len(self.markers[0]))
+        self.assertEqual(result['original_integrity'], 'PASS')
+        self.assertEqual(result['cleanup'], 'PASS')
+        self.assertEqual((self.release / 'RadioShake').read_bytes(), original)
+
+    def test_canary_baseline_fail_and_not_applicable_without_copy(self):
+        for status, reason in [('FAIL', 'BASELINE_NOT_PASS'), ('NOT_APPLICABLE', 'KNOWN_FEATURE_ABSENT')]:
+            baseline = {'status': status}
+            result = audit._canary(self.root, self.head, 'b'*64, 'c'*40, self.debug, self.release, baseline, 'd'*64, self.profile)
+            self.assertEqual(result['status'], status)
+            self.assertEqual(result['reason'], reason)
+            self.assertEqual(result['control'], 'NOT_RUN')
+
+    def test_canary_result_rejects_mismatched_fields(self):
+        import copy
+        baseline = self.run_audit()
+        path = self.release / 'RadioShake'
+        old = path.read_bytes()
+        path.write_bytes(old + self.markers[0])
+        observed = self.run_audit()
+        path.write_bytes(old)
+        expected_hash, expected_size = sha(old + self.markers[0]), len(old) + len(self.markers[0])
+        audit._check_canary_result(baseline, observed, expected_hash, expected_size)
+        for keys, value in [(('reason',), 'OTHER'), (('binary_result',), 'PASS'), (('source_sha',), '0'*40), (('source_guard',), {}), (('binaries','debug_code','sha256'), '0'*64), (('binaries','debug_launcher','counts','M01'), 999), (('binaries','release_main','counts','M01'), 2), (('binaries','release_main','counts','M02'), 1), (('binaries','release_main','sha256'), '0'*64), (('binaries','release_main','size'), 0), (('binaries','release_main','outcome'), 'PASS')]:
+            with self.subTest(keys=keys):
+                bad = copy.deepcopy(observed)
+                node = bad
+                for key in keys[:-1]: node = node[key]
+                node[keys[-1]] = value
+                with self.assertRaises(audit.AuditError):
+                    audit._check_canary_result(baseline, bad, expected_hash, expected_size)
+
+    def test_canary_original_changed_and_io_failures_are_closed(self):
+        baseline = self.run_audit()
+        p = self.release / 'RadioShake'
+        p.write_bytes(p.read_bytes() + b'changed')
+        result = audit._canary(self.root, self.head, 'b'*64, 'c'*40, self.debug, self.release, baseline, 'd'*64, self.profile)
+        self.assertEqual(result['status'], 'FAIL')
+        for name in ('read_bounded', '_copy_release', '_append_marker', '_cleanup_copy'):
+            with self.subTest(name=name):
+                # Fresh regular baseline; inject only I/O failures, never audit decisions.
+                current = self.run_audit()
+                original = getattr(audit, name)
+                def fail_io(*args):
+                    if name == '_cleanup_copy':
+                        original(*args)
+                    raise OSError('private-exception-canary')
+                with mock.patch.object(audit, name, side_effect=fail_io):
+                    result = audit._canary(self.root, self.head, 'b'*64, 'c'*40, self.debug, self.release, current, 'd'*64, self.profile)
+                self.assertEqual(result['status'], 'FAIL')
+                self.assertNotIn('private-exception-canary', json.dumps(result))
+
+    def test_canary_cli_requires_distinct_safe_outputs(self):
+        receipt = self.root / 'receipt.json'
+        second = self.root / 'second.json'
+        args = ['--source-root',str(self.root),'--source-sha',self.head,'--ref-sha256','b'*64,'--ci-sha','c'*40,'--debug-app',str(self.debug),'--release-app',str(self.release),'--receipt',str(receipt)]
+        with mock.patch('sys.stderr', new_callable=__import__('io').StringIO):
+            self.assertEqual(audit.main(args), 2)
+            self.assertNotEqual(audit.main(args + ['--canary-receipt', str(receipt)]), 0)
+            alias = self.root / 'link'
+            alias.symlink_to(self.root, target_is_directory=True)
+            self.assertNotEqual(audit.main(args + ['--canary-receipt', str(alias / 'second.json')]), 0)
+            self.assertNotEqual(audit.main(args + ['--canary-receipt',str(second),'--skip-canary']), 0)
+
+    def test_canary_detects_changed_original_plist_and_binary(self):
+        for path in (self.release / 'Info.plist', self.release / 'RadioShake', self.debug / 'Info.plist'):
+            with self.subTest(file=path.name, app=path.parent.name):
+                baseline = self.run_audit()
+                before = path.read_bytes()
+                append = audit._append_marker
+                def change_original(copy_path, marker):
+                    append(copy_path, marker)
+                    if path.name == 'Info.plist':
+                        info = plistlib.loads(before)
+                        info['SyntheticChange'] = 'changed'
+                        path.write_bytes(plistlib.dumps(info))
+                    else:
+                        path.write_bytes(before + b'changed')
+                with mock.patch.object(audit, '_append_marker', side_effect=change_original):
+                    result = audit._canary(self.root, self.head, 'b'*64, 'c'*40, self.debug, self.release, baseline, 'd'*64, self.profile)
+                path.write_bytes(before)
+                self.assertEqual(result['status'], 'FAIL')
+                self.assertEqual(result['reason'], 'ORIGINAL_CHANGED')
+                self.assertEqual(result['cleanup'], 'PASS')
+
+    def test_canary_copy_size_capacity_and_symlink_inputs(self):
+        source = self.root / 'big'
+        with source.open('wb') as stream:
+            stream.truncate(1024 * 1024 * 1024)
+        with self.assertRaises(audit.AuditError):
+            audit._copy_release(source, self.root / 'copy', {'size': source.stat().st_size, 'sha256': 'a'*64}, self.markers[0])
+        alias = self.root / 'binary-link'
+        alias.symlink_to(self.release / 'RadioShake')
+        with self.assertRaises(audit.AuditError):
+            audit._copy_release(alias, self.root / 'copy', {'size': 0, 'sha256': 'a'*64}, self.markers[0])
+
+    def test_both_prior_receipts_replaced_with_fail_on_regular_failure(self):
+        receipt, second = self.root / 'receipt.json', self.root / 'second.json'
+        receipt.write_text('{"status":"PASS"}')
+        second.write_text('{"status":"PASS"}')
+        args = ['--source-root',str(self.root),'--source-sha','0'*40,'--ref-sha256','b'*64,'--ci-sha','c'*40,'--debug-app',str(self.debug),'--release-app',str(self.release),'--receipt',str(receipt),'--canary-receipt',str(second)]
+        with mock.patch('sys.stdout', new_callable=__import__('io').StringIO) as out:
+            self.assertEqual(audit.main(args), 1)
+        self.assertEqual(json.loads(receipt.read_text())['status'], 'FAIL')
+        self.assertEqual(json.loads(second.read_text())['reason'], 'BASELINE_NOT_PASS')
+        self.assertNotIn(str(self.root), out.getvalue() + receipt.read_text() + second.read_text())
+
+    def test_receipt_write_failure_leaves_both_initial_failures(self):
+        first, second = self.root / 'one.json', self.root / 'two.json'
+        first.write_text('{"status":"PASS"}')
+        second.write_text('{"status":"PASS"}')
+        args = ['--source-root',str(self.root),'--source-sha','0'*40,'--ref-sha256','b'*64,'--ci-sha','c'*40,'--debug-app',str(self.debug),'--release-app',str(self.release),'--receipt',str(first),'--canary-receipt',str(second)]
+        write = audit.write_receipt
+        calls = []
+        def fail_third(*values):
+            calls.append(1)
+            if len(calls) == 3:
+                raise OSError('private-write-canary')
+            return write(*values)
+        with mock.patch.object(audit, 'write_receipt', side_effect=fail_third), mock.patch('sys.stderr', new_callable=__import__('io').StringIO) as err:
+            self.assertEqual(audit.main(args), 1)
+        self.assertEqual(json.loads(first.read_text())['reason'], 'INCOMPLETE')
+        self.assertEqual(json.loads(second.read_text())['reason'], 'INCOMPLETE')
+        self.assertNotIn('private-write-canary', err.getvalue())
+
+    def test_regular_audit_body_unchanged(self):
+        import inspect
+        self.assertEqual(sha(inspect.getsource(audit._audit).encode()), '72cb84e25bbc0f9b5080bd9c941d15bb5c047f1e0d660edfc16d92b302c12ee9')
 
 
 class WorkflowIntegrationTests(unittest.TestCase):

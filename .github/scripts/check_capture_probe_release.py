@@ -221,6 +221,138 @@ def audit(source_root, source_sha, ref_sha256, ci_sha, debug_app, release_app):
     return _audit(source_root, source_sha, ref_sha256, ci_sha, debug_app, release_app, PROFILE)
 
 
+
+_IDENTITY_FIELDS = ('source_sha', 'source_sha256', 'ref_sha256', 'ci_sha', 'checker_sha256', 'source_guard')
+_BINARY_FIELDS = ('size', 'sha256', 'counts')
+
+
+def _check_canary_result(baseline, observed, expected_sha256, expected_size):
+    try:
+        if baseline['status'] != 'PASS' or baseline['binary_result'] != 'PASS':
+            fail('CANARY_RESULT_MISMATCH')
+        if (observed['status'], observed['reason'], observed['binary_result']) != ('FAIL', 'RELEASE_PRESENT_M01', 'FAIL'):
+            fail('CANARY_RESULT_MISMATCH')
+        for key in _IDENTITY_FIELDS:
+            if baseline[key] != observed[key]:
+                fail('CANARY_RESULT_MISMATCH')
+        for role in ('debug_launcher', 'debug_code'):
+            for key in _BINARY_FIELDS:
+                if baseline['binaries'][role][key] != observed['binaries'][role][key]:
+                    fail('CANARY_RESULT_MISMATCH')
+        if observed['binaries']['debug_launcher']['outcome'] != 'OBSERVED' or observed['binaries']['debug_code']['outcome'] != 'PASS':
+            fail('CANARY_RESULT_MISMATCH')
+        release = observed['binaries']['release_main']
+        counts = {f'M{i:02d}': int(i == 1) for i in range(1, 9)}
+        if release['outcome'] != 'FAIL' or release['counts'] != counts or release['sha256'] != expected_sha256 or release['size'] != expected_size:
+            fail('CANARY_RESULT_MISMATCH')
+    except (KeyError, TypeError):
+        fail('CANARY_RESULT_MISMATCH')
+
+
+def _copy_release(source, dest, baseline, marker):
+    source = safe_path(source)
+    size = source.stat().st_size
+    if size != baseline['size'] or size + len(marker) > 1024 * 1024 * 1024:
+        fail('COPY_SIZE_INVALID')
+    original_hash, mutated_hash = hashlib.sha256(), hashlib.sha256()
+    total = 0
+    with source.open('rb') as inp, dest.open('xb') as out:
+        os.chmod(dest, 0o600)
+        while True:
+            chunk = inp.read(CHUNK)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > size:
+                fail('COPY_SIZE_INVALID')
+            original_hash.update(chunk)
+            mutated_hash.update(chunk)
+            out.write(chunk)
+    if total != size or original_hash.hexdigest() != baseline['sha256']:
+        fail('COPY_MISMATCH')
+    mutated_hash.update(marker)
+    return mutated_hash.hexdigest(), size + len(marker)
+
+
+def _append_marker(path, marker):
+    with path.open('ab') as stream:
+        stream.write(marker)
+
+
+def _cleanup_copy(directory):
+    directory.cleanup()
+
+
+def _canary(source_root, source_sha, ref_sha256, ci_sha, debug_app, release_app, baseline, baseline_receipt_sha256, profile):
+    result = {'schema': 1, 'profile': 'capture-probe-native-canary-v1', 'status': 'FAIL', 'reason': 'BASELINE_NOT_PASS', 'control': 'NOT_RUN'}
+    if baseline.get('status') == 'NOT_APPLICABLE':
+        result.update(status='NOT_APPLICABLE', reason='KNOWN_FEATURE_ABSENT')
+        return result
+    if baseline.get('status') != 'PASS':
+        return result
+    directory = None
+    try:
+        if not re.fullmatch(r'[0-9a-f]{64}', baseline_receipt_sha256):
+            fail('CANARY_INPUT_INVALID')
+        for key, value in (('source_sha', source_sha), ('ref_sha256', ref_sha256), ('ci_sha', ci_sha)):
+            if baseline[key] != value:
+                fail('CANARY_INPUT_INVALID')
+        source = read_bounded(Path(source_root) / profile['source_path'], 2 * 1024 * 1024)
+        markers = markers_for_source(source, profile)
+        if markers is None or digest(source) != baseline['source_sha256']:
+            fail('CANARY_INPUT_INVALID')
+        marker = markers[0]
+        plist_hashes = {role: digest(read_bounded(Path(app) / 'Info.plist', 1024 * 1024)) for role, app in (('debug', debug_app), ('release', release_app))}
+        directory = tempfile.TemporaryDirectory(prefix='capture-canary-', dir=os.path.realpath('/tmp'))
+        bundle = Path(directory.name) / 'Release.app'
+        bundle.mkdir(mode=0o700)
+        plist_data = read_bounded(Path(release_app) / 'Info.plist', 1024 * 1024)
+        if digest(plist_data) != plist_hashes['release']:
+            fail('ORIGINAL_CHANGED')
+        with (bundle / 'Info.plist').open('xb') as stream:
+            os.chmod(bundle / 'Info.plist', 0o600)
+            stream.write(plist_data)
+        expected_hash, expected_size = _copy_release(Path(release_app) / 'RadioShake', bundle / 'RadioShake', baseline['binaries']['release_main'], marker)
+        _append_marker(bundle / 'RadioShake', marker)
+        observed = _audit(source_root, source_sha, ref_sha256, ci_sha, debug_app, bundle, profile)
+        _check_canary_result(baseline, observed, expected_hash, expected_size)
+        original = _audit(source_root, source_sha, ref_sha256, ci_sha, debug_app, release_app, profile)
+        if original.get('status') != 'PASS' or original.get('reason') != 'OK' or original.get('binary_result') != 'PASS':
+            fail('ORIGINAL_CHANGED')
+        for key in _IDENTITY_FIELDS:
+            if original[key] != baseline[key]:
+                fail('ORIGINAL_CHANGED')
+        for role in ('debug_launcher', 'debug_code', 'release_main'):
+            if original['binaries'][role] != baseline['binaries'][role]:
+                fail('ORIGINAL_CHANGED')
+        for role, app in (('debug', debug_app), ('release', release_app)):
+            if digest(read_bounded(Path(app) / 'Info.plist', 1024 * 1024)) != plist_hashes[role]:
+                fail('ORIGINAL_CHANGED')
+        result.update(reason='INCOMPLETE', control='PASS', marker='M01', baseline_receipt_sha256=baseline_receipt_sha256,
+                      provenance={key: baseline[key] for key in _IDENTITY_FIELDS},
+                      binaries={role: baseline['binaries'][role] for role in ('debug_launcher', 'debug_code', 'release_main')},
+                      plist_sha256=plist_hashes, mutated_sha256=expected_hash, mutated_size=expected_size,
+                      counts=observed['binaries']['release_main']['counts'], observed_reason=observed['reason'], original_integrity='PASS')
+    except AuditError as exc:
+        result['reason'] = str(exc)
+    except Exception:
+        result['reason'] = 'CANARY_IO_ERROR'
+    finally:
+        if directory is not None:
+            try:
+                _cleanup_copy(directory)
+                result['cleanup'] = 'PASS'
+            except Exception:
+                result.update(status='FAIL', reason='CLEANUP_FAILED', cleanup='FAIL')
+    if result['reason'] == 'INCOMPLETE' and result.get('cleanup') == 'PASS':
+        result.update(status='PASS', reason='OK')
+    return result
+
+
+def canary(source_root, source_sha, ref_sha256, ci_sha, debug_app, release_app, baseline, baseline_receipt_sha256):
+    return _canary(source_root, source_sha, ref_sha256, ci_sha, debug_app, release_app, baseline, baseline_receipt_sha256, PROFILE)
+
+
 def write_receipt(path, receipt):
     if '..' in Path(path).parts:
         fail('UNSAFE_PATH')
@@ -243,8 +375,8 @@ def main(argv):
     class QuietParser(argparse.ArgumentParser):
         def error(self, message):
             raise ValueError('invalid arguments')
-    parser = QuietParser(add_help=False)
-    for arg in ('source-root', 'source-sha', 'ref-sha256', 'ci-sha', 'debug-app', 'release-app', 'receipt'):
+    parser = QuietParser(add_help=False, allow_abbrev=False)
+    for arg in ('source-root', 'source-sha', 'ref-sha256', 'ci-sha', 'debug-app', 'release-app', 'receipt', 'canary-receipt'):
         parser.add_argument('--' + arg, required=True)
     try:
         args = parser.parse_args(argv)
@@ -252,14 +384,27 @@ def main(argv):
         print('FAIL ARGUMENT_INVALID', file=sys.stderr)
         return 2
     try:
-        write_receipt(args.receipt, {'schema': 1, 'profile': 'capture-probe-release-v1', 'status': 'FAIL', 'reason': 'INCOMPLETE'})
+        paths = [Path(args.receipt), Path(args.canary_receipt)]
+        for path in paths:
+            if '..' in path.parts:
+                fail('UNSAFE_PATH')
+            safe_path(path.parent, directory=True)
+            if os.path.lexists(path):
+                safe_path(path)
+        if os.path.abspath(paths[0]) == os.path.abspath(paths[1]) or (paths[0].exists() and paths[1].exists() and os.path.samefile(*paths)):
+            fail('UNSAFE_PATH')
+        write_receipt(paths[0], {'schema': 1, 'profile': 'capture-probe-release-v1', 'status': 'FAIL', 'reason': 'INCOMPLETE'})
+        write_receipt(paths[1], {'schema': 1, 'profile': 'capture-probe-native-canary-v1', 'status': 'FAIL', 'reason': 'INCOMPLETE', 'control': 'NOT_RUN'})
         result = audit(Path(args.source_root), args.source_sha, args.ref_sha256, args.ci_sha, Path(args.debug_app), Path(args.release_app))
-        write_receipt(args.receipt, result)
+        write_receipt(paths[0], result)
+        receipt_hash = digest(read_bounded(paths[0], 2 * 1024 * 1024))
+        supplement = canary(Path(args.source_root), args.source_sha, args.ref_sha256, args.ci_sha, Path(args.debug_app), Path(args.release_app), result, receipt_hash)
+        write_receipt(paths[1], supplement)
     except Exception:
         print('FAIL RECEIPT_ERROR', file=sys.stderr)
         return 1
-    print(result['status'], result['reason'])
-    return 0 if result['status'] in ('PASS', 'NOT_APPLICABLE') else 1
+    print(result['status'], result['reason'], supplement['status'], supplement['reason'])
+    return 0 if (result['status'], supplement['status']) in (('PASS', 'PASS'), ('NOT_APPLICABLE', 'NOT_APPLICABLE')) else 1
 
 
 if __name__ == '__main__':
