@@ -1046,7 +1046,7 @@ jobs:
     name: ui-shard-${{ matrix.shard }}
     needs: resolve
     runs-on: macos-26
-    timeout-minutes: 120
+    timeout-minutes: 180  # 2026-11-11: the UI suite outgrew 120 on contended runners
     strategy:
       fail-fast: false
       matrix:
