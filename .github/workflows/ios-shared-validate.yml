@@ -249,6 +249,19 @@ jobs:
           python3 -m unittest scripts/test_check_ios_spike_residue.py
           python3 scripts/check_ios_spike_residue.py ios scripts .forgejo .github
 
+      - name: Timeshift memory-only check (Phase 6c, App Review 5.2.3)
+        working-directory: src
+        run: |
+          set -euo pipefail
+          if [ ! -f scripts/check_timeshift_memory_only.py ]; then
+            echo "Source ref predates Phase 6c: timeshift memory-only check not present, skipping"
+            exit 0
+          fi
+          if [ -f scripts/test_check_timeshift_memory_only.py ]; then
+            python3 -m unittest scripts/test_check_timeshift_memory_only.py
+          fi
+          python3 scripts/check_timeshift_memory_only.py
+
       - name: Apple Music badge assets check (Phase 4b D9)
         working-directory: src
         run: |
