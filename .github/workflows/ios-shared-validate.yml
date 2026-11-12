@@ -111,7 +111,7 @@ jobs:
     # cannot silently drift. macos-26 = Apple Silicon (arm64) image.
     needs: resolve
     runs-on: macos-26
-    timeout-minutes: 120
+    timeout-minutes: 180
     env:
       # Single source of truth for what gets uploaded: the secret scan and
       # the upload step both read this list, so they cannot drift apart.
