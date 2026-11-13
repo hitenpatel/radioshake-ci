@@ -507,12 +507,14 @@ class ProfileSelectionTests(unittest.TestCase):
     """Phase 5e: two reviewed StreamAudioCapture.swift sources are accepted; anything else keeps the drift check."""
 
     def root_with(self, data):
-        directory = tempfile.TemporaryDirectory()
+        # Resolved: macOS temp folders sit behind /var -> /private/var, and the checker refuses symlinked paths.
+        directory = tempfile.TemporaryDirectory(dir=os.path.realpath(tempfile.gettempdir()))
         self.addCleanup(directory.cleanup)
-        path = Path(directory.name) / audit.SOURCE_PATH
+        root = os.path.realpath(directory.name)
+        path = Path(root) / audit.SOURCE_PATH
         path.parent.mkdir(parents=True)
         path.write_bytes(data)
-        return directory.name
+        return root
 
     def test_the_profile_whose_digest_matches_is_chosen(self):
         a, b = b'struct A {}\n', b'struct B {}\n'
@@ -526,9 +528,9 @@ class ProfileSelectionTests(unittest.TestCase):
         self.assertIs(audit.profile_for(self.root_with(b'struct Other {}\n')), audit.PROFILE)
 
     def test_a_missing_source_falls_back_to_the_first_profile(self):
-        directory = tempfile.TemporaryDirectory()
+        directory = tempfile.TemporaryDirectory(dir=os.path.realpath(tempfile.gettempdir()))
         self.addCleanup(directory.cleanup)
-        self.assertIs(audit.profile_for(directory.name), audit.PROFILE)
+        self.assertIs(audit.profile_for(os.path.realpath(directory.name)), audit.PROFILE)
 
     def test_the_5e_profile_moves_only_the_func_slot(self):
         self.assertEqual(audit.PROFILE_5E['slots'][:7], audit.PROFILE['slots'][:7])
