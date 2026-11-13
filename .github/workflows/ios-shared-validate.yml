@@ -946,10 +946,10 @@ jobs:
           echo "=== Validation Evidence ==="
           echo "SHA: $(git rev-parse HEAD)"
           echo "Runner: $(uname -a)"
-          echo "Xcode: $(xcodebuild -version | head -1)"
+          echo "Xcode: $(xcodebuild -version 2>/dev/null | sed -n 1p)"   # sed reads all: head closing the pipe crashed xcodebuild (5e run 43409665958)
           echo "SDK (device): $(xcrun --sdk iphoneos --show-sdk-path)"
           echo "SDK (simulator): $(xcrun --sdk iphonesimulator --show-sdk-path)"
-          echo "Java: $(java -version 2>&1 | head -1)"
+          echo "Java: $(java -version 2>&1 | sed -n 1p)"
           echo "Date: $(date -u)"
 
           # List test reports
@@ -1299,7 +1299,7 @@ jobs:
           set -euo pipefail
           echo "=== Shard $SHARD evidence ==="
           echo "SHA: $(git -C src rev-parse HEAD)"
-          echo "Xcode: $(xcodebuild -version | head -1)"
+          echo "Xcode: $(xcodebuild -version 2>/dev/null | sed -n 1p)"   # sed reads all: head closing the pipe crashed xcodebuild (5e run 43409665958)
           echo "Date: $(date -u)"
 
       # Nothing uploaded may contain the Forgejo tokens (raw, or the base64
