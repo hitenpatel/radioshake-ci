@@ -500,3 +500,37 @@ class WorkflowIntegrationTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+@unittest.skipIf(audit is None, 'checker missing')
+class ProfileSelectionTests(unittest.TestCase):
+    """Phase 5e: two reviewed StreamAudioCapture.swift sources are accepted; anything else keeps the drift check."""
+
+    def root_with(self, data):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        path = Path(directory.name) / audit.SOURCE_PATH
+        path.parent.mkdir(parents=True)
+        path.write_bytes(data)
+        return directory.name
+
+    def test_the_profile_whose_digest_matches_is_chosen(self):
+        a, b = b'struct A {}\n', b'struct B {}\n'
+        first = dict(audit.PROFILE, source_sha256=sha(a))
+        second = dict(audit.PROFILE, source_sha256=sha(b))
+        with mock.patch.object(audit, 'PROFILES', (first, second)), mock.patch.object(audit, 'PROFILE', first):
+            self.assertIs(audit.profile_for(self.root_with(b)), second)
+            self.assertIs(audit.profile_for(self.root_with(a)), first)
+
+    def test_an_unreviewed_source_falls_back_to_the_first_profile(self):
+        self.assertIs(audit.profile_for(self.root_with(b'struct Other {}\n')), audit.PROFILE)
+
+    def test_a_missing_source_falls_back_to_the_first_profile(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.assertIs(audit.profile_for(directory.name), audit.PROFILE)
+
+    def test_the_5e_profile_moves_only_the_func_slot(self):
+        self.assertEqual(audit.PROFILE_5E['slots'][:7], audit.PROFILE['slots'][:7])
+        self.assertEqual(audit.PROFILE_5E['slots'][7], (612, 'func', audit.PROFILE['slots'][7][2]))
+        self.assertNotEqual(audit.PROFILE_5E['source_sha256'], audit.PROFILE['source_sha256'])

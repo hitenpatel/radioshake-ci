@@ -31,6 +31,22 @@ PROFILE = {
     ],
 }
 CHUNK = 1024 * 1024
+# Phase 5e (RadioShake feat/ios-phase5e, 2026-11-13): 8 reviewed lines (the data saver's dataSaverActive hook and two
+# guards, no probe identifiers) shift the func slot from 607 to 612. Both sources are accepted until 5e reaches main.
+PROFILE_5E = dict(PROFILE, source_sha256='14f5e730eb7c935604a8ffebd757819b2d2b6bc407d66fd97ec30fd971eda90d',
+                  slots=PROFILE['slots'][:7] + [(612, 'func', PROFILE['slots'][7][2])])
+PROFILES = (PROFILE, PROFILE_5E)
+
+
+def profile_for(source_root):
+    """The reviewed profile whose source digest matches the file; the first one otherwise (so drift still fails)."""
+    try:
+        data = read_bounded(Path(source_root) / SOURCE_PATH, 2 * 1024 * 1024)
+    except (AuditError, OSError):
+        return PROFILE
+    return next((p for p in PROFILES if digest(data) == p['source_sha256']), PROFILE)
+
+
 
 
 class AuditError(Exception):
@@ -218,7 +234,7 @@ def _audit(source_root, source_sha, ref_sha256, ci_sha, debug_app, release_app, 
 
 
 def audit(source_root, source_sha, ref_sha256, ci_sha, debug_app, release_app):
-    return _audit(source_root, source_sha, ref_sha256, ci_sha, debug_app, release_app, PROFILE)
+    return _audit(source_root, source_sha, ref_sha256, ci_sha, debug_app, release_app, profile_for(source_root))
 
 
 
@@ -350,7 +366,8 @@ def _canary(source_root, source_sha, ref_sha256, ci_sha, debug_app, release_app,
 
 
 def canary(source_root, source_sha, ref_sha256, ci_sha, debug_app, release_app, baseline, baseline_receipt_sha256):
-    return _canary(source_root, source_sha, ref_sha256, ci_sha, debug_app, release_app, baseline, baseline_receipt_sha256, PROFILE)
+    return _canary(source_root, source_sha, ref_sha256, ci_sha, debug_app, release_app, baseline, baseline_receipt_sha256,
+                   profile_for(source_root))
 
 
 def write_receipt(path, receipt):
