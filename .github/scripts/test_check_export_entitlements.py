@@ -290,6 +290,59 @@ class WidgetsGuardWithProjectSpecTests(unittest.TestCase):
         self.assertIn("RadioShakeWidgets.appex", message)
 
 
+SPEC_ICLOUD = SPEC_5C + ("        com.apple.developer.icloud-container-identifiers:\n          - iCloud.com.radioshake\n"
+                         "        com.apple.developer.icloud-services:\n          - CloudKit\n"
+                         "        aps-environment: development\n")
+
+
+def icloud(container="iCloud.com.radioshake", service="CloudKit", aps="production") -> bytes:
+    out = (b"<key>com.apple.developer.icloud-container-identifiers</key><array><string>" + container.encode()
+           + b"</string></array><key>com.apple.developer.icloud-services</key><array><string>" + service.encode()
+           + b"</string></array>")
+    return out + (b"<key>aps-environment</key><string>" + aps.encode() + b"</string>" if aps else b"")
+
+
+class ICloudExportGuardTests(unittest.TestCase):
+    def check(self, spec, *entries, **kwargs):
+        app_ents = output(attest(b"production"), groups(GROUP), DOMAINS, *entries)
+        with tempfile.TemporaryDirectory() as root:
+            app = make_app(root, **kwargs)
+            return gate.check_widgets(app, codesign_for(app_ents, output(groups(GROUP))), project_yml=spec)
+
+    def test_icloud_declared_helper(self):
+        self.assertTrue(gate.icloud_declared(SPEC_ICLOUD))
+        self.assertFalse(gate.icloud_declared(SPEC_5C))
+        self.assertFalse(gate.icloud_declared("# com.apple.developer.icloud-container-identifiers:\n"))
+
+    def test_keys_present_and_production_pass(self):
+        status, message = self.check(SPEC_ICLOUD, icloud())
+        self.assertEqual(status, "pass", message)
+        self.assertIn("aps-environment", message)
+
+    def test_development_push_environment_fails(self):
+        status, message = self.check(SPEC_ICLOUD, icloud(aps="development"))
+        self.assertEqual(status, "fail")
+        self.assertIn("entitlements missing at export", message)
+        self.assertIn("aps-environment", message)
+
+    def test_missing_push_environment_fails(self):
+        self.assertEqual(self.check(SPEC_ICLOUD, icloud(aps=""))[0], "fail")
+
+    def test_missing_keys_fail(self):
+        status, message = self.check(SPEC_ICLOUD)
+        self.assertEqual(status, "fail")
+        self.assertIn("icloud-container-identifiers", message)
+
+    def test_wrong_container_or_service_fails(self):
+        self.assertEqual(self.check(SPEC_ICLOUD, icloud(container="iCloud.other"))[0], "fail")
+        status, message = self.check(SPEC_ICLOUD, icloud(service="CloudDocuments"))
+        self.assertEqual(status, "fail")
+        self.assertIn("CloudKit", message)
+
+    def test_an_old_spec_without_icloud_is_not_checked(self):
+        self.assertEqual(self.check(SPEC_5C)[0], "pass")
+
+
 class WidgetsCommandLineTests(unittest.TestCase):
     SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "check_export_entitlements.py")
 

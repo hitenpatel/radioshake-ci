@@ -416,17 +416,25 @@ jobs:
           [[ "$VERSION" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]] || fail "bad marketing version"
           [[ "$SHA" =~ ^[0-9a-f]{40}$ ]] || fail "bad sha"
 
-          TEAM="$TEAM" python3 - "$OPTIONS" <<'PY'
+          TEAM="$TEAM" python3 - "$OPTIONS" "$GITHUB_WORKSPACE/src/ios/project.yml" <<'PY'
           import os, plistlib, sys
+          options = {
+              "method": "app-store-connect",
+              "destination": "upload",
+              "teamID": os.environ["TEAM"],
+              "signingStyle": "automatic",
+              "uploadSymbols": True,
+              "manageAppVersionAndBuildNumber": False,
+          }
+          # Phase 5e: a source that declares the iCloud container exports against the Production CloudKit environment
+          # (older shas do not declare it, so re-releasing them is unchanged).
+          with open(sys.argv[2], encoding="utf-8") as fh:
+              spec = fh.read()
+          if any("com.apple.developer.icloud-container-identifiers" in line
+                 for line in spec.splitlines() if not line.lstrip().startswith("#")):
+              options["iCloudContainerEnvironment"] = "Production"
           with open(sys.argv[1], "wb") as fh:
-              plistlib.dump({
-                  "method": "app-store-connect",
-                  "destination": "upload",
-                  "teamID": os.environ["TEAM"],
-                  "signingStyle": "automatic",
-                  "uploadSymbols": True,
-                  "manageAppVersionAndBuildNumber": False,
-              }, fh)
+              plistlib.dump(options, fh)
           PY
 
           # The archive carries an ad-hoc signature (no identity, no team id, no profile) only so the
@@ -606,7 +614,7 @@ jobs:
               echo "$message"
             else
               echo "$message"
-              fail "entitlements missing at export: the signed app or the widget extension lacks the App Group or the associated domain; see the runbook, App Group and the widget extension"
+              fail "entitlements missing at export: the signed app or the widget extension lacks the App Group, the associated domain or the iCloud keys (aps-environment must be production); see the runbook, App Group and the widget extension"
             fi
             rm -rf "$gate_dir" "$gate_app"
           }

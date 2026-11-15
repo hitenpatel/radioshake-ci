@@ -53,6 +53,10 @@ YML_ALL = YML_5C + "        CFBundleURLSchemes: [radioshake]\n        NSSupports
           "        NSAlarmKitUsageDescription: x\n          - applinks:radioshake.media\n"
 
 
+YML_ICLOUD = YML_5C + "        com.apple.developer.icloud-container-identifiers:\n          - iCloud.com.radioshake\n" \
+             "        com.apple.developer.icloud-services:\n          - CloudKit\n        aps-environment: development\n"
+
+
 class ProbeTests(unittest.TestCase):
     def run_probe(self, yml=YML_5C, app_ents=GOOD, appex_ents=GOOD, **kwargs):
         with tempfile.TemporaryDirectory() as root:
@@ -99,6 +103,35 @@ class ProbeTests(unittest.TestCase):
                  "NSAlarmKitUsageDescription": "x"}
         self.assertEqual(self.run_probe(yml=YML_ALL, app_extra=extra,
                                         app_ents=ents(**{GROUPS: [GROUP], DOMAINS: ["applinks:radioshake.media"]})), [])
+
+    def icloud_ents(self, container=("iCloud.com.radioshake",), services=("CloudKit",), aps="development"):
+        raw = ents(**{GROUPS: [GROUP], "com.apple.developer.icloud-container-identifiers": list(container),
+                      "com.apple.developer.icloud-services": list(services)})
+        if aps:
+            raw = raw.replace(b"</dict>", b"<key>aps-environment</key><string>" + aps.encode() + b"</string></dict>")
+        return raw
+
+    def test_icloud_keys_present_pass(self):
+        self.assertEqual(self.run_probe(yml=YML_ICLOUD, app_ents=self.icloud_ents()), [])
+
+    def test_icloud_keys_missing_fail(self):
+        errors = self.run_probe(yml=YML_ICLOUD, app_ents=GOOD)
+        self.assertEqual(len(errors), 3, errors)
+        joined = " ".join(errors)
+        for word in ("icloud-container-identifiers", "icloud-services", "aps-environment"):
+            self.assertIn(word, joined)
+
+    def test_wrong_container_or_service_or_missing_aps_fail(self):
+        self.assertEqual(len(self.run_probe(yml=YML_ICLOUD, app_ents=self.icloud_ents(container=("iCloud.other",)))), 1)
+        self.assertEqual(len(self.run_probe(yml=YML_ICLOUD, app_ents=self.icloud_ents(services=("CloudDocuments",)))), 1)
+        self.assertEqual(len(self.run_probe(yml=YML_ICLOUD, app_ents=self.icloud_ents(aps=""))), 1)
+
+    def test_an_old_project_without_icloud_skips_the_checks(self):
+        self.assertEqual(self.run_probe(yml=YML_5C, app_ents=GOOD), [])
+
+    def test_a_commented_icloud_declaration_skips_the_checks(self):
+        yml = YML_5C + "        # com.apple.developer.icloud-container-identifiers:\n"
+        self.assertEqual(self.run_probe(yml=yml, app_ents=GOOD), [])
 
     def test_a_comment_does_not_declare_a_key(self):
         yml = YML_5C + "        # CFBundleURLSchemes: [radioshake]\n"

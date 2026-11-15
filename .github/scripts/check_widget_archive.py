@@ -8,6 +8,9 @@ be exported or uploaded yet. It proves the archive carries what the export will 
   * the app's built Info.plist has RSAppGroup = group.com.radioshake, and (each only when the XcodeGen spec declares it)
     a URL scheme `radioshake`, NSSupportsLiveActivities true, NSAlarmKitUsageDescription, and the entitlement
     com.apple.developer.associated-domains with applinks:radioshake.media;
+  * (Phase 5e, each only when the spec declares it) the app's entitlements carry com.apple.developer.icloud-container-identifiers
+    with iCloud.com.radioshake, com.apple.developer.icloud-services with CloudKit, and aps-environment (any value; the
+    ad-hoc archive keeps the project's `development`, the export guard checks `production`);
   * the appex has RSAppGroup, the widgetkit extension point, bundle id com.radioshake.widgets and both versions equal to
     the app's.
 
@@ -25,6 +28,10 @@ APPEX_ID = "com.radioshake.widgets"
 POINT = "com.apple.widgetkit-extension"
 DOMAINS_KEY = "com.apple.developer.associated-domains"
 APPLINKS = "applinks:radioshake.media"
+ICLOUD_CONTAINER_KEY = "com.apple.developer.icloud-container-identifiers"
+ICLOUD_SERVICES_KEY = "com.apple.developer.icloud-services"
+APS_KEY = "aps-environment"
+ICLOUD_CONTAINER = "iCloud.com.radioshake"
 
 
 def declared(project_yml: str, word: str) -> bool:
@@ -87,6 +94,9 @@ def check(app: str, project_yml: str, codesign=ce.codesign_entitlements) -> list
             raw = codesign(path)
             groups = _entitlement_list(raw, ce.GROUPS_KEY)
             domains = _entitlement_list(raw, DOMAINS_KEY)
+            containers = _entitlement_list(raw, ICLOUD_CONTAINER_KEY)
+            services = _entitlement_list(raw, ICLOUD_SERVICES_KEY)
+            aps = ce.parse(raw).get(APS_KEY)
         except Exception:
             errors.append(f"{label}: codesign printed no readable entitlements")
             continue
@@ -94,6 +104,13 @@ def check(app: str, project_yml: str, codesign=ce.codesign_entitlements) -> list
             errors.append(f"{label}: {ce.GROUPS_KEY} lacks the release group")
         if label == "RadioShake.app" and declared(project_yml, "applinks:") and APPLINKS not in domains:
             errors.append(f"{label}: {DOMAINS_KEY} lacks {APPLINKS}")
+        if label == "RadioShake.app":
+            if declared(project_yml, ICLOUD_CONTAINER_KEY) and ICLOUD_CONTAINER not in containers:
+                errors.append(f"{label}: {ICLOUD_CONTAINER_KEY} lacks {ICLOUD_CONTAINER}")
+            if declared(project_yml, ICLOUD_SERVICES_KEY) and "CloudKit" not in services:
+                errors.append(f"{label}: {ICLOUD_SERVICES_KEY} lacks CloudKit")
+            if declared(project_yml, APS_KEY) and not (isinstance(aps, str) and aps):
+                errors.append(f"{label}: {APS_KEY} is missing")
     return errors
 
 

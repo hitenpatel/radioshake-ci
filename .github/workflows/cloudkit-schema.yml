@@ -1,0 +1,90 @@
+# Imports the RadioShake CloudKit schema (ios/CloudKit/schema.ckdb) into the DEVELOPMENT environment of
+# iCloud.com.radioshake (Phase 5e). Production is never targeted here: the owner deploys the schema to Production
+# from the CloudKit Console (release gate, BookStack page 218).
+#
+# Secret: CLOUDKIT_MANAGEMENT_TOKEN (CloudKit Console > Settings > Tokens, type management). Plus the same
+# FORGEJO_HOST / FORGEJO_CLONE_TOKEN secrets ios-shared-validate.yml uses.
+#
+# cktool notes (from Apple's cktool man page; `xcrun cktool --help` was not available when this was written):
+#   - validate-schema and import-schema both require --team-id, --container-id, --environment and --file.
+#   - the management token is read from `--token`, else $CLOUDKIT_MANAGEMENT_TOKEN, else ~/.config/cktool, else the
+#     keychain. We rely on the env var, which keeps the token off the command line and avoids a keychain on the
+#     runner. `save-token --type management` takes the token as a positional argument only (no stdin, no env), so it
+#     is deliberately not used.
+
+name: cloudkit-schema
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Forgejo branch or tag of RadioShake to clone'
+        default: 'main'
+      sha:
+        description: 'Expected HEAD SHA (leave empty to skip check)'
+        default: ''
+
+permissions:
+  contents: read
+
+env:
+  XCODE_APP: /Applications/Xcode_26.6.app
+  TEAM_ID: NDNUFB9RU5
+  CONTAINER_ID: iCloud.com.radioshake
+
+jobs:
+  import-development:
+    runs-on: macos-26
+    timeout-minutes: 15
+    steps:
+      - name: Clone source from private host
+        env:
+          HOST: ${{ secrets.FORGEJO_HOST }}
+          TOKEN: ${{ secrets.FORGEJO_CLONE_TOKEN }}
+          REF: ${{ inputs.ref }}
+          EXPECTED_SHA: ${{ inputs.sha }}
+        run: |
+          set -euo pipefail
+          AUTH=$(printf 'oauth2:%s' "$TOKEN" | base64)
+          echo "::add-mask::$AUTH"
+          echo "::add-mask::$TOKEN"
+          echo "::add-mask::$HOST"
+          git -c http.extraheader="AUTHORIZATION: basic $AUTH" \
+            clone --depth 1 --branch "$REF" "https://${HOST}/hiten/RadioShake.git" src
+          if grep -rq "AUTHORIZATION" src/.git/config; then
+            echo "::error::auth header was persisted in src/.git/config"
+            exit 1
+          fi
+          HEAD_SHA=$(git -C src rev-parse HEAD)
+          if [ -n "$EXPECTED_SHA" ] && [ "$HEAD_SHA" != "$EXPECTED_SHA" ]; then
+            git -C src -c http.extraheader="AUTHORIZATION: basic $AUTH" \
+              fetch --unshallow origin "$REF" || { echo "::error::could not fetch full history of $REF"; exit 1; }
+            FULL_SHA=$(git -C src rev-parse --verify -q "${EXPECTED_SHA}^{commit}" || true)
+            [ -n "$FULL_SHA" ] || { echo "::error::expected SHA $EXPECTED_SHA does not exist in $REF"; exit 1; }
+            git -C src merge-base --is-ancestor "$FULL_SHA" "origin/$REF" \
+              || { echo "::error::expected SHA $FULL_SHA is not an ancestor of origin/$REF"; exit 1; }
+            git -C src checkout --detach "$FULL_SHA"
+            HEAD_SHA=$(git -C src rev-parse HEAD)
+          fi
+          echo "Importing the schema from commit $HEAD_SHA"
+
+      - name: Select Xcode
+        run: |
+          set -euo pipefail
+          test -d "$XCODE_APP" || { echo "::error::$XCODE_APP is missing; the macos-26 image changed"; exit 1; }
+          sudo xcode-select -s "$XCODE_APP"
+
+      - name: Validate and import the schema (development only)
+        env:
+          # cktool reads the management token from this variable; it is never echoed or passed as an argument.
+          CLOUDKIT_MANAGEMENT_TOKEN: ${{ secrets.CLOUDKIT_MANAGEMENT_TOKEN }}
+        run: |
+          set -euo pipefail
+          [ -n "$CLOUDKIT_MANAGEMENT_TOKEN" ] || { echo "::error::secret CLOUDKIT_MANAGEMENT_TOKEN is not set"; exit 1; }
+          echo "::add-mask::$CLOUDKIT_MANAGEMENT_TOKEN"
+          cd src
+          test -f ios/CloudKit/schema.ckdb || { echo "::error::ios/CloudKit/schema.ckdb is missing at this commit"; exit 1; }
+          xcrun cktool validate-schema --environment development --team-id "$TEAM_ID" \
+            --container-id "$CONTAINER_ID" --file ios/CloudKit/schema.ckdb
+          xcrun cktool import-schema --environment development --team-id "$TEAM_ID" \
+            --container-id "$CONTAINER_ID" --file ios/CloudKit/schema.ckdb

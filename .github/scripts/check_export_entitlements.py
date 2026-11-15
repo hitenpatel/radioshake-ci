@@ -25,6 +25,9 @@ Phase 5c (spec decision 16 b), the widget extension:
       As above, plus the released source decides: when it defines the RadioShakeWidgets target, an app without the appex
       fails instead of being skipped; when it declares applinks:radioshake.media, the app must carry
       com.apple.developer.associated-domains with it. An unreadable PROJECT_YML fails (never a silent skip).
+      Phase 5e: when it declares com.apple.developer.icloud-container-identifiers, the app must also carry that key with
+      iCloud.com.radioshake, com.apple.developer.icloud-services with CloudKit, and aps-environment = production (the
+      project says development; the App Store Connect export must flip it).
 """
 import os
 import plistlib
@@ -40,6 +43,10 @@ APPEX_DIR = "PlugIns/RadioShakeWidgets.appex"
 APPEX_NAME = "RadioShakeWidgets.appex"
 DOMAINS_KEY = "com.apple.developer.associated-domains"
 APPLINKS = "applinks:radioshake.media"
+ICLOUD_CONTAINER_KEY = "com.apple.developer.icloud-container-identifiers"
+ICLOUD_SERVICES_KEY = "com.apple.developer.icloud-services"
+APS_KEY = "aps-environment"
+ICLOUD_CONTAINER = "iCloud.com.radioshake"
 
 
 def parse(raw: bytes) -> dict:
@@ -66,6 +73,11 @@ def widgets_declared(project_yml: str) -> bool:
     `- target: RadioShakeWidgets` dependency line of the app)."""
     return any(re.match(r"^\s+RadioShakeWidgets:\s*(#.*)?$", line) for line in project_yml.splitlines()
                if not line.lstrip().startswith("#"))
+
+
+def icloud_declared(project_yml: str) -> bool:
+    """True when an uncommented line of the XcodeGen spec declares the iCloud container entitlement (Phase 5e)."""
+    return any(ICLOUD_CONTAINER_KEY in line for line in project_yml.splitlines() if not line.lstrip().startswith("#"))
 
 
 def codesign_entitlements(path: str) -> bytes:
@@ -102,15 +114,31 @@ def check_widgets(app_dir: str, codesign=codesign_entitlements, project_yml=None
     `project_yml` (the released XcodeGen spec's text, optional) makes the appex required when the spec defines the widget
     target and the associated domain required on the app when the spec declares it."""
     status, message = _check_app_group(app_dir, codesign, project_yml is not None and widgets_declared(project_yml))
-    if status == "fail" or project_yml is None or not links_declared(project_yml):
+    if status == "fail" or project_yml is None:
         return status, message
+    links, icloud = links_declared(project_yml), icloud_declared(project_yml)
+    if not (links or icloud):
+        return status, message
+    fail = "entitlements missing at export"
     try:
-        domains = _strings(codesign(app_dir), DOMAINS_KEY)
+        raw = codesign(app_dir)
+        domains = _strings(raw, DOMAINS_KEY)
+        containers = _strings(raw, ICLOUD_CONTAINER_KEY)
+        services = _strings(raw, ICLOUD_SERVICES_KEY)
+        aps = parse(raw).get(APS_KEY)
     except Exception:
-        return "fail", "entitlements missing at export (codesign printed no readable entitlements for RadioShake.app)"
-    if APPLINKS not in domains:
-        return "fail", f"entitlements missing at export (RadioShake.app lacks {DOMAINS_KEY} with the universal links domain)"
-    return "pass", f"{message}; RadioShake.app carries {DOMAINS_KEY}"
+        return "fail", f"{fail} (codesign printed no readable entitlements for RadioShake.app)"
+    if links and APPLINKS not in domains:
+        return "fail", f"{fail} (RadioShake.app lacks {DOMAINS_KEY} with the universal links domain)"
+    if icloud:
+        if ICLOUD_CONTAINER not in containers:
+            return "fail", f"{fail} (RadioShake.app lacks {ICLOUD_CONTAINER_KEY} with the iCloud container)"
+        if "CloudKit" not in services:
+            return "fail", f"{fail} (RadioShake.app lacks {ICLOUD_SERVICES_KEY} with CloudKit)"
+        if aps != "production":
+            return "fail", f"{fail} ({APS_KEY} is not production on RadioShake.app; the export must flip it from development)"
+    carried = ([DOMAINS_KEY] if links else []) + ([ICLOUD_CONTAINER_KEY, ICLOUD_SERVICES_KEY, APS_KEY] if icloud else [])
+    return "pass", f"{message}; RadioShake.app carries {', '.join(carried)}"
 
 
 def _check_app_group(app_dir: str, codesign, required: bool) -> tuple:
