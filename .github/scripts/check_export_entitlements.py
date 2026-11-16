@@ -46,6 +46,7 @@ APPLINKS = "applinks:radioshake.media"
 ICLOUD_CONTAINER_KEY = "com.apple.developer.icloud-container-identifiers"
 ICLOUD_SERVICES_KEY = "com.apple.developer.icloud-services"
 APS_KEY = "aps-environment"
+CARPLAY_KEY = "com.apple.developer.carplay-audio"
 ICLOUD_CONTAINER = "iCloud.com.radioshake"
 
 
@@ -87,6 +88,11 @@ def codesign_entitlements(path: str) -> bytes:
     return result.stdout
 
 
+def carplay_declared(project_yml: str) -> bool:
+    """True when an uncommented line of the XcodeGen spec declares the CarPlay audio entitlement (Phase CP)."""
+    return any(CARPLAY_KEY in line for line in project_yml.splitlines() if not line.lstrip().startswith("#"))
+
+
 def links_declared(project_yml: str) -> bool:
     """True when an uncommented line of the XcodeGen spec names the universal links domain."""
     return any(APPLINKS in line for line in project_yml.splitlines() if not line.lstrip().startswith("#"))
@@ -117,7 +123,8 @@ def check_widgets(app_dir: str, codesign=codesign_entitlements, project_yml=None
     if status == "fail" or project_yml is None:
         return status, message
     links, icloud = links_declared(project_yml), icloud_declared(project_yml)
-    if not (links or icloud):
+    carplay = carplay_declared(project_yml)
+    if not (links or icloud or carplay):
         return status, message
     fail = "entitlements missing at export"
     try:
@@ -126,6 +133,7 @@ def check_widgets(app_dir: str, codesign=codesign_entitlements, project_yml=None
         containers = _strings(raw, ICLOUD_CONTAINER_KEY)
         services = _strings(raw, ICLOUD_SERVICES_KEY)
         aps = parse(raw).get(APS_KEY)
+        carplay_value = parse(raw).get(CARPLAY_KEY)
     except Exception:
         return "fail", f"{fail} (codesign printed no readable entitlements for RadioShake.app)"
     if links and APPLINKS not in domains:
@@ -137,7 +145,9 @@ def check_widgets(app_dir: str, codesign=codesign_entitlements, project_yml=None
             return "fail", f"{fail} (RadioShake.app lacks {ICLOUD_SERVICES_KEY} with CloudKit)"
         if aps != "production":
             return "fail", f"{fail} ({APS_KEY} is not production on RadioShake.app; the export must flip it from development)"
-    carried = ([DOMAINS_KEY] if links else []) + ([ICLOUD_CONTAINER_KEY, ICLOUD_SERVICES_KEY, APS_KEY] if icloud else [])
+    if carplay and carplay_value is not True:
+        return "fail", f"{fail} (RadioShake.app lacks {CARPLAY_KEY} set to true)"
+    carried = ([DOMAINS_KEY] if links else []) + ([ICLOUD_CONTAINER_KEY, ICLOUD_SERVICES_KEY, APS_KEY] if icloud else []) + ([CARPLAY_KEY] if carplay else [])
     return "pass", f"{message}; RadioShake.app carries {', '.join(carried)}"
 
 

@@ -493,7 +493,7 @@ class WorkflowIntegrationTests(unittest.TestCase):
         self.assertNotIn('derived-data/', evidence)
         self.assertNotIn('derived-data-release/', evidence)
         deny = self.step('Audit Release binary for debug-only symbols (TASK-136 + TASK-137)')
-        self.assertEqual(hashlib.sha256((deny + '\n').encode()).hexdigest(), '17c41d599a4f250cf737a382b41727f0db1ec0643e98672bab1058364adc5121')  # + FakeCloudTransport, RSFakeICloud, RSRealICloud (Phase 5e part 2); before: RSDataSaver, RSDataUsageSeed, RSNetworkScript
+        self.assertEqual(hashlib.sha256((deny + '\n').encode()).hexdigest(), '503e5fbca61c253963ed6b973b92fbbebe6ead315c712afdb0e6374e1c270d9a')  # + CarPreviewView, RecordingCarInterface, RSCarPreview, car.np. (Phase CP); before: + FakeCloudTransport, RSFakeICloud, RSRealICloud (Phase 5e part 2); before: RSDataSaver, RSDataUsageSeed, RSNetworkScript
         self.assertEqual(self.validate.count('      - name: Audit capture probe in Release binary'), 1)
 
 

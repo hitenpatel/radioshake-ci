@@ -129,6 +129,26 @@ class ProbeTests(unittest.TestCase):
     def test_an_old_project_without_icloud_skips_the_checks(self):
         self.assertEqual(self.run_probe(yml=YML_5C, app_ents=GOOD), [])
 
+    def carplay_ents(self, value=b"<true/>"):
+        raw = ents(**{GROUPS: [GROUP]})
+        if value:
+            raw = raw.replace(b"</dict>", b"<key>com.apple.developer.carplay-audio</key>" + value + b"</dict>")
+        return raw
+
+    def test_carplay_present_passes(self):
+        yml = YML_5C + "        com.apple.developer.carplay-audio: true\n"
+        self.assertEqual(self.run_probe(yml=yml, app_ents=self.carplay_ents()), [])
+
+    def test_carplay_missing_or_false_fails(self):
+        yml = YML_5C + "        com.apple.developer.carplay-audio: true\n"
+        for value in (b"", b"<false/>"):
+            errors = self.run_probe(yml=yml, app_ents=self.carplay_ents(value))
+            self.assertEqual(len(errors), 1, errors)
+            self.assertIn("carplay-audio", errors[0])
+
+    def test_an_old_project_without_carplay_skips_the_check(self):
+        self.assertEqual(self.run_probe(yml=YML_5C, app_ents=self.carplay_ents(b"")), [])
+
     def test_a_commented_icloud_declaration_skips_the_checks(self):
         yml = YML_5C + "        # com.apple.developer.icloud-container-identifiers:\n"
         self.assertEqual(self.run_probe(yml=yml, app_ents=GOOD), [])

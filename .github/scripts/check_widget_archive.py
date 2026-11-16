@@ -31,6 +31,7 @@ APPLINKS = "applinks:radioshake.media"
 ICLOUD_CONTAINER_KEY = "com.apple.developer.icloud-container-identifiers"
 ICLOUD_SERVICES_KEY = "com.apple.developer.icloud-services"
 APS_KEY = "aps-environment"
+CARPLAY_KEY = "com.apple.developer.carplay-audio"
 ICLOUD_CONTAINER = "iCloud.com.radioshake"
 
 
@@ -97,6 +98,7 @@ def check(app: str, project_yml: str, codesign=ce.codesign_entitlements) -> list
             containers = _entitlement_list(raw, ICLOUD_CONTAINER_KEY)
             services = _entitlement_list(raw, ICLOUD_SERVICES_KEY)
             aps = ce.parse(raw).get(APS_KEY)
+            carplay = ce.parse(raw).get(CARPLAY_KEY)
         except Exception:
             errors.append(f"{label}: codesign printed no readable entitlements")
             continue
@@ -111,6 +113,8 @@ def check(app: str, project_yml: str, codesign=ce.codesign_entitlements) -> list
                 errors.append(f"{label}: {ICLOUD_SERVICES_KEY} lacks CloudKit")
             if declared(project_yml, APS_KEY) and not (isinstance(aps, str) and aps):
                 errors.append(f"{label}: {APS_KEY} is missing")
+            if declared(project_yml, CARPLAY_KEY) and carplay is not True:
+                errors.append(f"{label}: {CARPLAY_KEY} is missing or not true")
     return errors
 
 
