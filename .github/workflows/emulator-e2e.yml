@@ -340,6 +340,11 @@ jobs:
           target: google_apis
           profile: pixel_6
           disable-animations: true
+          # 2 cores / default RAM dropped the adb transport mid-tier (device offline,
+          # DeviceServerDiedException) in about 1 nightly in 3; the hosted runner has
+          # 4 vCPUs and 16 GB.
+          cores: 4
+          ram-size: 4096M
           emulator-options: -no-snapshot -no-window -gpu swiftshader_indirect -no-boot-anim -camera-back none
           # The emulator runner executes each YAML line as a separate /usr/bin/sh -c
           # invocation, so a plain 'cd src' would not persist. Use a single-line script
