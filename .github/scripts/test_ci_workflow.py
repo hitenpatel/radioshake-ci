@@ -149,6 +149,83 @@ class WorkflowTests(unittest.TestCase):
             self.assertIn("exit 1", run, job)
 
 
+@unittest.skipIf(yaml is None, "PyYAML not installed")
+class A11yGateWorkflowTests(unittest.TestCase):
+    """A11y-1: per-screen accessibility audit gate wiring."""
+
+    @classmethod
+    def setUpClass(cls):
+        with open(WORKFLOW, encoding="utf-8") as fh:
+            cls.wf = yaml.safe_load(fh)
+        cls.jobs = cls.wf["jobs"]
+        cls.steps = {s["name"]: s for s in cls.jobs["validate"]["steps"] if "name" in s}
+        cls.order = [s.get("name") for s in cls.jobs["validate"]["steps"]]
+        cls.step = cls.steps.get("iOS accessibility source checks (A11y)")
+
+    def test_a11y_step_follows_privacy_step_and_is_guarded(self):
+        self.assertIsNotNone(self.step)
+        self.assertEqual(self.order.index("iOS accessibility source checks (A11y)"),
+                         self.order.index("iOS privacy source checks (TASK-14)") + 1)
+        self.assertEqual(self.step["working-directory"], "src")
+        run = self.step["run"]
+        self.assertIn('if [ ! -f scripts/check_ios_a11y_inventory.py ]; then', run)
+        self.assertLess(run.index("scripts/check_ios_a11y_inventory.py ]"), run.index("python3 "))
+        self.assertIn("scripts/check_ios_a11y_sources.py ios/App ios/a11y/sources-allow.json ios/a11y/inventory.json", run)
+        self.assertIn('"${BASE_ARGS[@]}"', run)
+
+    def test_base_args_are_only_added_conditionally_and_fetch_failure_is_tolerated(self):
+        run = self.step["run"]
+        self.assertIn("BASE_ARGS=()", run)
+        for flag in ("--base-inventory", "--base-exclusions"):
+            self.assertEqual(run.count(flag), 1, flag)
+            line = [l for l in run.splitlines() if flag in l][0]
+            self.assertIn("BASE_ARGS+=(", line)
+            self.assertTrue(line.strip().startswith("if "), flag)
+        self.assertIn("if git ", run)  # the fetch is an `if`, so its failure does not fail the step
+        # credentials are passed per command, never persisted
+        self.assertNotIn("git config", run)
+
+    def test_release_deny_list_has_the_new_flags(self):
+        run = self.steps["Audit Release binary for debug-only symbols (TASK-136 + TASK-137)"]["run"]
+        deny = re.search(r"DENY='([^']*)'", run).group(1)
+        for flag in ("RSForceIncreaseContrast", "RSForceBoldText"):
+            self.assertIn(flag, deny.split("|"))
+
+    def test_a11y_matrix_input_defaults_to_gate_and_resolve_validates_it(self):
+        on = self.wf.get("on", self.wf.get(True))
+        inp = on["workflow_dispatch"]["inputs"]["a11y_matrix"]
+        self.assertEqual(inp["default"], "gate")
+        self.assertEqual(sorted(inp.get("options", ["gate", "full"])), ["full", "gate"])
+        resolve = self.jobs["resolve"]
+        self.assertIn("a11y_matrix", resolve["outputs"])
+        st = [s for s in resolve["steps"] if s.get("id") == "resolve"][0]
+        self.assertIn("inputs.a11y_matrix || github.event.client_payload.a11y_matrix || 'gate'", st["env"]["A11Y_MATRIX"])
+        self.assertIn("'^(gate|full)$'", st["run"])
+        self.assertIn("a11y_matrix=", st["run"])
+
+    def test_a11y_full_is_advisory_and_not_a_gate(self):
+        job = self.jobs["a11y-full"]
+        self.assertIs(job["continue-on-error"], True)
+        self.assertEqual(job["runs-on"], "macos-26")
+        self.assertIn("needs.resolve.outputs.a11y_matrix == 'full'", job["if"])
+        self.assertIn("resolve", job["needs"])
+        self.assertNotIn("a11y-full", self.jobs["report-status"]["needs"])
+        rs = yaml.safe_dump(self.jobs["report-status"])
+        self.assertNotIn("a11y", rs)
+        text = "\n".join(s.get("run", "") for s in job["steps"])
+        self.assertIn("TEST_RUNNER_RS_A11Y_MATRIX=full", text)
+        self.assertIn("iPhone SE (3rd generation)", yaml.safe_dump(job))
+        self.assertIn("A11yAudit", text)
+
+    def test_a11y_full_shares_the_clone_and_preflight_steps(self):
+        v = {s["name"]: s for s in self.jobs["ui-shard"]["steps"] if "name" in s}
+        f = {s["name"]: s for s in self.jobs["a11y-full"]["steps"] if "name" in s}
+        for name in ("Clone source from private host", "Set up JDK 21", "Install XcodeGen (pinned)",
+                     "Generate Xcode project", "Secret scan of evidence artifacts",
+                     "Check out CI scripts (this repo, scripts only)"):
+            self.assertEqual(v[name], f[name], name)
+
+
 SCREENSHOTS_WORKFLOW = os.path.join(ROOT, ".github", "workflows", "ios-screenshots.yml")
 
 
