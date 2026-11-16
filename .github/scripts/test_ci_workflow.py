@@ -173,17 +173,42 @@ class A11yGateWorkflowTests(unittest.TestCase):
         self.assertIn("scripts/check_ios_a11y_sources.py ios/App ios/a11y/sources-allow.json ios/a11y/inventory.json", run)
         self.assertIn('"${BASE_ARGS[@]}"', run)
 
-    def test_base_args_are_only_added_conditionally_and_fetch_failure_is_tolerated(self):
+    def test_base_args_are_only_added_conditionally_and_empty_array_safe(self):
         run = self.step["run"]
         self.assertIn("BASE_ARGS=()", run)
-        for flag in ("--base-inventory", "--base-exclusions"):
+        for flag, f in (("--base-inventory", "inventory.json"), ("--base-exclusions", "exclusions.swift")):
             self.assertEqual(run.count(flag), 1, flag)
             line = [l for l in run.splitlines() if flag in l][0]
             self.assertIn("BASE_ARGS+=(", line)
-            self.assertTrue(line.strip().startswith("if "), flag)
-        self.assertIn("if git ", run)  # the fetch is an `if`, so its failure does not fail the step
-        # credentials are passed per command, never persisted
-        self.assertNotIn("git config", run)
+            self.assertTrue(line.strip().startswith("if [ -f"), flag)
+            self.assertIn(f, line)
+        self.assertIn('${BASE_ARGS[@]+"${BASE_ARGS[@]}"}', run)
+        self.assertNotIn('"${BASE_ARGS[@]}"', run.replace('${BASE_ARGS[@]+"${BASE_ARGS[@]}"}', ""))
+
+    def test_clone_token_never_reaches_a_step_that_runs_branch_code(self):
+        allowed = {"Clone source from private host", "Fetch A11y base files from main",
+                   "Secret scan of evidence artifacts"}
+        for st in self.jobs["validate"]["steps"]:
+            if "secrets.FORGEJO_CLONE_TOKEN" in yaml.safe_dump(st):
+                self.assertIn(st.get("name"), allowed, st.get("name"))
+        self.assertNotIn("env", self.step)
+
+    def test_base_fetch_step_runs_early_and_runs_only_git(self):
+        name = "Fetch A11y base files from main"
+        self.assertIn(name, self.steps)
+        idx = self.order.index(name)
+        self.assertEqual(idx, self.order.index("Clone source from private host") + 1)
+        for i, st in enumerate(self.jobs["validate"]["steps"]):
+            if str(st.get("working-directory", "")).startswith("src") or "python3" in st.get("run", "") \
+                    or "scripts/" in st.get("run", ""):
+                self.assertGreater(i, idx, st.get("name"))
+        run = self.steps[name]["run"]
+        self.assertNotIn("scripts/", run)
+        self.assertNotIn("python3", run)
+        self.assertIn("GIT_CONFIG_GLOBAL=/dev/null", run)
+        self.assertIn("GIT_CONFIG_NOSYSTEM=1", run)
+        self.assertIn("a11y-base", run)
+        self.assertEqual(set(self.steps[name]["env"]), {"HOST", "TOKEN"})
 
     def test_release_deny_list_has_the_new_flags(self):
         run = self.steps["Audit Release binary for debug-only symbols (TASK-136 + TASK-137)"]["run"]
