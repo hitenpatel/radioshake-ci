@@ -217,6 +217,35 @@ jobs:
           echo "head_sha=$HEAD_SHA" >> "$GITHUB_OUTPUT"
           echo "Cloned $REF at $HEAD_SHA"
 
+      # A11y-1: the base-comparison files from main are fetched here, before any branch code
+      # runs, by a step that only runs git. The token is in this step's env alone, so no
+      # branch-supplied script ever sees it. Never fails the job: no files = no comparison.
+      - name: Fetch A11y base files from main
+        env:
+          HOST: ${{ secrets.FORGEJO_HOST }}
+          TOKEN: ${{ secrets.FORGEJO_CLONE_TOKEN }}
+        run: |
+          set -uo pipefail
+          export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
+          AUTH=$(printf 'oauth2:%s' "$TOKEN" | base64)
+          echo "::add-mask::$AUTH"
+          echo "::add-mask::$TOKEN"
+          echo "::add-mask::$HOST"
+          B="$RUNNER_TEMP/a11y-base"; G="$RUNNER_TEMP/a11y-main"
+          mkdir -p "$B"
+          if git init -q "$G" 2>/dev/null \
+             && git -C "$G" -c http.extraheader="AUTHORIZATION: basic $AUTH" \
+                  fetch -q --depth 1 "https://${HOST}/hiten/RadioShake.git" main >/dev/null 2>&1; then
+            git -C "$G" show FETCH_HEAD:ios/a11y/inventory.json > "$B/inventory.json.tmp" 2>/dev/null \
+              && mv "$B/inventory.json.tmp" "$B/inventory.json"
+            git -C "$G" show FETCH_HEAD:ios/UITests/RadioShakeUITests/A11y/A11yExclusions.swift > "$B/exclusions.swift.tmp" 2>/dev/null \
+              && mv "$B/exclusions.swift.tmp" "$B/exclusions.swift"
+          else
+            echo "Could not fetch main: no A11y base comparison"
+          fi
+          rm -rf "$G" "$B"/*.tmp
+          exit 0
+
       - name: Check out CI scripts (this repo, scripts only)
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4
         with:
@@ -252,26 +281,16 @@ jobs:
 
       - name: iOS accessibility source checks (A11y)
         working-directory: src
-        env:
-          HOST: ${{ secrets.FORGEJO_HOST }}
-          TOKEN: ${{ secrets.FORGEJO_CLONE_TOKEN }}
         run: |
           set -euo pipefail
           if [ ! -f scripts/check_ios_a11y_inventory.py ]; then echo "Source ref predates A11y-1, skipping"; exit 0; fi
           python3 -m unittest scripts/test_check_ios_a11y_inventory.py scripts/test_check_ios_a11y_sources.py
-          # The clone keeps no credentials, so main is fetched with a per-command auth header
-          # (never persisted). A failed fetch only means no base comparison (inventory
-          # ratchet skipped); a script failure below still fails the step.
-          AUTH=$(printf 'oauth2:%s' "$TOKEN" | base64)
-          echo "::add-mask::$AUTH"
-          echo "::add-mask::$TOKEN"
-          echo "::add-mask::$HOST"
+          # Base files come from the credential-free "Fetch A11y base files from main" step;
+          # absent files (fetch failed, or main predates A11y-1) just mean no base comparison.
           BASE_ARGS=()
-          if git -c http.extraheader="AUTHORIZATION: basic $AUTH" fetch --depth 1 origin main; then
-            if git show FETCH_HEAD:ios/a11y/inventory.json > "$RUNNER_TEMP/base-inventory.json" 2>/dev/null; then BASE_ARGS+=(--base-inventory "$RUNNER_TEMP/base-inventory.json"); fi
-            if git show FETCH_HEAD:ios/UITests/RadioShakeUITests/A11y/A11yExclusions.swift > "$RUNNER_TEMP/base-exclusions.swift" 2>/dev/null; then BASE_ARGS+=(--base-exclusions "$RUNNER_TEMP/base-exclusions.swift"); fi
-          fi
-          python3 scripts/check_ios_a11y_inventory.py ios/App ios/a11y/inventory.json ios/UITests/RadioShakeUITests/A11y/A11yScreen.swift ios/UITests/RadioShakeUITests/A11y/A11yExclusions.swift ios/UITests/RadioShakeUITests "${BASE_ARGS[@]}"
+          if [ -f "$RUNNER_TEMP/a11y-base/inventory.json" ]; then BASE_ARGS+=(--base-inventory "$RUNNER_TEMP/a11y-base/inventory.json"); fi
+          if [ -f "$RUNNER_TEMP/a11y-base/exclusions.swift" ]; then BASE_ARGS+=(--base-exclusions "$RUNNER_TEMP/a11y-base/exclusions.swift"); fi
+          python3 scripts/check_ios_a11y_inventory.py ios/App ios/a11y/inventory.json ios/UITests/RadioShakeUITests/A11y/A11yScreen.swift ios/UITests/RadioShakeUITests/A11y/A11yExclusions.swift ios/UITests/RadioShakeUITests ${BASE_ARGS[@]+"${BASE_ARGS[@]}"}
           python3 scripts/check_ios_a11y_sources.py ios/App ios/a11y/sources-allow.json ios/a11y/inventory.json
 
       - name: iOS spike residue check (Phase 4b D3a)
@@ -1647,7 +1666,7 @@ jobs:
           ONLY=()
           for f in UITests/RadioShakeUITests/A11y/A11yAudit*UITests.swift; do
             [ -f "$f" ] || continue
-            for c in $(grep -hoE 'class +A11yAudit[A-Za-z0-9_]*UITests' "$f" | awk '{print $2}'); do
+            for c in $(grep -hoE '^final class +A11yAudit[A-Za-z0-9_]*UITests' "$f" | awk '{print $3}'); do
               ONLY+=("-only-testing:RadioShakeUITests/$c")
             done
           done
