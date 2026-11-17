@@ -664,7 +664,8 @@ jobs:
         env:
           TIER: tv
         with:
-          api-level: 34
+          # api 34 android-tv x86 image download was corrupt on the first canary (2026-11-17); api 33 per the plan's fallback.
+          api-level: 33
           arch: x86
           target: android-tv
           profile: tv_1080p
