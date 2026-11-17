@@ -56,6 +56,21 @@ class DiscoverTests(unittest.TestCase):
         })
         self.assertEqual(got, {"AUITests": 2})
 
+    def test_excludes_per_screen_a11y_audit_classes_but_keeps_other_a11y_classes(self):
+        got = self.discover({
+            "A1.swift": swift_class("A11yAuditHomeUITests", 4),
+            "A2.swift": swift_class("A11yAudit_Settings2UITests", 4),
+            "T.swift": swift_class("A11yTraitOverrideUITests", 2),
+            "E.swift": swift_class("A11yExclusionMatchTests", 3),
+            "A.swift": swift_class("AUITests", 2),
+        })
+        self.assertEqual(got, {"A11yTraitOverrideUITests": 2, "A11yExclusionMatchTests": 3, "AUITests": 2})
+
+    def test_audit_exclusion_applies_even_when_exclude_is_overridden(self):
+        got = self.discover({"A1.swift": swift_class("A11yAuditHomeUITests", 4),
+                             "A.swift": swift_class("AUITests", 2)}, exclude=())
+        self.assertEqual(got, {"AUITests": 2})
+
     def test_ignores_private_commented_and_parameterised_tests(self):
         extra = ("    private func testHidden() {}\n    func testHelper(_ x: Int) {}\n"
                  "    // func testCommented() {}\n    /* func testBlock() {} */\n"

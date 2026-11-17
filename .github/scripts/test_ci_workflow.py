@@ -216,39 +216,144 @@ class A11yGateWorkflowTests(unittest.TestCase):
         for flag in ("RSForceIncreaseContrast", "RSForceBoldText"):
             self.assertIn(flag, deny.split("|"))
 
-    def test_a11y_matrix_input_defaults_to_gate_and_resolve_validates_it(self):
+    def test_validate_no_longer_carries_the_audit_matrix(self):
         on = self.wf.get("on", self.wf.get(True))
-        inp = on["workflow_dispatch"]["inputs"]["a11y_matrix"]
-        self.assertEqual(inp["default"], "gate")
-        self.assertEqual(sorted(inp.get("options", ["gate", "full"])), ["full", "gate"])
-        resolve = self.jobs["resolve"]
-        self.assertIn("a11y_matrix", resolve["outputs"])
-        st = [s for s in resolve["steps"] if s.get("id") == "resolve"][0]
-        self.assertIn("inputs.a11y_matrix || github.event.client_payload.a11y_matrix || 'gate'", st["env"]["A11Y_MATRIX"])
-        self.assertIn("'^(gate|full)$'", st["run"])
-        self.assertIn("a11y_matrix=", st["run"])
+        self.assertNotIn("a11y_matrix", on["workflow_dispatch"]["inputs"])
+        self.assertNotIn("a11y_matrix", self.jobs["resolve"]["outputs"])
+        self.assertNotIn("a11y-full", self.jobs)
+        text = open(WORKFLOW, encoding="utf-8").read()
+        for gone in ("a11y_matrix", "A11Y_MATRIX", "a11y-full", "TEST_RUNNER_RS_A11Y_MATRIX"):
+            self.assertNotIn(gone, text)
 
-    def test_a11y_full_is_advisory_and_not_a_gate(self):
-        job = self.jobs["a11y-full"]
-        self.assertIs(job["continue-on-error"], True)
-        self.assertEqual(job["runs-on"], "macos-26")
-        self.assertIn("needs.resolve.outputs.a11y_matrix == 'full'", job["if"])
-        self.assertIn("resolve", job["needs"])
-        self.assertNotIn("a11y-full", self.jobs["report-status"]["needs"])
-        rs = yaml.safe_dump(self.jobs["report-status"])
-        self.assertNotIn("a11y", rs)
-        text = "\n".join(s.get("run", "") for s in job["steps"])
-        self.assertIn("TEST_RUNNER_RS_A11Y_MATRIX=full", text)
-        self.assertIn("iPhone SE (3rd generation)", yaml.safe_dump(job))
-        self.assertIn("A11yAudit", text)
 
-    def test_a11y_full_shares_the_clone_and_preflight_steps(self):
-        v = {s["name"]: s for s in self.jobs["ui-shard"]["steps"] if "name" in s}
-        f = {s["name"]: s for s in self.jobs["a11y-full"]["steps"] if "name" in s}
+AUDIT_WORKFLOW = os.path.join(ROOT, ".github", "workflows", "ios-a11y-audit.yml")
+
+
+@unittest.skipIf(yaml is None, "PyYAML not installed")
+class A11yAuditWorkflowTests(unittest.TestCase):
+    """Nightly / weekly / manual per-screen accessibility audit workflow."""
+
+    @classmethod
+    def setUpClass(cls):
+        with open(AUDIT_WORKFLOW, encoding="utf-8") as fh:
+            cls.text = fh.read()
+        cls.wf = yaml.safe_load(cls.text)
+        cls.on = cls.wf.get("on", cls.wf.get(True))
+        cls.jobs = cls.wf["jobs"]
+        cls.resolve = {s.get("id") or s.get("name"): s for s in cls.jobs["resolve"]["steps"]}
+        cls.audit = cls.jobs["audit"]
+        cls.asteps = {s["name"]: s for s in cls.audit["steps"] if "name" in s}
+        cls.aorder = [s.get("name") for s in cls.audit["steps"]]
+
+    def test_schedules_and_dispatch_inputs(self):
+        crons = [c["cron"] for c in self.on["schedule"]]
+        self.assertEqual(sorted(crons), ["17 5 * * 0", "41 1 * * *"])
+        inp = self.on["workflow_dispatch"]["inputs"]
+        self.assertEqual(set(inp), {"ref", "sha", "matrix"})
+        self.assertEqual(inp["ref"]["default"], "main")
+        self.assertEqual(inp["matrix"]["type"], "choice")
+        self.assertEqual(inp["matrix"]["options"], ["gate", "full"])
+        self.assertEqual(inp["matrix"]["default"], "gate")
+
+    def test_concurrency_keyed_on_the_resolved_ref_without_cancelling(self):
+        c = self.wf["concurrency"]
+        self.assertTrue(c["group"].startswith("ios-a11y-audit-"))
+        self.assertIs(c["cancel-in-progress"], False)
+
+    def test_resolve_reads_inputs_through_env_and_validates_them(self):
+        st = [s for s in self.jobs["resolve"]["steps"] if s.get("id") == "resolve"][0]
+        run = st["run"]
+        self.assertNotIn("${{", run)
+        self.assertIn("github.event.schedule", yaml.safe_dump(st["env"]))
+        self.assertIn("'^(gate|full)$'", run)
+        self.assertRegex(run, r"ref must match")
+        self.assertIn("17 5 * * 0", yaml.safe_dump(st["env"]) + run)
+        for out in ("ref", "sha", "matrix", "passes", "device", "context"):
+            self.assertIn(out, self.jobs["resolve"]["outputs"], out)
+
+    def test_pass_lists_and_devices_per_matrix(self):
+        run = [s for s in self.jobs["resolve"]["steps"] if s.get("id") == "resolve"][0]["run"]
+        self.assertIn('["defaultLight","ax5DarkBold"]', run)
+        self.assertIn('["defaultDark","ax5Light","contrastLight","contrastDark","xSmallLight"]', run)
+        self.assertIn("iPhone SE (3rd generation)", run)
+        self.assertIn("iPhone 17", run)
+        for ctx in ("ios-a11y-nightly", "ios-a11y-weekly", "ios-a11y"):
+            self.assertIn(ctx, run)
+
+    def test_audit_job_shape(self):
+        self.assertEqual(self.audit["runs-on"], "macos-26")
+        self.assertEqual(self.audit["timeout-minutes"], 240)
+        st = self.audit["strategy"]
+        self.assertEqual(st["max-parallel"], 2)
+        self.assertIs(st["fail-fast"], False)
+        self.assertIn("needs.resolve.outputs.passes", st["matrix"]["pass"])
+        self.assertIn("fromJSON", st["matrix"]["pass"])
+
+    def test_test_step_selects_methods_per_audit_class_without_retries(self):
+        run = self.asteps["Run accessibility audit passes"]["run"]
+        self.assertIn("^final class +A11yAudit[A-Za-z0-9_]*UITests", run)
+        self.assertIn("testGate", run)
+        self.assertIn("testFull", run)
+        self.assertNotIn("-retry-tests-on-failure", self.text)
+        self.assertNotIn("-test-iterations", self.text)
+        self.assertEqual(run.count("TEST_RUNNER_RS_A11Y_MATRIX=full"), 1)
+        self.assertRegex(run, r'if \[ "\$MATRIX" = "full" \]; then\s+export TEST_RUNNER_RS_A11Y_MATRIX=full')
+        self.assertIn("skipping", run)
+        self.assertIn("A11yAudit", run)
+
+    def test_issue_summary_is_extracted_and_uploaded(self):
+        text = "\n".join(s.get("run", "") for s in self.audit["steps"])
+        self.assertIn("error: -[RadioShakeUITests.A11yAudit", text)
+        up = [s for s in self.audit["steps"] if s.get("uses", "").startswith("actions/upload-artifact")]
+        self.assertTrue(up)
+        self.assertIn("a11y-issues", yaml.safe_dump(up))
+
+    def test_clone_token_only_in_clone_fetch_and_secret_scan(self):
+        allowed = {"Clone source from private host", "Secret scan of evidence artifacts"}
+        for jname, job in self.jobs.items():
+            for st in job["steps"]:
+                if "FORGEJO_CLONE_TOKEN" in yaml.safe_dump(st):
+                    ok = (jname == "resolve" and st.get("id") == "resolve") or \
+                        (jname == "audit" and st.get("name") in allowed)
+                    self.assertTrue(ok, f"{jname}/{st.get('name')}")
+        for st in self.audit["steps"]:
+            if st.get("name") in ("Clone source from private host", "Secret scan of evidence artifacts"):
+                continue
+            self.assertNotIn("TOKEN", yaml.safe_dump(st.get("env", {})), st.get("name"))
+        self.assertNotIn("FORGEJO_CLONE_TOKEN", yaml.safe_dump(self.wf.get("env", {})))
+        self.assertNotIn("FORGEJO_CLONE_TOKEN", yaml.safe_dump(self.audit.get("env", {})))
+        clone = self.asteps["Clone source from private host"]
+        self.assertEqual(self.aorder.index("Clone source from private host"), 0)
+        self.assertIn("auth header was persisted", clone["run"])
+
+    def test_clone_and_scan_steps_match_validate(self):
+        with open(WORKFLOW, encoding="utf-8") as fh:
+            v = {s["name"]: s for s in yaml.safe_load(fh)["jobs"]["ui-shard"]["steps"] if "name" in s}
         for name in ("Clone source from private host", "Set up JDK 21", "Install XcodeGen (pinned)",
                      "Generate Xcode project", "Secret scan of evidence artifacts",
                      "Check out CI scripts (this repo, scripts only)"):
-            self.assertEqual(v[name], f[name], name)
+            self.assertEqual(v[name]["run"] if "run" in v[name] else v[name]["uses"],
+                             self.asteps[name]["run"] if "run" in self.asteps[name] else self.asteps[name]["uses"], name)
+
+    def test_full_matrix_creates_the_se_simulator_from_the_resolved_device(self):
+        st = self.asteps["Boot simulator"]
+        self.assertIn("needs.resolve.outputs.device", st["env"]["DEVICE"])
+        self.assertIn("simctl create", st["run"])
+
+    def test_report_job_posts_the_right_contexts_and_never_fails(self):
+        rep = self.jobs["report"]
+        self.assertEqual(rep["if"], "always()")
+        self.assertIn("audit", rep["needs"])
+        self.assertIn("resolve", rep["needs"])
+        run = rep["steps"][0]["run"]
+        env = yaml.safe_dump(rep["steps"][0]["env"])
+        self.assertIn("needs.resolve.outputs.context", env)
+        self.assertIn("needs.audit.result", env)
+        self.assertIn('"success"', run)
+        self.assertNotIn("exit 1", run)
+        self.assertIn("::warning::", run)
+        self.assertIn("STATUS_TOKEN", env)
+        self.assertNotIn("FORGEJO_CLONE_TOKEN", yaml.safe_dump(rep))
 
 
 SCREENSHOTS_WORKFLOW = os.path.join(ROOT, ".github", "workflows", "ios-screenshots.yml")
