@@ -33,6 +33,7 @@ on:
           - r8check
           - auto-instrumentation
           - i18n
+          - tv
         default: tier1-smoke
       ref:
         description: Source ref to clone (Forgejo branch or tag)
@@ -169,7 +170,8 @@ jobs:
     needs: [skip-gate]
     # Run unless the skip-gate explicitly said to skip.
     # When skip-gate was bypassed (non-schedule event), its output is "false" → always runs.
-    if: needs.skip-gate.outputs.should_skip != 'true'
+    # The TV tier runs in its own job (`tv`, below) on a TV emulator.
+    if: needs.skip-gate.outputs.should_skip != 'true' && inputs.tier != 'tv'
     runs-on: ubuntu-latest
     # 150 min for full nightly set (cron, repository_dispatch, or manual nightly tier).
     # 90 min for manual single-tier dispatches.
@@ -475,7 +477,7 @@ jobs:
   # ──────────────────────────────────────────────────────────────────────────
   publish:
     needs: [skip-gate, e2e]
-    if: always() && needs.skip-gate.outputs.should_skip != 'true'
+    if: always() && needs.skip-gate.outputs.should_skip != 'true' && inputs.tier != 'tv'
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
@@ -598,6 +600,88 @@ jobs:
             echo "::error::Publish succeeded but tier results were missing — exiting non-zero"
             exit 1
           fi
+
+  # TV tier (feat/pro-sync-tv, TASK-300): RadioShake's TV app on a TV emulator.
+  # Manual dispatch only (tier: tv); never on the schedule or repository_dispatch,
+  # so the nightly is unchanged until the TV tier is enabled there on purpose.
+  tv:
+    if: github.event_name == 'workflow_dispatch' && inputs.tier == 'tv'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules && sudo udevadm trigger --name-match=kvm
+
+      - name: Clone source from private host
+        env:
+          HOST: ${{ secrets.FORGEJO_HOST }}
+          TOKEN: ${{ secrets.FORGEJO_CLONE_TOKEN }}
+          REF: ${{ inputs.ref || 'main' }}
+        run: |
+          set -eu
+          AUTH=$(printf 'oauth2:%s' "$TOKEN" | base64 -w0)
+          echo "::add-mask::$AUTH"
+          git -c http.extraheader="AUTHORIZATION: basic $AUTH" \
+            clone --depth 1 --branch "$REF" "https://${HOST}/hiten/RadioShake.git" src
+          echo "Testing $(git -C src rev-parse HEAD)"
+          ! grep -rq "AUTHORIZATION" src/.git/config
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Ensure Android SDK 36 components
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
+            "platforms;android-36" "build-tools;36.0.0" > /dev/null
+
+      - name: Install Maestro (pinned)
+        env:
+          MAESTRO_VERSION: "2.8.0"
+        run: |
+          curl -fsSL "https://get.maestro.mobile.dev" | bash
+          echo "$HOME/.maestro/bin" >> "$GITHUB_PATH"
+          "$HOME/.maestro/bin/maestro" --version
+
+      - name: Build debug APK
+        working-directory: src
+        env:
+          PODCAST_INDEX_API_KEY: ${{ secrets.PODCAST_INDEX_API_KEY }}
+          PODCAST_INDEX_API_SECRET: ${{ secrets.PODCAST_INDEX_API_SECRET }}
+        run: |
+          printf 'sdk.dir=%s\n' "$ANDROID_HOME" > local.properties
+          printf 'podcastIndex.apiKey=%s\n' "$PODCAST_INDEX_API_KEY" >> local.properties
+          printf 'podcastIndex.apiSecret=%s\n' "$PODCAST_INDEX_API_SECRET" >> local.properties
+          ./gradlew :app:assembleDebug :app:assembleDebugAndroidTest
+
+      - name: Run TV tier on a TV emulator
+        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2
+        env:
+          TIER: tv
+        with:
+          api-level: 34
+          arch: x86
+          target: android-tv
+          profile: tv_1080p
+          cores: 4
+          ram-size: 4096M
+          disable-animations: true
+          emulator-options: -no-snapshot -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim
+          script: cd src && bash ci/emulator-tier.sh
+
+      - name: Upload results artifact
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: results-tv
+          path: |
+            ~/.maestro/tests/**
+            src/tier-results.json
 
   # ──────────────────────────────────────────────────────────────────────────
   # Forgejo commit status callback for repository_dispatch (push-to-main bridge).
