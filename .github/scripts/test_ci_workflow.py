@@ -21,6 +21,7 @@ SHARED_STEPS = [
     "Install XcodeGen (pinned)",
     "Generate Xcode project",
     "Screenshot tour did not run in the public job",
+    "Decompress evidence for the secret scan",
     "Secret scan of evidence artifacts",
     "Check out CI scripts (this repo, scripts only)",
 ]
@@ -301,6 +302,29 @@ class A11yAuditWorkflowTests(unittest.TestCase):
         self.assertIn("skipping", run)
         self.assertIn("A11yAudit", run)
 
+    def test_every_selected_audit_test_must_have_run_and_not_been_skipped(self):
+        step = self.asteps["Verify every selected audit test ran"]
+        run = self.asteps["Run accessibility audit passes"]["run"]
+        self.assertIn("/tmp/a11y-only-args.txt", run)
+        self.assertEqual(self.aorder.index("Verify every selected audit test ran"),
+                         self.aorder.index("Run accessibility audit passes") + 1)
+        self.assertEqual(step["if"], "success()")
+        self.assertNotIn("working-directory", step)
+        self.assertIn("python3 ci/.github/scripts/check_shard_ran.py", step["run"])
+        self.assertIn("--args /tmp/a11y-only-args.txt", step["run"])
+        self.assertLess(self.aorder.index("Check out CI scripts (this repo, scripts only)"),
+                        self.aorder.index("Run accessibility audit passes"))
+        self.assertNotIn("src/.github", step["run"])
+
+    def test_unknown_schedule_fails_loudly(self):
+        run = [s for s in self.jobs["resolve"]["steps"] if s.get("id") == "resolve"][0]["run"]
+        self.assertIn("unknown schedule", run)
+        self.assertIn("17 5 * * 0", run)
+        self.assertIn("41 1 * * *", run)
+
+    def test_report_job_has_a_timeout(self):
+        self.assertEqual(self.jobs["report"]["timeout-minutes"], 15)
+
     def test_issue_summary_is_extracted_and_uploaded(self):
         text = "\n".join(s.get("run", "") for s in self.audit["steps"])
         self.assertIn("error: -[RadioShakeUITests.A11yAudit", text)
@@ -330,10 +354,10 @@ class A11yAuditWorkflowTests(unittest.TestCase):
         with open(WORKFLOW, encoding="utf-8") as fh:
             v = {s["name"]: s for s in yaml.safe_load(fh)["jobs"]["ui-shard"]["steps"] if "name" in s}
         for name in ("Clone source from private host", "Set up JDK 21", "Install XcodeGen (pinned)",
-                     "Generate Xcode project", "Secret scan of evidence artifacts",
-                     "Check out CI scripts (this repo, scripts only)"):
-            self.assertEqual(v[name]["run"] if "run" in v[name] else v[name]["uses"],
-                             self.asteps[name]["run"] if "run" in self.asteps[name] else self.asteps[name]["uses"], name)
+                     "Generate Xcode project", "Decompress evidence for the secret scan",
+                     "Secret scan of evidence artifacts", "Check out CI scripts (this repo, scripts only)"):
+            for key in ("run", "uses", "with", "env", "shell", "if", "id"):
+                self.assertEqual(v[name].get(key), self.asteps[name].get(key), f"{name}: {key}")
 
     def test_full_matrix_creates_the_se_simulator_from_the_resolved_device(self):
         st = self.asteps["Boot simulator"]
@@ -354,6 +378,58 @@ class A11yAuditWorkflowTests(unittest.TestCase):
         self.assertIn("::warning::", run)
         self.assertIn("STATUS_TOKEN", env)
         self.assertNotIn("FORGEJO_CLONE_TOKEN", yaml.safe_dump(rep))
+
+
+HARD_SHELL = "/bin/bash -p --noprofile --norc -eo pipefail {0}"
+TOKEN_RE = re.compile(r"secrets\.FORGEJO_(CLONE|STATUS)_TOKEN")
+
+
+@unittest.skipIf(yaml is None, "PyYAML not installed")
+class TokenStepHardeningTests(unittest.TestCase):
+    """A token-holding step that runs after branch code must not be hijackable via BASH_ENV,
+    GITHUB_PATH or Homebrew binaries."""
+
+    def jobs_under_test(self):
+        out = []
+        for path, names in ((WORKFLOW, ("validate", "ui-shard")), (AUDIT_WORKFLOW, ("audit",))):
+            with open(path, encoding="utf-8") as fh:
+                wf = yaml.safe_load(fh)
+            for n in names:
+                out.append((os.path.basename(path), n, wf["jobs"][n]["steps"]))
+        return out
+
+    def test_token_steps_after_branch_code_are_hardened(self):
+        for wf, job, steps in self.jobs_under_test():
+            names = [s.get("name") for s in steps]
+            ci = names.index("Check out CI scripts (this repo, scripts only)")
+            checked = 0
+            for i, st in enumerate(steps):
+                if i <= ci or not TOKEN_RE.search(yaml.safe_dump(st)):
+                    continue
+                checked += 1
+                where = f"{wf}/{job}/{st.get('name')}"
+                self.assertEqual(st.get("shell"), HARD_SHELL, where)
+                lines = [l.strip() for l in st["run"].splitlines() if l.strip() and not l.strip().startswith("#")]
+                self.assertEqual(lines[0], "PATH=/usr/bin:/bin:/usr/sbin:/sbin; export PATH", where)
+                self.assertIn("unset DEVELOPER_DIR", st["run"], where)
+                self.assertNotIn("brew", st["run"], where)
+                self.assertNotRegex(st["run"], r"(?m)^\s*python3\b", where)
+                self.assertIn("/usr/bin/python3 -I", st["run"], where)
+                self.assertNotIn("zstd", st["run"].replace("zstd-decompressed", ""), where)
+            self.assertGreaterEqual(checked, 1, f"{wf}/{job}")
+
+    def test_decompress_step_holds_no_tokens_and_precedes_the_scan(self):
+        for wf, job, steps in self.jobs_under_test():
+            names = [s.get("name") for s in steps]
+            d = names.index("Decompress evidence for the secret scan")
+            self.assertEqual(names.index("Secret scan of evidence artifacts"), d + 1)
+            self.assertNotIn("TOKEN", yaml.safe_dump(steps[d]))
+            self.assertEqual(steps[d]["if"], "always()")
+
+    def test_scan_step_reads_decompressed_manifest_not_zstd(self):
+        for wf, job, steps in self.jobs_under_test():
+            scan = [s for s in steps if s.get("name") == "Secret scan of evidence artifacts"][0]
+            self.assertIn("manifest.json", scan["run"])
 
 
 SCREENSHOTS_WORKFLOW = os.path.join(ROOT, ".github", "workflows", "ios-screenshots.yml")

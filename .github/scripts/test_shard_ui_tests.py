@@ -207,6 +207,49 @@ class CheckShardRanTests(unittest.TestCase):
         # a suite that merely started, or the command line echo, is not a run
         self.assertEqual(ran.missing_classes(["AUITests"], "Test Suite 'AUITests' started at x\n-only-testing:RadioShakeUITests/AUITests"), ["AUITests"])
 
+    METHOD_ARGS = ("-only-testing:RadioShakeUITests/A11yAuditHomeUITests/testGateDefaultLight\n"
+                   "-only-testing:RadioShakeUITests/A11yAuditHomeUITests/testGateAx5DarkBold\n")
+
+    def test_selected_entries_parse_class_and_class_method(self):
+        self.assertEqual(ran.selected_entries(self.ARGS + self.METHOD_ARGS),
+                         [("AUITests", None), ("BUITests", None),
+                          ("A11yAuditHomeUITests", "testGateDefaultLight"),
+                          ("A11yAuditHomeUITests", "testGateAx5DarkBold")])
+        with self.assertRaises(ValueError):
+            ran.selected_entries("-only-testing:X/Y/z/extra\n")
+        with self.assertRaises(ValueError):
+            ran.selected_entries("-only-testing:X/Y/z w\n")
+
+    def test_missing_entries_require_a_passed_or_failed_test_case_line(self):
+        entries = ran.selected_entries(self.METHOD_ARGS)
+        passed = "Test Case '-[RadioShakeUITests.A11yAuditHomeUITests testGateDefaultLight]' passed (3.1 seconds).\n"
+        failed = "Test Case '-[RadioShakeUITests.A11yAuditHomeUITests testGateAx5DarkBold]' failed (4.0 seconds).\n"
+        skipped = "Test Case '-[RadioShakeUITests.A11yAuditHomeUITests testGateAx5DarkBold]' skipped (0.0 seconds).\n"
+        started = "Test Case '-[RadioShakeUITests.A11yAuditHomeUITests testGateAx5DarkBold]' started.\n"
+        self.assertEqual(ran.missing_entries(entries, passed + failed), [])
+        self.assertEqual(ran.missing_entries(entries, passed + skipped), ["A11yAuditHomeUITests/testGateAx5DarkBold"])
+        self.assertEqual(ran.missing_entries(entries, passed + started), ["A11yAuditHomeUITests/testGateAx5DarkBold"])
+        self.assertEqual(ran.missing_entries(entries, ""), [
+            "A11yAuditHomeUITests/testGateDefaultLight", "A11yAuditHomeUITests/testGateAx5DarkBold"])
+        # a different class with the same method does not count
+        other = "Test Case '-[RadioShakeUITests.A11yAuditOtherUITests testGateDefaultLight]' passed (1 seconds).\n"
+        self.assertEqual(ran.missing_entries(entries[:1], other), ["A11yAuditHomeUITests/testGateDefaultLight"])
+
+    def test_cli_method_entries(self):
+        with tempfile.TemporaryDirectory() as d:
+            a, l = os.path.join(d, "a"), os.path.join(d, "l")
+            open(a, "w").write(self.METHOD_ARGS)
+            open(l, "w").write("Test Case '-[RadioShakeUITests.A11yAuditHomeUITests testGateDefaultLight]' passed (1 seconds).\n"
+                                "Test Case '-[RadioShakeUITests.A11yAuditHomeUITests testGateAx5DarkBold]' skipped (0 seconds).\n")
+            with contextlib.redirect_stdout(io.StringIO()) as buf:
+                self.assertEqual(ran.main(["--args", a, "--log", l]), 1)
+            self.assertIn("testGateAx5DarkBold", buf.getvalue())
+            open(l, "a").write("Test Case '-[RadioShakeUITests.A11yAuditHomeUITests testGateAx5DarkBold]' passed (1 seconds).\n")
+            open(l, "w").write("Test Case '-[RadioShakeUITests.A11yAuditHomeUITests testGateDefaultLight]' passed (1 seconds).\n"
+                               "Test Case '-[RadioShakeUITests.A11yAuditHomeUITests testGateAx5DarkBold]' failed (1 seconds).\n")
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(ran.main(["--args", a, "--log", l]), 0)
+
     def test_cli_exit_codes(self):
         with tempfile.TemporaryDirectory() as d:
             a, l = os.path.join(d, "a"), os.path.join(d, "l")
