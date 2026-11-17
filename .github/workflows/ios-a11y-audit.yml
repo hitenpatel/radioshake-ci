@@ -348,7 +348,7 @@ jobs:
           if [ "$MATRIX" = "full" ]; then
             export TEST_RUNNER_RS_A11Y_MATRIX=full
           fi
-          # No -retry-tests-on-failure: audit findings are deterministic and a retry doubles the time.
+          # No xcodebuild retries: audit findings are deterministic and a retry doubles the time.
           xcodebuild test \
             -project RadioShake.xcodeproj \
             -scheme RadioShake \
