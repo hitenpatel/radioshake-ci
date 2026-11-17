@@ -3,7 +3,8 @@
 
 Enumerates test classes from the cloned source (every `class X: XCTestCase` under the UI test
 directory that has at least one `func testY()`), minus the excluded ones (the screenshot tour,
-which must never run in the public job), sorts them and assigns them greedily, heaviest first, to
+which must never run in the public job, and the per-screen A11yAudit*UITests classes, which have
+their own nightly workflow), sorts them and assigns them greedily, heaviest first, to
 the shard with the smallest load relative to its capacity. Weight is the measured seconds per class
 from ui_test_weights.json when present, otherwise the method count times a default per-method cost.
 
@@ -24,6 +25,8 @@ import sys
 
 DEFAULT_SECONDS_PER_METHOD = 25.0
 DEFAULT_EXCLUDE = ("ScreenshotTourUITests", "StoreScreenshotsUITests")
+# Per-screen accessibility audits run in ios-a11y-audit.yml (nightly/weekly/manual), never in validate.
+AUDIT_CLASS = re.compile(r"^A11yAudit[A-Za-z0-9_]*UITests$")
 IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 # A column-0 type declaration starts a new section; test methods belong to the section they are in.
 DECL = re.compile(
@@ -91,7 +94,7 @@ def discover(ui_dir, exclude=DEFAULT_EXCLUDE):
 
     result = {}
     for cls in sorted(supers):
-        if cls in exclude or not is_test_case(cls):
+        if cls in exclude or AUDIT_CLASS.match(cls) or not is_test_case(cls):
             continue
         count = len(tests.get(cls, []))
         if count == 0:
