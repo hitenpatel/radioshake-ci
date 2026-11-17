@@ -1,7 +1,10 @@
 """Structure checks for ios-shared-validate.yml: sharding must keep the gate's contract.
 Run: python3 -m unittest discover -s .github/scripts   (skipped when PyYAML is unavailable)"""
+import json
 import os
 import re
+import subprocess
+import tempfile
 import unittest
 
 try:
@@ -382,7 +385,7 @@ class A11yAuditWorkflowTests(unittest.TestCase):
         self.assertNotIn("FORGEJO_CLONE_TOKEN", yaml.safe_dump(rep))
 
 
-HARD_SHELL = "/bin/bash -p --noprofile --norc -eo pipefail {0}"
+HARD_SHELL = "/bin/bash --noprofile --norc -p -eo pipefail {0}"
 TOKEN_RE = re.compile(r"secrets\.FORGEJO_(CLONE|STATUS)_TOKEN")
 
 
@@ -427,6 +430,84 @@ class TokenStepHardeningTests(unittest.TestCase):
             self.assertEqual(names.index("Secret scan of evidence artifacts"), d + 1)
             self.assertNotIn("TOKEN", yaml.safe_dump(steps[d]))
             self.assertEqual(steps[d]["if"], "always()")
+
+    def run_hard(self, script_text, env=None):
+        with tempfile.NamedTemporaryFile("w", suffix=".sh", delete=False) as fh:
+            fh.write(script_text)
+        self.addCleanup(os.unlink, fh.name)
+        cmd = [a.replace("{0}", fh.name) for a in HARD_SHELL.split()]
+        full = {"PATH": "/usr/bin:/bin", "HOME": tempfile.gettempdir()}
+        full.update(env or {})
+        return subprocess.run(cmd, env=full, capture_output=True, text=True)
+
+    @unittest.skipUnless(os.path.exists("/bin/bash"), "no /bin/bash")
+    def test_hard_shell_string_is_valid_bash_privileged_and_ignores_bash_env(self):
+        with tempfile.NamedTemporaryFile("w", delete=False) as be:
+            be.write("echo BASH_ENV_SOURCED\n")
+        self.addCleanup(os.unlink, be.name)
+        r = self.run_hard('[[ $- == *p* ]] && echo privileged-on\n', {"BASH_ENV": be.name})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("privileged-on", r.stdout)
+        self.assertNotIn("BASH_ENV_SOURCED", r.stdout)
+
+    def scan_run(self):
+        with open(WORKFLOW, encoding="utf-8") as fh:
+            steps = yaml.safe_load(fh)["jobs"]["validate"]["steps"]
+        return [s for s in steps if s.get("name") == "Secret scan of evidence artifacts"][0]["run"]
+
+    def test_scan_interpreter_gets_an_allowlisted_environment(self):
+        for wf, job, steps in self.jobs_under_test():
+            scan = [s for s in steps if s.get("name") == "Secret scan of evidence artifacts"][0]
+            run = scan["run"]
+            self.assertIn("/usr/bin/env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin", run, wf)
+            self.assertIn("/usr/bin/python3 -I -", run, wf)
+            for var in ("HOME=", "EVIDENCE_PATHS=", "FORGEJO_CLONE_TOKEN=", "FORGEJO_STATUS_TOKEN="):
+                self.assertIn(var, run, wf)
+            self.assertNotIn("TOOLCHAINS=", run)
+            self.assertIn("trap '/bin/rm -rf /tmp/scan-decompressed' EXIT", run, wf)
+            self.assertLess(run.index("trap "), run.index("/usr/bin/env -i"))
+
+    def run_scan(self, files, manifest=None):
+        """Run the real scan step script (hardened shell) against a temp evidence dir."""
+        d = tempfile.mkdtemp()
+        self.addCleanup(subprocess.run, ["rm", "-rf", d, "/tmp/scan-decompressed"])
+        for name, data in files.items():
+            with open(os.path.join(d, name), "wb") as fh:
+                fh.write(data)
+        subprocess.run(["rm", "-rf", "/tmp/scan-decompressed"])
+        if manifest is not None:
+            os.makedirs("/tmp/scan-decompressed")
+            items = []
+            for name, extra in manifest.items():
+                dest = os.path.join("/tmp/scan-decompressed", name)
+                with open(dest, "wb") as fh:
+                    fh.write(extra)
+                items.append({"label": os.path.join(d, name), "file": dest, "source": os.path.join(d, name)})
+            with open("/tmp/scan-decompressed/manifest.json", "w") as fh:
+                json.dump({"items": items, "failed": []}, fh)
+        env = {"EVIDENCE_PATHS": d + "/\n", "FORGEJO_CLONE_TOKEN": "tok-clone-123",
+               "FORGEJO_STATUS_TOKEN": "tok-status-456"}
+        return self.run_hard(self.scan_run(), env)
+
+    @unittest.skipUnless(os.path.exists("/usr/bin/python3") and os.path.exists("/bin/bash"), "no system python/bash")
+    def test_scan_step_script_executes_and_detects_leaks_and_unlisted_zstd_blobs(self):
+        magic = b"\x28\xb5\x2f\xfd"
+        r = self.run_scan({"a.log": b"clean"})
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("OK - no secret", r.stdout)
+        self.assertFalse(os.path.exists("/tmp/scan-decompressed"), "trap must remove the decompressed copies")
+        r = self.run_scan({"a.log": b"x tok-status-456 y"})
+        self.assertEqual(r.returncode, 1)
+        self.assertNotIn("tok-status-456", r.stdout + r.stderr)
+        # a zstd-magic file with no manifest entry fails even with no xcresult bundle present
+        r = self.run_scan({"b.bin": magic + b"junk"})
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("not in decompression manifest", r.stdout)
+        # listed in the manifest: scanned (clean) and accepted; a leak in the decompressed copy is caught
+        r = self.run_scan({"b.bin": magic + b"junk"}, manifest={"b.bin": b"decoded clean"})
+        self.assertEqual(r.returncode, 0, r.stdout)
+        r = self.run_scan({"b.bin": magic + b"junk"}, manifest={"b.bin": b"decoded tok-clone-123"})
+        self.assertEqual(r.returncode, 1)
 
     def test_scan_step_reads_decompressed_manifest_not_zstd(self):
         for wf, job, steps in self.jobs_under_test():
