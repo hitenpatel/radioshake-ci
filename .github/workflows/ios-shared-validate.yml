@@ -1002,26 +1002,79 @@ jobs:
 
       # Nothing uploaded may contain the Forgejo tokens (raw, or the base64
       # basic-auth value the clone step builds). xcresult blobs are
-      # zstd-compressed, so every file is also scanned decompressed. Fails
-      # closed: unreadable files or a missing decompressor fail the step.
-      # Prints paths only, never a secret value.
+      # zstd-compressed, so a token-free step first decompresses them into
+      # /tmp/scan-decompressed (it may use Homebrew's zstd; it holds no secrets).
+      - name: Decompress evidence for the secret scan
+        if: always()
+        run: |
+          set +e -u -o pipefail
+          NEED=0
+          while IFS= read -r p; do
+            case "$p" in *.xcresult) [ -e "$p" ] && NEED=1 ;; esac
+          done <<< "$EVIDENCE_PATHS"
+          if [ "$NEED" = 1 ] && ! command -v zstd >/dev/null 2>&1; then
+            brew install zstd >/dev/null 2>&1
+          fi
+          python3 - <<'PY'
+          import json, os, subprocess, shutil
+
+          MAGIC = b"\x28\xb5\x2f\xfd"
+          zstd = shutil.which("zstd")
+          out = "/tmp/scan-decompressed"
+          os.makedirs(out, exist_ok=True)
+          items, failed, n = [], [], 0
+          for p in [x.strip() for x in os.environ["EVIDENCE_PATHS"].splitlines() if x.strip()]:
+              if not os.path.exists(p):
+                  continue
+              is_bundle = p.rstrip("/").endswith(".xcresult")
+              files = []
+              if os.path.isdir(p):
+                  for root, _, names in os.walk(p):
+                      files += [os.path.join(root, f) for f in names]
+              else:
+                  files = [p]
+              for f in files:
+                  label = p if is_bundle else f
+                  try:
+                      with open(f, "rb") as fh:
+                          data = fh.read()
+                  except OSError:
+                      continue  # the scan step reports unreadable files
+                  if not data.startswith(MAGIC):
+                      continue
+                  if zstd is None:
+                      failed.append(label + " (decompressor unavailable)")
+                      continue
+                  r = subprocess.run([zstd, "-dcq"], input=data, capture_output=True)
+                  if r.returncode != 0:
+                      failed.append(label + " (decompress failed)")
+                      continue
+                  n += 1
+                  dest = os.path.join(out, str(n))
+                  with open(dest, "wb") as fh:
+                      fh.write(r.stdout)
+                  items.append({"label": label, "file": dest})
+          with open(os.path.join(out, "manifest.json"), "w") as fh:
+              json.dump({"items": items, "failed": failed}, fh)
+          print(f"Decompressed {len(items)} blobs, {len(failed)} failures")
+          PY
+
+      # Holds the Forgejo tokens and runs after branch code, so it uses only system tools by
+      # absolute path, a fixed PATH, and a bash that ignores BASH_ENV (-p). Fails closed:
+      # unreadable files or a missing/failed decompression fail the step. Prints paths only.
       - name: Secret scan of evidence artifacts
         id: secret_scan
         if: always()
+        shell: /bin/bash -p --noprofile --norc -eo pipefail {0}
         env:
           FORGEJO_CLONE_TOKEN: ${{ secrets.FORGEJO_CLONE_TOKEN }}
           FORGEJO_STATUS_TOKEN: ${{ secrets.FORGEJO_STATUS_TOKEN }}
         run: |
+          PATH=/usr/bin:/bin:/usr/sbin:/sbin; export PATH
+          unset DEVELOPER_DIR BASH_ENV ENV PYTHONPATH PYTHONHOME PYTHONSTARTUP
           set +e -u -o pipefail
-          NEED_ZSTD=0
-          while IFS= read -r p; do
-            case "$p" in *.xcresult) [ -e "$p" ] && NEED_ZSTD=1 ;; esac
-          done <<< "$EVIDENCE_PATHS"
-          if [ "$NEED_ZSTD" = 1 ] && ! command -v zstd >/dev/null 2>&1; then
-            brew install zstd >/dev/null 2>&1
-          fi
-          python3 - <<'PY'
-          import base64, os, subprocess, shutil, sys
+          /usr/bin/python3 -I - <<'PY'
+          import base64, json, os, sys
 
           needles = {}
           for name in ("FORGEJO_CLONE_TOKEN", "FORGEJO_STATUS_TOKEN"):
@@ -1032,22 +1085,20 @@ jobs:
           if clone:
               needles["CLONE_AUTH_BASE64"] = base64.b64encode(b"oauth2:" + clone.encode())
 
-          ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
-          zstd = shutil.which("zstd")
-          leaked, failed, scanned_files, scanned_paths, decompressed = [], [], 0, 0, 0
+          leaked, failed, scanned_files, scanned_paths = [], [], 0, 0
+          have_bundle = False
 
-          def hit(data):
-              return [n for n, v in needles.items() if v in data]
-
-          def check(label, data, path):
-              for n in hit(data):
-                  leaked.append((n, label))
+          def check(label, data):
+              for n, v in needles.items():
+                  if v in data:
+                      leaked.append((n, label))
 
           for p in [x.strip() for x in os.environ["EVIDENCE_PATHS"].splitlines() if x.strip()]:
               if not os.path.exists(p):
                   continue
               scanned_paths += 1
               is_bundle = p.rstrip("/").endswith(".xcresult")
+              have_bundle = have_bundle or is_bundle
               files = []
               if os.path.isdir(p):
                   for root, _, names in os.walk(p):
@@ -1063,19 +1114,26 @@ jobs:
                       failed.append(label)
                       continue
                   scanned_files += 1
-                  check(label, data, f)
-                  if data.startswith(ZSTD_MAGIC):
-                      if zstd is None:
-                          failed.append(label + " (zstd decompressor unavailable)")
-                          continue
-                      r = subprocess.run([zstd, "-dcq"], input=data, capture_output=True)
-                      if r.returncode != 0:
-                          failed.append(label + " (zstd decompress failed)")
-                          continue
-                      decompressed += 1
-                      check(label, r.stdout, f)
+                  check(label, data)
 
-          print(f"Scanned {scanned_paths} evidence paths, {scanned_files} files, {decompressed} zstd blobs decompressed; {len(needles)} needles")
+          decompressed = 0
+          manifest = "/tmp/scan-decompressed/manifest.json"
+          try:
+              with open(manifest, "r") as fh:
+                  m = json.load(fh)
+              for item in m["items"]:
+                  try:
+                      with open(item["file"], "rb") as fh:
+                          check(item["label"], fh.read())
+                      decompressed += 1
+                  except OSError:
+                      failed.append(item["label"] + " (decompressed copy unreadable)")
+              failed.extend(m["failed"])
+          except (OSError, ValueError, KeyError):
+              if have_bundle:
+                  failed.append("xcresult evidence (decompression manifest missing)")
+
+          print(f"Scanned {scanned_paths} evidence paths, {scanned_files} files, {decompressed} decompressed blobs; {len(needles)} needles")
           for n, label in sorted(set(leaked)):
               print(f"::error::{n} value found in {label}")
           for label in sorted(set(failed)):
@@ -1347,26 +1405,79 @@ jobs:
 
       # Nothing uploaded may contain the Forgejo tokens (raw, or the base64
       # basic-auth value the clone step builds). xcresult blobs are
-      # zstd-compressed, so every file is also scanned decompressed. Fails
-      # closed: unreadable files or a missing decompressor fail the step.
-      # Prints paths only, never a secret value.
+      # zstd-compressed, so a token-free step first decompresses them into
+      # /tmp/scan-decompressed (it may use Homebrew's zstd; it holds no secrets).
+      - name: Decompress evidence for the secret scan
+        if: always()
+        run: |
+          set +e -u -o pipefail
+          NEED=0
+          while IFS= read -r p; do
+            case "$p" in *.xcresult) [ -e "$p" ] && NEED=1 ;; esac
+          done <<< "$EVIDENCE_PATHS"
+          if [ "$NEED" = 1 ] && ! command -v zstd >/dev/null 2>&1; then
+            brew install zstd >/dev/null 2>&1
+          fi
+          python3 - <<'PY'
+          import json, os, subprocess, shutil
+
+          MAGIC = b"\x28\xb5\x2f\xfd"
+          zstd = shutil.which("zstd")
+          out = "/tmp/scan-decompressed"
+          os.makedirs(out, exist_ok=True)
+          items, failed, n = [], [], 0
+          for p in [x.strip() for x in os.environ["EVIDENCE_PATHS"].splitlines() if x.strip()]:
+              if not os.path.exists(p):
+                  continue
+              is_bundle = p.rstrip("/").endswith(".xcresult")
+              files = []
+              if os.path.isdir(p):
+                  for root, _, names in os.walk(p):
+                      files += [os.path.join(root, f) for f in names]
+              else:
+                  files = [p]
+              for f in files:
+                  label = p if is_bundle else f
+                  try:
+                      with open(f, "rb") as fh:
+                          data = fh.read()
+                  except OSError:
+                      continue  # the scan step reports unreadable files
+                  if not data.startswith(MAGIC):
+                      continue
+                  if zstd is None:
+                      failed.append(label + " (decompressor unavailable)")
+                      continue
+                  r = subprocess.run([zstd, "-dcq"], input=data, capture_output=True)
+                  if r.returncode != 0:
+                      failed.append(label + " (decompress failed)")
+                      continue
+                  n += 1
+                  dest = os.path.join(out, str(n))
+                  with open(dest, "wb") as fh:
+                      fh.write(r.stdout)
+                  items.append({"label": label, "file": dest})
+          with open(os.path.join(out, "manifest.json"), "w") as fh:
+              json.dump({"items": items, "failed": failed}, fh)
+          print(f"Decompressed {len(items)} blobs, {len(failed)} failures")
+          PY
+
+      # Holds the Forgejo tokens and runs after branch code, so it uses only system tools by
+      # absolute path, a fixed PATH, and a bash that ignores BASH_ENV (-p). Fails closed:
+      # unreadable files or a missing/failed decompression fail the step. Prints paths only.
       - name: Secret scan of evidence artifacts
         id: secret_scan
         if: always()
+        shell: /bin/bash -p --noprofile --norc -eo pipefail {0}
         env:
           FORGEJO_CLONE_TOKEN: ${{ secrets.FORGEJO_CLONE_TOKEN }}
           FORGEJO_STATUS_TOKEN: ${{ secrets.FORGEJO_STATUS_TOKEN }}
         run: |
+          PATH=/usr/bin:/bin:/usr/sbin:/sbin; export PATH
+          unset DEVELOPER_DIR BASH_ENV ENV PYTHONPATH PYTHONHOME PYTHONSTARTUP
           set +e -u -o pipefail
-          NEED_ZSTD=0
-          while IFS= read -r p; do
-            case "$p" in *.xcresult) [ -e "$p" ] && NEED_ZSTD=1 ;; esac
-          done <<< "$EVIDENCE_PATHS"
-          if [ "$NEED_ZSTD" = 1 ] && ! command -v zstd >/dev/null 2>&1; then
-            brew install zstd >/dev/null 2>&1
-          fi
-          python3 - <<'PY'
-          import base64, os, subprocess, shutil, sys
+          /usr/bin/python3 -I - <<'PY'
+          import base64, json, os, sys
 
           needles = {}
           for name in ("FORGEJO_CLONE_TOKEN", "FORGEJO_STATUS_TOKEN"):
@@ -1377,22 +1488,20 @@ jobs:
           if clone:
               needles["CLONE_AUTH_BASE64"] = base64.b64encode(b"oauth2:" + clone.encode())
 
-          ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
-          zstd = shutil.which("zstd")
-          leaked, failed, scanned_files, scanned_paths, decompressed = [], [], 0, 0, 0
+          leaked, failed, scanned_files, scanned_paths = [], [], 0, 0
+          have_bundle = False
 
-          def hit(data):
-              return [n for n, v in needles.items() if v in data]
-
-          def check(label, data, path):
-              for n in hit(data):
-                  leaked.append((n, label))
+          def check(label, data):
+              for n, v in needles.items():
+                  if v in data:
+                      leaked.append((n, label))
 
           for p in [x.strip() for x in os.environ["EVIDENCE_PATHS"].splitlines() if x.strip()]:
               if not os.path.exists(p):
                   continue
               scanned_paths += 1
               is_bundle = p.rstrip("/").endswith(".xcresult")
+              have_bundle = have_bundle or is_bundle
               files = []
               if os.path.isdir(p):
                   for root, _, names in os.walk(p):
@@ -1408,19 +1517,26 @@ jobs:
                       failed.append(label)
                       continue
                   scanned_files += 1
-                  check(label, data, f)
-                  if data.startswith(ZSTD_MAGIC):
-                      if zstd is None:
-                          failed.append(label + " (zstd decompressor unavailable)")
-                          continue
-                      r = subprocess.run([zstd, "-dcq"], input=data, capture_output=True)
-                      if r.returncode != 0:
-                          failed.append(label + " (zstd decompress failed)")
-                          continue
-                      decompressed += 1
-                      check(label, r.stdout, f)
+                  check(label, data)
 
-          print(f"Scanned {scanned_paths} evidence paths, {scanned_files} files, {decompressed} zstd blobs decompressed; {len(needles)} needles")
+          decompressed = 0
+          manifest = "/tmp/scan-decompressed/manifest.json"
+          try:
+              with open(manifest, "r") as fh:
+                  m = json.load(fh)
+              for item in m["items"]:
+                  try:
+                      with open(item["file"], "rb") as fh:
+                          check(item["label"], fh.read())
+                      decompressed += 1
+                  except OSError:
+                      failed.append(item["label"] + " (decompressed copy unreadable)")
+              failed.extend(m["failed"])
+          except (OSError, ValueError, KeyError):
+              if have_bundle:
+                  failed.append("xcresult evidence (decompression manifest missing)")
+
+          print(f"Scanned {scanned_paths} evidence paths, {scanned_files} files, {decompressed} decompressed blobs; {len(needles)} needles")
           for n, label in sorted(set(leaked)):
               print(f"::error::{n} value found in {label}")
           for label in sorted(set(failed)):

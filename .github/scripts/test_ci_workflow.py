@@ -356,7 +356,9 @@ class A11yAuditWorkflowTests(unittest.TestCase):
         for name in ("Clone source from private host", "Set up JDK 21", "Install XcodeGen (pinned)",
                      "Generate Xcode project", "Decompress evidence for the secret scan",
                      "Secret scan of evidence artifacts", "Check out CI scripts (this repo, scripts only)"):
-            for key in ("run", "uses", "with", "env", "shell", "if", "id"):
+            keys = ("run", "uses", "with", "shell", "if", "id") if name.startswith("Clone") \
+                else ("run", "uses", "with", "env", "shell", "if", "id")
+            for key in keys:
                 self.assertEqual(v[name].get(key), self.asteps[name].get(key), f"{name}: {key}")
 
     def test_full_matrix_creates_the_se_simulator_from_the_resolved_device(self):

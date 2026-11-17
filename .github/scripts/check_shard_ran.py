@@ -4,6 +4,8 @@
   check_shard_ran.py --args /tmp/ui-shard-args.txt --log /tmp/ios-logs/xctest.log
 
 --args holds one `-only-testing:<Bundle>/<Class>` line per class (written by shard_ui_tests.py).
+A line `-only-testing:<Bundle>/<Class>/<method>` selects one test method: it must have a
+`Test Case '-[<Bundle>.<Class> <method>]' passed|failed (` line (a skipped or missing test goes red).
 A class that is selected but has no `Test Suite '<Class>' passed|failed` line (typo, class renamed or
 deleted, build skipped it) means the shard silently tested less than planned, so the job goes red.
 """
@@ -23,6 +25,36 @@ def selected_classes(args_text):
     return classes
 
 
+ENTRY = re.compile(r"-only-testing:[A-Za-z0-9_]+/([A-Za-z_][A-Za-z0-9_]*)(?:/([A-Za-z_][A-Za-z0-9_]*))?")
+
+
+def selected_entries(args_text):
+    """Return [(class, method_or_None)] for every -only-testing line."""
+    entries = []
+    for line in args_text.splitlines():
+        if not line.strip():
+            continue
+        m = ENTRY.fullmatch(line.strip())
+        if not m:
+            raise ValueError(f"unexpected line in args file: {line.strip()!r}")
+        entries.append((m.group(1), m.group(2)))
+    return entries
+
+
+def missing_entries(entries, log_text):
+    """Entries that did not run: a class needs a passed/failed suite line, a method a passed/failed test case line."""
+    suites = set(re.findall(r"Test Suite '([A-Za-z_][A-Za-z0-9_]*)' (?:passed|failed) at", log_text))
+    cases = set(re.findall(r"Test Case '-\[[A-Za-z0-9_]+\.([A-Za-z_][A-Za-z0-9_]*) ([A-Za-z_][A-Za-z0-9_]*)\]' (?:passed|failed) \(", log_text))
+    out = []
+    for cls, method in entries:
+        if method is None:
+            if cls not in suites:
+                out.append(cls)
+        elif (cls, method) not in cases:
+            out.append(f"{cls}/{method}")
+    return out
+
+
 def missing_classes(classes, log_text):
     ran = set(re.findall(r"Test Suite '([A-Za-z_][A-Za-z0-9_]*)' (?:passed|failed) at", log_text))
     return [c for c in classes if c not in ran]
@@ -35,7 +67,7 @@ def main(argv=None):
     a = p.parse_args(argv)
     try:
         with open(a.args, encoding="utf-8") as fh:
-            classes = selected_classes(fh.read())
+            classes = selected_entries(fh.read())
         with open(a.log, encoding="utf-8", errors="replace") as fh:
             log = fh.read()
     except (OSError, ValueError) as e:
@@ -44,11 +76,11 @@ def main(argv=None):
     if not classes:
         print("::error::no UI test classes were selected for this job")
         return 1
-    missing = missing_classes(classes, log)
+    missing = missing_entries(classes, log)
     if missing:
-        print(f"::error::selected UI test classes that did not run: {', '.join(missing)}")
+        print(f"::error::selected UI tests that did not run (or were skipped): {', '.join(missing)}")
         return 1
-    print(f"OK - all {len(classes)} selected UI test classes ran")
+    print(f"OK - all {len(classes)} selected UI tests ran")
     return 0
 
 
