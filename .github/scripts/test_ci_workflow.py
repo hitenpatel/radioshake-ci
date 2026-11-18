@@ -327,7 +327,7 @@ class A11yAuditWorkflowTests(unittest.TestCase):
         self.assertIn("/tmp/a11y-only-args.txt", run)
         self.assertEqual(self.aorder.index("Verify every selected audit test ran"),
                          self.aorder.index("Run accessibility audit passes") + 1)
-        self.assertEqual(step["if"], "success()")
+        self.assertEqual(step["if"], "success() && steps.classes.outputs.present == 'true'")
         self.assertNotIn("working-directory", step)
         self.assertIn("python3 ci/.github/scripts/check_shard_ran.py", step["run"])
         self.assertIn("--args /tmp/a11y-only-args.txt", step["run"])
@@ -377,7 +377,13 @@ class A11yAuditWorkflowTests(unittest.TestCase):
                      "Secret scan of evidence artifacts", "Check out CI scripts (this repo, scripts only)"):
             keys = ("run", "uses", "with", "shell", "if", "id") if name.startswith("Clone") \
                 else ("run", "uses", "with", "env", "shell", "if", "id")
+            gated = name in ("Set up JDK 21", "Install XcodeGen (pinned)", "Generate Xcode project")
             for key in keys:
+                if gated and key == "if":
+                    # The audit job only adds the audit-classes gate on build steps.
+                    self.assertIsNone(v[name].get(key), f"{name}: validate has no condition")
+                    self.assertEqual(self.asteps[name].get(key), "steps.classes.outputs.present == 'true'", name)
+                    continue
                 self.assertEqual(v[name].get(key), self.asteps[name].get(key), f"{name}: {key}")
 
     def test_full_matrix_creates_the_se_simulator_from_the_resolved_device(self):

@@ -208,6 +208,20 @@ jobs:
           echo "head_sha=$HEAD_SHA" >> "$GITHUB_OUTPUT"
           echo "Cloned $REF at $HEAD_SHA"
 
+      # A source ref without audit classes (main before A11y-1 merges, old branches) skips the whole build.
+      # Reads files only; no secrets, no branch code runs.
+      - name: Find audit classes in the source
+        id: classes
+        run: |
+          set -euo pipefail
+          N=0
+          for f in src/ios/UITests/RadioShakeUITests/A11y/A11yAudit*UITests.swift; do
+            [ -f "$f" ] || continue
+            N=$((N + $(grep -cE '^final class +A11yAudit[A-Za-z0-9_]*UITests' "$f" || true)))
+          done
+          if [ "$N" -gt 0 ]; then echo "present=true" >> "$GITHUB_OUTPUT"; else echo "present=false" >> "$GITHUB_OUTPUT"; fi
+          echo "$N audit class(es) in this source ref"
+
       - name: Check out CI scripts (this repo, scripts only)
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4
         with:
@@ -217,6 +231,7 @@ jobs:
           persist-credentials: false
 
       - name: Set up JDK 21
+        if: steps.classes.outputs.present == 'true'
         uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3  # v4
         with:
           distribution: temurin
@@ -224,6 +239,7 @@ jobs:
 
       # ── macOS preflight (TASK-141 AC #3) ────────────────────────────
       - name: macOS preflight
+        if: steps.classes.outputs.present == 'true'
         run: |
           set -euo pipefail
           ARCH=$(uname -m)
@@ -266,6 +282,7 @@ jobs:
 
       # ── iOS app build + XCTest ──────────────────────────────────────
       - name: Install XcodeGen (pinned)
+        if: steps.classes.outputs.present == 'true'
         run: |
           set -euo pipefail
           VERSION="2.42.0"
@@ -279,6 +296,7 @@ jobs:
       # Only the Debug XCFramework: this job builds and tests the Debug app. The Xcode
       # preBuildScript re-runs the (cached) Gradle task and re-points the symlink itself.
       - name: Assemble shared Debug XCFramework and point symlink at it
+        if: steps.classes.outputs.present == 'true'
         working-directory: src
         run: |
           set -euo pipefail
@@ -291,12 +309,14 @@ jobs:
                   "$PWD/shared/build/XCFrameworks/current/RadioShakeShared.xcframework"
 
       - name: Generate Xcode project
+        if: steps.classes.outputs.present == 'true'
         working-directory: src/ios
         run: |
           xcodegen generate --spec project.yml
           xcodebuild -project RadioShake.xcodeproj -list
 
       - name: Boot simulator
+        if: steps.classes.outputs.present == 'true'
         env:
           DEVICE: ${{ needs.resolve.outputs.device }}
         run: |
@@ -330,6 +350,7 @@ jobs:
           xcrun simctl bootstatus "$UDID" -b
 
       - name: Run accessibility audit passes
+        if: steps.classes.outputs.present == 'true'
         working-directory: src/ios
         env:
           MATRIX: ${{ needs.resolve.outputs.matrix }}
@@ -371,7 +392,7 @@ jobs:
       # A leg is green only if every selected audit method ran and was not skipped (xcodebuild exits 0
       # when tests skip or an -only-testing identifier matches nothing). CI-owned script.
       - name: Verify every selected audit test ran
-        if: success()
+        if: success() && steps.classes.outputs.present == 'true'
         run: |
           if [ ! -f /tmp/a11y-only-args.txt ]; then echo "No audit tests were selected (old source ref), nothing to verify"; exit 0; fi
           python3 ci/.github/scripts/check_shard_ran.py --args /tmp/a11y-only-args.txt --log /tmp/ios-logs/xctest.log
