@@ -493,7 +493,7 @@ class WorkflowIntegrationTests(unittest.TestCase):
         self.assertNotIn('derived-data/', evidence)
         self.assertNotIn('derived-data-release/', evidence)
         deny = self.step('Audit Release binary for debug-only symbols (TASK-136 + TASK-137)')
-        self.assertEqual(hashlib.sha256((deny + '\n').encode()).hexdigest(), '553d6f9447a536a8e6bebca2e3d423df11b1e16bc8f6ffeccfd7732c24ed0cb1')  # + RSHoldFileImportProgress (A11y-1 flows); before: + RSForceIncreaseContrast, RSForceBoldText (A11y-1); before: + CarPreviewView, RecordingCarInterface, RSCarPreview, car.np. (Phase CP); before: + FakeCloudTransport, RSFakeICloud, RSRealICloud (Phase 5e part 2); before: RSDataSaver, RSDataUsageSeed, RSNetworkScript
+        self.assertEqual(hashlib.sha256((deny + '\n').encode()).hexdigest(), 'dc1e9446c2f14c6f2a8fbc69186c4b5fd60425a97f2bbfc02fb582a14fc68a48')  # + CarPreviewModel, CarPreviewSnapshot, RecordingNowPlayingHost, RSSeedFavourites, car.(tab|row|image|section). (Phase CP Task 4); before: + RSHoldFileImportProgress (A11y-1 flows); before: + RSForceIncreaseContrast, RSForceBoldText (A11y-1); before: + CarPreviewView, RecordingCarInterface, RSCarPreview, car.np. (Phase CP); before: + FakeCloudTransport, RSFakeICloud, RSRealICloud (Phase 5e part 2); before: RSDataSaver, RSDataUsageSeed, RSNetworkScript
         self.assertEqual(self.validate.count('      - name: Audit capture probe in Release binary'), 1)
 
 
