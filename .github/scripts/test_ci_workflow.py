@@ -293,6 +293,22 @@ class A11yAuditWorkflowTests(unittest.TestCase):
         self.assertIn("needs.resolve.outputs.passes", st["matrix"]["pass"])
         self.assertIn("fromJSON", st["matrix"]["pass"])
 
+    def test_audit_classes_are_found_right_after_the_clone_and_gate_the_build(self):
+        """A source ref without audit classes (main before A11y-1 merges) must not spend a macOS build."""
+        find = "Find audit classes in the source"
+        self.assertIn(find, self.asteps)
+        self.assertEqual(self.aorder.index(find), self.aorder.index("Clone source from private host") + 1)
+        step = self.asteps[find]
+        self.assertEqual(step.get("id"), "classes")
+        self.assertNotIn("env", step, "the discovery step holds no secrets")
+        self.assertIn("^final class +A11yAudit[A-Za-z0-9_]*UITests", step["run"])
+        self.assertIn('present=', step["run"])
+        gated = ["Set up JDK 21", "macOS preflight", "Install XcodeGen (pinned)",
+                 "Assemble shared Debug XCFramework and point symlink at it", "Generate Xcode project",
+                 "Boot simulator", "Run accessibility audit passes", "Verify every selected audit test ran"]
+        for name in gated:
+            self.assertIn("steps.classes.outputs.present == 'true'", str(self.asteps[name].get("if", "")), name)
+
     def test_test_step_selects_methods_per_audit_class_without_retries(self):
         run = self.asteps["Run accessibility audit passes"]["run"]
         self.assertIn("^final class +A11yAudit[A-Za-z0-9_]*UITests", run)
