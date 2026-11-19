@@ -321,6 +321,19 @@ class A11yAuditWorkflowTests(unittest.TestCase):
         self.assertIn("skipping", run)
         self.assertIn("A11yAudit", run)
 
+    def test_each_audit_class_runs_alone_on_a_rebooted_simulator(self):
+        run = self.asteps["Run accessibility audit passes"]["run"]
+        self.assertIn("xcodebuild build-for-testing", run)
+        self.assertIn("xcodebuild test-without-building", run)
+        self.assertNotRegex(run, r"xcodebuild test \\")
+        loop = run[run.index('for ARG in "${ONLY[@]}"'):]
+        self.assertLess(loop.index('xcrun simctl shutdown "$UDID"'), loop.index("xcodebuild test-without-building"))
+        self.assertIn('xcrun simctl bootstatus "$UDID" -b', loop)
+        self.assertIn('"$ARG"', loop)
+        self.assertIn("tee -a /tmp/ios-logs/xctest.log", loop)
+        self.assertIn('xcrun xcresulttool merge "${BUNDLES[@]}" --output-path "/tmp/ios-a11y-${PASS}.xcresult"', run)
+        self.assertIn('exit "$STATUS"', run)
+
     def test_every_selected_audit_test_must_have_run_and_not_been_skipped(self):
         step = self.asteps["Verify every selected audit test ran"]
         run = self.asteps["Run accessibility audit passes"]["run"]

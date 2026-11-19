@@ -378,16 +378,54 @@ jobs:
           if [ "$MATRIX" = "full" ]; then
             export TEST_RUNNER_RS_A11Y_MATRIX=full
           fi
+          # Build once, then one xcodebuild per audit class on a freshly rebooted simulator. In one long
+          # run, a wedged simulator ("Failed to get background assertion") failed every later class at
+          # launch (full run 3, 2026-11-18); a reboot per class keeps one bad class from taking the rest.
           # No xcodebuild retries: audit findings are deterministic and a retry doubles the time.
-          xcodebuild test \
+          xcodebuild build-for-testing \
             -project RadioShake.xcodeproj \
             -scheme RadioShake \
             -configuration Debug \
             -destination "id=$UDID" \
             -derivedDataPath /tmp/derived-data \
-            -resultBundlePath "/tmp/ios-a11y-${PASS}.xcresult" \
-            "${ONLY[@]}" \
-            CODE_SIGNING_ALLOWED=NO 2>&1 | tee /tmp/ios-logs/xctest.log
+            CODE_SIGNING_ALLOWED=NO 2>&1 | tee /tmp/ios-logs/build.log
+          : > /tmp/ios-logs/xctest.log
+          STATUS=0
+          BUNDLES=()
+          PART=0
+          for ARG in "${ONLY[@]}"; do
+            PART=$((PART + 1))
+            if [ "$PART" -gt 1 ]; then
+              xcrun simctl shutdown "$UDID" || true
+              xcrun simctl boot "$UDID" || true
+              xcrun simctl bootstatus "$UDID" -b
+            fi
+            BUNDLE="/tmp/ios-a11y-${PASS}-part${PART}.xcresult"
+            echo "=== Audit class ${PART}/${#ONLY[@]}: ${ARG#-only-testing:} ===" | tee -a /tmp/ios-logs/xctest.log
+            set +e
+            xcodebuild test-without-building \
+              -project RadioShake.xcodeproj \
+              -scheme RadioShake \
+              -configuration Debug \
+              -destination "id=$UDID" \
+              -derivedDataPath /tmp/derived-data \
+              -resultBundlePath "$BUNDLE" \
+              "$ARG" \
+              CODE_SIGNING_ALLOWED=NO 2>&1 | tee -a /tmp/ios-logs/xctest.log
+            RC=${PIPESTATUS[0]}
+            set -e
+            [ -d "$BUNDLE" ] && BUNDLES+=("$BUNDLE")
+            [ "$RC" -eq 0 ] || STATUS=1
+          done
+          # One evidence bundle per pass, as before: merge the per-class bundles.
+          if [ "${#BUNDLES[@]}" -gt 1 ]; then
+            xcrun xcresulttool merge "${BUNDLES[@]}" --output-path "/tmp/ios-a11y-${PASS}.xcresult" \
+              && rm -rf "${BUNDLES[@]}" \
+              || echo "::warning::could not merge the per-class result bundles"
+          elif [ "${#BUNDLES[@]}" -eq 1 ]; then
+            mv "${BUNDLES[0]}" "/tmp/ios-a11y-${PASS}.xcresult"
+          fi
+          exit "$STATUS"
 
       # A leg is green only if every selected audit method ran and was not skipped (xcodebuild exits 0
       # when tests skip or an -only-testing identifier matches nothing). CI-owned script.
