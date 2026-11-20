@@ -214,6 +214,69 @@ class A11yGateWorkflowTests(unittest.TestCase):
         self.assertIn("a11y-base", run)
         self.assertEqual(set(self.steps[name]["env"]), {"HOST", "TOKEN"})
 
+    def _run_fetch_step(self, fetch_ok, main_has_files, show_ok=True):
+        """Run the fetch step's script with a fake git; returns (exit code, files left in a11y-base)."""
+        run = self.steps["Fetch A11y base files from main"]["run"]
+        with tempfile.TemporaryDirectory() as tmp:
+            bindir = os.path.join(tmp, "bin")
+            os.makedirs(bindir)
+            fake = os.path.join(bindir, "git")
+            with open(fake, "w") as fh:
+                fh.write(
+                    "#!/bin/bash\n"
+                    'if [ "$1" = init ]; then mkdir -p "${@: -1}"; exit 0; fi\n'
+                    'case "$*" in\n'
+                    '  *" fetch "*) [ "$FAKE_FETCH_OK" = 1 ]; exit $?;;\n'
+                    '  *cat-file*) [ "$FAKE_HAS" = 1 ]; exit $?;;\n'
+                    '  *" show "*) [ "$FAKE_SHOW_OK" = 1 ] || exit 1; echo content; exit 0;;\n'
+                    "esac\nexit 0\n")
+            os.chmod(fake, 0o755)
+            env = {"PATH": bindir + ":/usr/bin:/bin", "RUNNER_TEMP": tmp, "HOST": "h", "TOKEN": "t",
+                   "FAKE_FETCH_OK": "1" if fetch_ok else "0", "FAKE_HAS": "1" if main_has_files else "0",
+                   "FAKE_SHOW_OK": "1" if show_ok else "0"}
+            r = subprocess.run(["bash", "-c", run], env=env, capture_output=True, text=True)
+            base = os.path.join(tmp, "a11y-base")
+            return r.returncode, sorted(os.listdir(base))
+
+    def test_fetch_step_marks_success_only_when_main_was_fetched_and_read(self):
+        self.assertEqual(self._run_fetch_step(True, True), (0, ["exclusions.swift", "fetched", "inventory.json"]))
+        # main fetched but predates A11y-1: legitimate, marker without files
+        self.assertEqual(self._run_fetch_step(True, False), (0, ["fetched"]))
+        # fetch failed: no marker
+        self.assertEqual(self._run_fetch_step(False, True), (0, []))
+        # main has the files but they cannot be read: no marker
+        self.assertNotIn("fetched", self._run_fetch_step(True, True, show_ok=False)[1])
+
+    def _guard_prefix(self):
+        run = self.step["run"]
+        return "set -euo pipefail\n" + run[run.index("if [ -f ios/a11y/inventory.json ]"):run.index("BASE_ARGS=()")]
+
+    def _run_guard(self, has_inventory, marker):
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "src", "scripts"))
+            os.makedirs(os.path.join(tmp, "src", "ios", "a11y"))
+            os.makedirs(os.path.join(tmp, "base"), exist_ok=True)
+            os.makedirs(os.path.join(tmp, "a11y-base"))
+            open(os.path.join(tmp, "src", "scripts", "check_ios_a11y_inventory.py"), "w").close()
+            if has_inventory:
+                open(os.path.join(tmp, "src", "ios", "a11y", "inventory.json"), "w").close()
+            if marker:
+                open(os.path.join(tmp, "a11y-base", "fetched"), "w").close()
+            script = self._guard_prefix() + 'echo GUARD_PASSED\n'
+            r = subprocess.run(["bash", "-c", script], cwd=os.path.join(tmp, "src"),
+                               env={"PATH": "/usr/bin:/bin", "RUNNER_TEMP": tmp}, capture_output=True, text=True)
+            return r
+
+    def test_check_step_errors_when_the_base_fetch_failed(self):
+        r = self._run_guard(has_inventory=True, marker=False)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertNotIn("GUARD_PASSED", r.stdout)
+        self.assertIn("::error::", r.stdout)
+
+    def test_check_step_proceeds_when_fetched_or_when_source_has_no_inventory(self):
+        self.assertIn("GUARD_PASSED", self._run_guard(has_inventory=True, marker=True).stdout)
+        self.assertIn("GUARD_PASSED", self._run_guard(has_inventory=False, marker=False).stdout)
+
     def test_release_deny_list_has_the_new_flags(self):
         run = self.steps["Audit Release binary for debug-only symbols (TASK-136 + TASK-137)"]["run"]
         deny = re.search(r"DENY='([^']*)'", run).group(1)

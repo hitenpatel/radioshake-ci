@@ -207,7 +207,11 @@ jobs:
 
       # A11y-1: the base-comparison files from main are fetched here, before any branch code
       # runs, by a step that only runs git. The token is in this step's env alone, so no
-      # branch-supplied script ever sees it. Never fails the job: no files = no comparison.
+      # branch-supplied script ever sees it. This step never fails the job itself; it leaves a
+      # "fetched" marker only when main was fetched and every base file main has was copied. The
+      # accessibility check step turns a missing marker into an error, so a failed fetch cannot
+      # silently drop the shrink-only comparison. "Fetched, but main has no A11y files yet" is the
+      # one legitimate no-comparison case (main before A11y-1 merges).
       - name: Fetch A11y base files from main
         env:
           HOST: ${{ secrets.FORGEJO_HOST }}
@@ -220,16 +224,24 @@ jobs:
           echo "::add-mask::$TOKEN"
           echo "::add-mask::$HOST"
           B="$RUNNER_TEMP/a11y-base"; G="$RUNNER_TEMP/a11y-main"
+          rm -rf "$B"
           mkdir -p "$B"
           if git init -q "$G" 2>/dev/null \
              && git -C "$G" -c http.extraheader="AUTHORIZATION: basic $AUTH" \
                   fetch -q --depth 1 "https://${HOST}/hiten/RadioShake.git" main >/dev/null 2>&1; then
-            git -C "$G" show FETCH_HEAD:ios/a11y/inventory.json > "$B/inventory.json.tmp" 2>/dev/null \
-              && mv "$B/inventory.json.tmp" "$B/inventory.json"
-            git -C "$G" show FETCH_HEAD:ios/UITests/RadioShakeUITests/A11y/A11yExclusions.swift > "$B/exclusions.swift.tmp" 2>/dev/null \
-              && mv "$B/exclusions.swift.tmp" "$B/exclusions.swift"
+            COPIED=1
+            for PAIR in "ios/a11y/inventory.json:inventory.json" \
+                        "ios/UITests/RadioShakeUITests/A11y/A11yExclusions.swift:exclusions.swift"; do
+              SRC="${PAIR%%:*}"; DST="${PAIR##*:}"
+              # A path main does not have is fine; a path main has that cannot be read is a failure.
+              if git -C "$G" cat-file -e "FETCH_HEAD:$SRC" 2>/dev/null; then
+                git -C "$G" show "FETCH_HEAD:$SRC" > "$B/$DST.tmp" 2>/dev/null \
+                  && mv "$B/$DST.tmp" "$B/$DST" || COPIED=0
+              fi
+            done
+            if [ "$COPIED" = 1 ]; then : > "$B/fetched"; else echo "Could not read A11y base files from main"; fi
           else
-            echo "Could not fetch main: no A11y base comparison"
+            echo "Could not fetch main"
           fi
           rm -rf "$G" "$B"/*.tmp
           exit 0
@@ -273,8 +285,13 @@ jobs:
           set -euo pipefail
           if [ ! -f scripts/check_ios_a11y_inventory.py ]; then echo "Source ref predates A11y-1, skipping"; exit 0; fi
           python3 -m unittest scripts/test_check_ios_a11y_inventory.py scripts/test_check_ios_a11y_sources.py
-          # Base files come from the credential-free "Fetch A11y base files from main" step;
-          # absent files (fetch failed, or main predates A11y-1) just mean no base comparison.
+          # Base files come from the credential-free "Fetch A11y base files from main" step. It leaves a
+          # "fetched" marker only when main was fetched and read. No marker is an error, never a skipped
+          # comparison; a fetched main without the files (it predates A11y-1) just means no comparison.
+          if [ -f ios/a11y/inventory.json ] && [ ! -f "$RUNNER_TEMP/a11y-base/fetched" ]; then
+            echo "::error::could not fetch main's A11y base files; refusing to skip the shrink-only comparison"
+            exit 1
+          fi
           BASE_ARGS=()
           if [ -f "$RUNNER_TEMP/a11y-base/inventory.json" ]; then BASE_ARGS+=(--base-inventory "$RUNNER_TEMP/a11y-base/inventory.json"); fi
           if [ -f "$RUNNER_TEMP/a11y-base/exclusions.swift" ]; then BASE_ARGS+=(--base-exclusions "$RUNNER_TEMP/a11y-base/exclusions.swift"); fi
