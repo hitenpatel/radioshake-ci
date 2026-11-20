@@ -280,8 +280,15 @@ class A11yGateWorkflowTests(unittest.TestCase):
     def test_release_deny_list_has_the_new_flags(self):
         run = self.steps["Audit Release binary for debug-only symbols (TASK-136 + TASK-137)"]["run"]
         deny = re.search(r"DENY='([^']*)'", run).group(1)
-        for flag in ("RSForceIncreaseContrast", "RSForceBoldText"):
+        for flag in ("RSForceIncreaseContrast", "RSForceBoldText", "RSForceColorScheme", "a11y-trait-probe"):
             self.assertIn(flag, deny.split("|"))
+
+    def test_a11y_step_also_runs_the_baseline_from_log_tests_when_present(self):
+        run = self.step["run"]
+        line = [l for l in run.splitlines() if "test_a11y_baseline_from_log.py" in l]
+        self.assertEqual(len(line), 1)
+        self.assertTrue(line[0].strip().startswith("if [ -f scripts/test_a11y_baseline_from_log.py ]; then"))
+        self.assertIn("python3 -m unittest scripts/test_a11y_baseline_from_log.py", line[0])
 
     def test_validate_no_longer_carries_the_audit_matrix(self):
         on = self.wf.get("on", self.wf.get(True))

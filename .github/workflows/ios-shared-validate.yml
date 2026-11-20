@@ -285,6 +285,7 @@ jobs:
           set -euo pipefail
           if [ ! -f scripts/check_ios_a11y_inventory.py ]; then echo "Source ref predates A11y-1, skipping"; exit 0; fi
           python3 -m unittest scripts/test_check_ios_a11y_inventory.py scripts/test_check_ios_a11y_sources.py
+          if [ -f scripts/test_a11y_baseline_from_log.py ]; then python3 -m unittest scripts/test_a11y_baseline_from_log.py; fi
           # Base files come from the credential-free "Fetch A11y base files from main" step. It leaves a
           # "fetched" marker only when main was fetched and read. No marker is an error, never a skipped
           # comparison; a fetched main without the files (it predates A11y-1) just means no comparison.
@@ -863,7 +864,7 @@ jobs:
           # inside #if DEBUG blocks in SharedContext.makeForTesting).
           # SongIdTrace / "Song ID log": the song ID diagnostics log, compiled only into Debug and into internal
           # TestFlight archives built with RS_DIAGNOSTICS (ios-testflight input diagnostics=true), never into this build.
-          DENY='ui-test-reset-onboarding|ui-test-skip-onboarding|resetOnboardingForTesting|setCompletedForTesting|LaunchArguments|applyForTesting|ui-test-fixture-endpoints|ui-test-fake-player|FixtureURLProtocol|FixtureRouteTable|FixtureBundle|FakePlayerEngine|useFakeNetworkForTesting|usePlayerModeForTesting|PlayerModeMarker|player-mode-marker|RegionForceDetection|RegionDebugOverride|uiTestDatabaseName|RSForceColorScheme|RSDisableAnimations|SongIdTrace|Song ID log|RSDataSaver|RSDataUsageSeed|RSNetworkScript|FakeCloudTransport|RSFakeICloud|RSRealICloud|CarPreviewView|RecordingCarInterface|RSCarPreview|car\.np\.|RSForceIncreaseContrast|RSForceBoldText|RSHoldFileImportProgress|CarPreviewModel|CarPreviewSnapshot|RecordingNowPlayingHost|RSSeedFavourites|car\.(tab|row|image|section)\.'
+          DENY='ui-test-reset-onboarding|ui-test-skip-onboarding|resetOnboardingForTesting|setCompletedForTesting|LaunchArguments|applyForTesting|ui-test-fixture-endpoints|ui-test-fake-player|FixtureURLProtocol|FixtureRouteTable|FixtureBundle|FakePlayerEngine|useFakeNetworkForTesting|usePlayerModeForTesting|PlayerModeMarker|player-mode-marker|RegionForceDetection|RegionDebugOverride|uiTestDatabaseName|RSForceColorScheme|RSDisableAnimations|SongIdTrace|Song ID log|RSDataSaver|RSDataUsageSeed|RSNetworkScript|FakeCloudTransport|RSFakeICloud|RSRealICloud|CarPreviewView|RecordingCarInterface|RSCarPreview|car\.np\.|RSForceIncreaseContrast|RSForceBoldText|a11y-trait-probe|RSHoldFileImportProgress|CarPreviewModel|CarPreviewSnapshot|RecordingNowPlayingHost|RSSeedFavourites|car\.(tab|row|image|section)\.'
           if grep -qE "$DENY" /tmp/release-strings.txt; then
             echo "::error::Release binary contains debug-only symbols:"
             grep -E "$DENY" /tmp/release-strings.txt
