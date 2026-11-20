@@ -137,6 +137,7 @@ jobs:
         /tmp/ios-logs/
         /tmp/a11y-issues/
         /tmp/ios-a11y-${{ matrix.pass }}.xcresult
+        /tmp/ios-a11y-${{ matrix.pass }}-unmerged.xcresult
     steps:
       # ── Clone source from private Forgejo host ──────────────────────
       - name: Clone source from private host
@@ -214,12 +215,23 @@ jobs:
         id: classes
         run: |
           set -euo pipefail
+          # A declaration may carry attributes before `final class` on the same line (`@MainActor final class ...`).
+          CLASS_RE='^[[:space:]]*(@[A-Za-z0-9_]+(\([^)]*\))?[[:space:]]+)*final class +A11yAudit[A-Za-z0-9_]*UITests'
           N=0
           for f in src/ios/UITests/RadioShakeUITests/A11y/A11yAudit*UITests.swift; do
             [ -f "$f" ] || continue
-            N=$((N + $(grep -cE '^final class +A11yAudit[A-Za-z0-9_]*UITests' "$f" || true)))
+            N=$((N + $(grep -cE "$CLASS_RE" "$f" || true)))
           done
-          if [ "$N" -gt 0 ]; then echo "present=true" >> "$GITHUB_OUTPUT"; else echo "present=false" >> "$GITHUB_OUTPUT"; fi
+          if [ "$N" -gt 0 ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          elif [ -f src/ios/a11y/inventory.json ]; then
+            # The source has the A11y inventory, so audit classes must exist: finding none means the discovery
+            # pattern or the files broke, and a green skip would hide that.
+            echo "::error::src/ios/a11y/inventory.json exists but no A11yAudit*UITests class was found"
+            exit 1
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          fi
           echo "$N audit class(es) in this source ref"
 
       - name: Check out CI scripts (this repo, scripts only)
@@ -363,16 +375,18 @@ jobs:
           if [ "$MATRIX" = "full" ]; then PREFIX=testFull; else PREFIX=testGate; fi
           CAP="$(printf '%s' "${PASS:0:1}" | tr '[:lower:]' '[:upper:]')${PASS:1}"
           METHOD="${PREFIX}${CAP}"
+          CLASS_RE='^[[:space:]]*(@[A-Za-z0-9_]+(\([^)]*\))?[[:space:]]+)*final class +A11yAudit[A-Za-z0-9_]*UITests'
           ONLY=()
           for f in UITests/RadioShakeUITests/A11y/A11yAudit*UITests.swift; do
             [ -f "$f" ] || continue
-            for c in $(grep -hoE '^final class +A11yAudit[A-Za-z0-9_]*UITests' "$f" | awk '{print $3}'); do
+            for c in $(grep -hoE "$CLASS_RE" "$f" | awk '{print $NF}'); do
               ONLY+=("-only-testing:RadioShakeUITests/$c/$METHOD")
             done
           done
+          # This step only runs when the "classes" step found audit classes, so none here is an error.
           if [ "${#ONLY[@]}" -eq 0 ]; then
-            echo "No A11yAudit*UITests classes in this source ref, skipping"
-            exit 0
+            echo "::error::no A11yAudit*UITests class found, though the classes step reported some"
+            exit 1
           fi
           printf '%s\n' "${ONLY[@]}" > /tmp/a11y-only-args.txt
           if [ "$MATRIX" = "full" ]; then
@@ -398,7 +412,12 @@ jobs:
             if [ "$PART" -gt 1 ]; then
               xcrun simctl shutdown "$UDID" || true
               xcrun simctl boot "$UDID" || true
-              xcrun simctl bootstatus "$UDID" -b
+              # A simulator that will not come back fails this class only; the rest still run.
+              if ! xcrun simctl bootstatus "$UDID" -b; then
+                echo "::error::simulator did not reboot before ${ARG#-only-testing:}; skipping that class"
+                STATUS=1
+                continue
+              fi
             fi
             BUNDLE="/tmp/ios-a11y-${PASS}-part${PART}.xcresult"
             echo "=== Audit class ${PART}/${#ONLY[@]}: ${ARG#-only-testing:} ===" | tee -a /tmp/ios-logs/xctest.log
@@ -419,9 +438,17 @@ jobs:
           done
           # One evidence bundle per pass, as before: merge the per-class bundles.
           if [ "${#BUNDLES[@]}" -gt 1 ]; then
-            xcrun xcresulttool merge "${BUNDLES[@]}" --output-path "/tmp/ios-a11y-${PASS}.xcresult" \
-              && rm -rf "${BUNDLES[@]}" \
-              || echo "::warning::could not merge the per-class result bundles"
+            if xcrun xcresulttool merge "${BUNDLES[@]}" --output-path "/tmp/ios-a11y-${PASS}.xcresult"; then
+              rm -rf "${BUNDLES[@]}"
+            else
+              # The leg goes red, and the per-class bundles move into a directory named like a bundle, so the
+              # existing decompress + scan steps cover it, and it is uploaded.
+              echo "::error::could not merge the per-class result bundles; keeping them as evidence"
+              STATUS=1
+              rm -rf "/tmp/ios-a11y-${PASS}.xcresult"
+              mkdir -p "/tmp/ios-a11y-${PASS}-unmerged.xcresult"
+              mv "${BUNDLES[@]}" "/tmp/ios-a11y-${PASS}-unmerged.xcresult/"
+            fi
           elif [ "${#BUNDLES[@]}" -eq 1 ]; then
             mv "${BUNDLES[0]}" "/tmp/ios-a11y-${PASS}.xcresult"
           fi
@@ -432,7 +459,8 @@ jobs:
       - name: Verify every selected audit test ran
         if: success() && steps.classes.outputs.present == 'true'
         run: |
-          if [ ! -f /tmp/a11y-only-args.txt ]; then echo "No audit tests were selected (old source ref), nothing to verify"; exit 0; fi
+          # This step only runs when audit classes are present, so no selection file means the run step broke.
+          if [ ! -f /tmp/a11y-only-args.txt ]; then echo "::error::audit classes are present but no audit tests were selected"; exit 1; fi
           python3 ci/.github/scripts/check_shard_ran.py --args /tmp/a11y-only-args.txt --log /tmp/ios-logs/xctest.log
 
       - name: Summarise audit issues
@@ -611,6 +639,7 @@ jobs:
           path: |
             /tmp/ios-logs/
             /tmp/ios-a11y-${{ matrix.pass }}.xcresult
+            /tmp/ios-a11y-${{ matrix.pass }}-unmerged.xcresult
 
       - name: Upload issue summary
         if: always() && steps.clone.outcome == 'success' && steps.secret_scan.outcome == 'success'

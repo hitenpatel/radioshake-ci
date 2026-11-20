@@ -371,7 +371,7 @@ class A11yAuditWorkflowTests(unittest.TestCase):
         step = self.asteps[find]
         self.assertEqual(step.get("id"), "classes")
         self.assertNotIn("env", step, "the discovery step holds no secrets")
-        self.assertIn("^final class +A11yAudit[A-Za-z0-9_]*UITests", step["run"])
+        self.assertIn("final class +A11yAudit[A-Za-z0-9_]*UITests", step["run"])
         self.assertIn('present=', step["run"])
         gated = ["Set up JDK 21", "macOS preflight", "Install XcodeGen (pinned)",
                  "Assemble shared Debug XCFramework and point symlink at it", "Generate Xcode project",
@@ -381,14 +381,13 @@ class A11yAuditWorkflowTests(unittest.TestCase):
 
     def test_test_step_selects_methods_per_audit_class_without_retries(self):
         run = self.asteps["Run accessibility audit passes"]["run"]
-        self.assertIn("^final class +A11yAudit[A-Za-z0-9_]*UITests", run)
+        self.assertIn("final class +A11yAudit[A-Za-z0-9_]*UITests", run)
         self.assertIn("testGate", run)
         self.assertIn("testFull", run)
         self.assertNotIn("-retry-tests-on-failure", self.text)
         self.assertNotIn("-test-iterations", self.text)
         self.assertEqual(run.count("TEST_RUNNER_RS_A11Y_MATRIX=full"), 1)
         self.assertRegex(run, r'if \[ "\$MATRIX" = "full" \]; then\s+export TEST_RUNNER_RS_A11Y_MATRIX=full')
-        self.assertIn("skipping", run)
         self.assertIn("A11yAudit", run)
 
     def test_each_audit_class_runs_alone_on_a_rebooted_simulator(self):
@@ -403,6 +402,114 @@ class A11yAuditWorkflowTests(unittest.TestCase):
         self.assertIn("tee -a /tmp/ios-logs/xctest.log", loop)
         self.assertIn('xcrun xcresulttool merge "${BUNDLES[@]}" --output-path "/tmp/ios-a11y-${PASS}.xcresult"', run)
         self.assertIn('exit "$STATUS"', run)
+
+    SWIFT_VARIANTS = {
+        "A11yAuditPlainUITests": "final class A11yAuditPlainUITests: XCTestCase {}",
+        "A11yAuditAttrUITests": "@MainActor final class A11yAuditAttrUITests: XCTestCase {}",
+        "A11yAuditTwoAttrUITests": "  @available(iOS 17, *) @MainActor final class A11yAuditTwoAttrUITests: XCTestCase {}",
+    }
+
+    def _discovery(self, files, inventory):
+        """Run the 'classes' step in a scratch tree; returns (exit code, GITHUB_OUTPUT text, stdout)."""
+        run = self.asteps["Find audit classes in the source"]["run"]
+        with tempfile.TemporaryDirectory() as tmp:
+            d = os.path.join(tmp, "src", "ios", "UITests", "RadioShakeUITests", "A11y")
+            os.makedirs(d)
+            for name, body in files.items():
+                with open(os.path.join(d, name), "w") as fh:
+                    fh.write(body + "\n")
+            if inventory:
+                os.makedirs(os.path.join(tmp, "src", "ios", "a11y"))
+                with open(os.path.join(tmp, "src", "ios", "a11y", "inventory.json"), "w") as fh:
+                    fh.write("{}")
+            out = os.path.join(tmp, "out")
+            r = subprocess.run(["bash", "-c", run], cwd=tmp, capture_output=True, text=True,
+                               env={"PATH": "/usr/bin:/bin", "GITHUB_OUTPUT": out})
+            text = open(out).read() if os.path.exists(out) else ""
+            return r.returncode, text, r.stdout
+
+    def test_discovery_finds_classes_with_attributes_before_final_class(self):
+        for cls, line in self.SWIFT_VARIANTS.items():
+            code, out, _ = self._discovery({f"{cls}.swift": line}, inventory=True)
+            self.assertEqual((code, out.strip()), (0, "present=true"), cls)
+
+    def test_discovery_ignores_commented_declarations_and_other_classes(self):
+        files = {"A11yAuditCommentedUITests.swift": "// final class A11yAuditCommentedUITests",
+                 "A11yAuditOtherUITests.swift": "final class Helper {}"}
+        self.assertEqual(self._discovery(files, inventory=False)[:2], (0, "present=false\n"))
+
+    def test_no_classes_without_an_inventory_still_skips(self):
+        self.assertEqual(self._discovery({}, inventory=False)[:2], (0, "present=false\n"))
+
+    def test_no_classes_with_an_inventory_is_an_error(self):
+        code, out, stdout = self._discovery({"A11yAuditXUITests.swift": "class A11yAuditXUITests {}"}, inventory=True)
+        self.assertNotEqual(code, 0)
+        self.assertNotIn("present=", out)
+        self.assertIn("::error::", stdout)
+
+    def test_run_step_selects_attributed_classes_and_fails_when_none_found(self):
+        run = self.asteps["Run accessibility audit passes"]["run"]
+        pre = run[run.index("CLASS_RE="):run.index('printf \'%s\\n\' "${ONLY[@]}"')]
+        for cls, line in self.SWIFT_VARIANTS.items():
+            with tempfile.TemporaryDirectory() as tmp:
+                d = os.path.join(tmp, "UITests", "RadioShakeUITests", "A11y")
+                os.makedirs(d)
+                with open(os.path.join(d, f"{cls}.swift"), "w") as fh:
+                    fh.write(line + "\n")
+                script = 'set -euo pipefail\nMETHOD=testGateLight\n' + pre + 'printf "%s\\n" "${ONLY[@]}"\n'
+                r = subprocess.run(["bash", "-c", script], cwd=tmp, capture_output=True, text=True,
+                                   env={"PATH": "/usr/bin:/bin"})
+                self.assertEqual(r.stdout.strip(), f"-only-testing:RadioShakeUITests/{cls}/testGateLight", (cls, r.stderr))
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "UITests", "RadioShakeUITests", "A11y"))
+            script = 'set -euo pipefail\nMETHOD=testGateLight\n' + pre
+            r = subprocess.run(["bash", "-c", script], cwd=tmp, capture_output=True, text=True, env={"PATH": "/usr/bin:/bin"})
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn("::error::", r.stdout)
+
+    def test_verify_step_errors_on_a_missing_selection_file(self):
+        run = self.asteps["Verify every selected audit test ran"]["run"]
+        self.assertNotIn("nothing to verify", run)
+        line = [l for l in run.splitlines() if "a11y-only-args.txt ]" in l][0]
+        self.assertIn("::error::", line)
+        self.assertIn("exit 1", line)
+        self.assertNotIn("exit 0", line)
+
+    def test_failed_reboot_marks_the_leg_red_and_moves_on_to_the_next_class(self):
+        run = self.asteps["Run accessibility audit passes"]["run"]
+        loop = run[run.index('for ARG in "${ONLY[@]}"'):]
+        m = re.search(r'if ! xcrun simctl bootstatus "\$UDID" -b; then(.*?)\n\s*fi\n', loop, re.S)
+        self.assertIsNotNone(m)
+        self.assertIn("STATUS=1", m.group(1))
+        self.assertIn("continue", m.group(1))
+        self.assertLess(loop.index("bootstatus"), loop.index("xcodebuild test-without-building"))
+        self.assertNotRegex(loop, r'(?m)^\s*xcrun simctl bootstatus "\$UDID" -b\s*$')
+
+    def test_failed_merge_fails_the_leg_and_keeps_the_part_bundles_as_scanned_evidence(self):
+        run = self.asteps["Run accessibility audit passes"]["run"]
+        self.assertNotIn("::warning::could not merge", run)
+        m = re.search(r"if xcrun xcresulttool merge .*?\n(.*?)\n\s*fi\n", run, re.S)
+        self.assertIsNotNone(m)
+        tail = run[run.index("xcresulttool merge"):]
+        self.assertIn("STATUS=1", tail.split("elif", 1)[0])
+        self.assertIn('/tmp/ios-a11y-${PASS}-unmerged.xcresult', tail.split("elif", 1)[0])
+        parts = "/tmp/ios-a11y-${{ matrix.pass }}-unmerged.xcresult"
+        self.assertIn(parts, self.audit["env"]["EVIDENCE_PATHS"].splitlines())
+        uploads = [s for s in self.audit["steps"] if s.get("name") == "Upload evidence"][0]
+        self.assertIn(parts, uploads["with"]["path"].splitlines())
+
+    def test_every_uploaded_evidence_path_is_in_the_scan_list(self):
+        evidence = set(self.audit["env"]["EVIDENCE_PATHS"].splitlines())
+        for st in self.audit["steps"]:
+            if st.get("uses", "").startswith("actions/upload-artifact"):
+                for path in st["with"]["path"].splitlines():
+                    covered = path in evidence or any(e.endswith("/") and path.startswith(e) for e in evidence)
+                    self.assertTrue(covered, path)
+
+    def test_unmerged_parts_directory_is_named_like_a_bundle_so_the_scan_covers_it(self):
+        # The decompress and scan steps treat any evidence path ending in .xcresult as a bundle.
+        for name in ("Decompress evidence for the secret scan", "Secret scan of evidence artifacts"):
+            self.assertIn('endswith(".xcresult")', self.asteps[name]["run"], name)
 
     def test_every_selected_audit_test_must_have_run_and_not_been_skipped(self):
         step = self.asteps["Verify every selected audit test ran"]
