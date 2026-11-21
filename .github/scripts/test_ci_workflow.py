@@ -1013,16 +1013,14 @@ class IPadWorkflowTests(unittest.TestCase):
         spec.loader.exec_module(sh)
         self.assertIn("IPadLayoutUITests", sh.DEFAULT_EXCLUDE)
 
-    def test_bundle_keys_step_follows_the_release_build_and_is_guarded_by_the_project_yml(self):
+    def test_bundle_keys_step_follows_the_release_build_and_decides_from_the_built_app(self):
         steps = self.wf["jobs"]["validate"]["steps"]
         names = [s.get("name") for s in steps]
         self.assertGreater(names.index(self.BUNDLE_STEP), names.index("Build iOS app (Release, simulator, unsigned)"))
         run = steps[names.index(self.BUNDLE_STEP)]["run"]
-        guard = [l for l in run.splitlines() if "grep -Eq" in l][0]
-        self.assertIn('TARGETED_DEVICE_FAMILY:', guard)
-        self.assertIn('"1,2"', guard)
-        self.assertIn("src/ios/project.yml", guard)
-        self.assertIn("exit 0", run.split("fi", 1)[0])  # the skip path comes before any check
+        self.assertNotIn("project.yml", run)  # the decision comes from the built app, not a spelling in the source
+        self.assertIn("UIDeviceFamily", run.split("FAMILY=", 1)[1].split("PHONE=", 1)[0])
+        self.assertLess(run.index("SKIP"), run.index("UISupportedInterfaceOrientations"))
         self.assertNotIn("secrets.", yaml.safe_dump(steps[names.index(self.BUNDLE_STEP)]))
         out = subprocess.run(["bash", "-n"], input=run, text=True, capture_output=True)
         self.assertEqual(out.returncode, 0, out.stderr)
@@ -1054,13 +1052,14 @@ else:
                 "UIApplicationSceneManifest": {"UIApplicationSupportsMultipleScenes": True, "UISceneConfigurations": {
                     "CPTemplateApplicationSceneSessionRoleApplication": [{"UISceneClassName": "CPTemplateApplicationScene"}]}}}
 
-    def run_step(self, app_plist, project_family='"1,2"', appex=({"UIDeviceFamily": [1, 2]},)):
+    def run_step(self, app_plist, ipad_tests=False, appex=({"UIDeviceFamily": [1, 2]},)):
         import plistlib
         run = [s for s in self.wf["jobs"]["validate"]["steps"] if s.get("name") == self.BUNDLE_STEP][0]["run"]
         with tempfile.TemporaryDirectory() as d:
             os.makedirs(f"{d}/src/ios")
-            with open(f"{d}/src/ios/project.yml", "w") as fh:
-                fh.write(f"settings:\n  base:\n    TARGETED_DEVICE_FAMILY: {project_family}\n")
+            if ipad_tests:
+                os.makedirs(f"{d}/src/ios/UITests/RadioShakeUITests")
+                open(f"{d}/src/ios/UITests/RadioShakeUITests/IPadLayoutUITests.swift", "w").close()
             app = f"{d}/tmp/derived-data-release/Build/Products/Release-iphonesimulator/RadioShake.app"
             os.makedirs(app)
             with open(f"{app}/Info.plist", "wb") as fh:
@@ -1087,14 +1086,35 @@ else:
         a["UISupportedInterfaceOrientations"] = ["UIInterfaceOrientationPortrait"]
         self.assertEqual(self.run_step(a).returncode, 0)
 
-    def test_bundle_step_skips_on_an_iphone_only_source_even_with_a_bad_bundle(self):
-        r = self.run_step({"UIDeviceFamily": [1]}, project_family='"1"')
+    def test_bundle_step_skips_only_for_an_iphone_only_built_app_without_ipad_tests(self):
+        r = self.run_step({"UIDeviceFamily": [1]})
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertIn("SKIP", r.stdout)
 
+    def test_bundle_step_fails_when_ipad_tests_exist_but_the_built_app_has_no_ipad(self):
+        r = self.run_step({"UIDeviceFamily": [1]}, ipad_tests=True)
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("::error::", r.stdout)
+
+    def test_bundle_step_fails_on_a_missing_or_odd_family(self):
+        for fam in ({}, {"UIDeviceFamily": [2]}, {"UIDeviceFamily": [1, 2, 3]}):
+            r = self.run_step(fam)
+            self.assertEqual(r.returncode, 1, f"{fam}: {r.stdout}{r.stderr}")
+
+    def test_bundle_step_runs_every_check_whatever_the_project_yml_spelling(self):
+        a = self.good_app()
+        a["UIRequiresFullScreen"] = True
+        self.assertEqual(self.run_step(a).returncode, 1)
+
+    def test_ipad_verify_step_requires_executed_tests(self):
+        run = self.steps["Every selected iPad test ran and was not skipped"]["run"]
+        self.assertIn("--require-executed", run)
+        shard = [s for s in self.wf["jobs"]["ui-shard"]["steps"] if s.get("name") == "Every selected UI test class ran"][0]
+        self.assertNotIn("--require-executed", shard["run"])
+
     def test_bundle_step_fails_each_violation(self):
         cases = {
-            "family": lambda a: a.update(UIDeviceFamily=[1]),
+            "family": lambda a: a.update(UIDeviceFamily=[1, 2, 3]),
             "phone orientations": lambda a: a.update(UISupportedInterfaceOrientations=["UIInterfaceOrientationLandscapeLeft"]),
             "pad orientations": lambda a: a.update({"UISupportedInterfaceOrientations~ipad": self.PAD[:2]}),
             "multiple scenes false": lambda a: a["UIApplicationSceneManifest"].update(UIApplicationSupportsMultipleScenes=False),

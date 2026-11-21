@@ -833,16 +833,13 @@ jobs:
             | tee /tmp/ios-app-release-bundle-digest.txt
 
       # Phase 5d: the shipped bundle must declare both device families and the orientations an iPad
-      # needs (App Store Connect rejects a universal build without them). Runs only when the source's
-      # ios/project.yml targets "1,2", so refs from before 5d skip it. Reads the raw Info.plist
-      # (CFBundle rewrites ~ipad keys per device). Holds no secrets.
+      # needs (App Store Connect rejects a universal build without them). The decision is made from
+      # the BUILT app, not from project.yml spelling: UIDeviceFamily containing 2 runs every check,
+      # exactly [1] skips (pre-5d), anything else fails. Reads the raw Info.plist (CFBundle rewrites
+      # ~ipad keys per device). Holds no secrets.
       - name: Universal bundle keys (Phase 5d)
         run: |
           set -euo pipefail
-          if ! grep -Eq '^[[:space:]]*TARGETED_DEVICE_FAMILY:[[:space:]]*"1,2"[[:space:]]*$' src/ios/project.yml; then
-            echo 'SKIP - src/ios/project.yml does not set TARGETED_DEVICE_FAMILY "1,2" (pre-5d ref)'
-            exit 0
-          fi
           APP="/tmp/derived-data-release/Build/Products/Release-iphonesimulator/RadioShake.app"
           test -d "$APP" || { echo "::error::release app not found at $APP"; exit 1; }
           PB="${PLISTBUDDY:-/usr/libexec/PlistBuddy}"
@@ -852,7 +849,18 @@ jobs:
           elems() { "$PB" -c "Print :$2" "$1" 2>/dev/null | sed '1d;$d' | sed 's/^[[:space:]]*//' | tr '\n' ' ' | sed 's/ $//' || true; }
           has() { "$PB" -c "Print :$2" "$1" >/dev/null 2>&1; }
           PLIST="$APP/Info.plist"
-          [ "$(elems "$PLIST" UIDeviceFamily)" = "1 2" ] || bad "app UIDeviceFamily is '$(elems "$PLIST" UIDeviceFamily)', expected '1 2'"
+          FAMILY="$(elems "$PLIST" UIDeviceFamily)"
+          case "$FAMILY" in
+            "1")
+              if [ -f src/ios/UITests/RadioShakeUITests/IPadLayoutUITests.swift ]; then
+                echo "::error::IPadLayoutUITests.swift exists but the built app's UIDeviceFamily is '1' (no iPad)"
+                exit 1
+              fi
+              echo "SKIP - built app is iPhone-only (UIDeviceFamily 1) and the source has no iPad tests (pre-5d ref)"
+              exit 0 ;;
+            "1 2"|"2 1") ;;
+            *) echo "::error::app UIDeviceFamily is '$FAMILY', expected '1 2' (or '1' on a pre-5d ref)"; exit 1 ;;
+          esac
           PHONE="$(elems "$PLIST" UISupportedInterfaceOrientations)"
           # iPhone keeps the orientations it ships with: all but upside down, or portrait only when
           # the 5d Step 0 probe found the built main app declares just Portrait.
@@ -1925,10 +1933,11 @@ jobs:
         run: python3 ci/.github/scripts/report_flaky_tests.py --log /tmp/ios-logs/xctest.log --label ipad-ui
 
 
-      # A skipped or missing test goes red (the iPad class, the bundle test, the Podcasts iPad method).
+      # A skipped or missing test goes red; --require-executed also rejects a class whose tests were all skipped
+      # (xcodebuild still prints the suite as passed).
       - name: Every selected iPad test ran and was not skipped
         if: steps.guard.outputs.has_ipad == 'true'
-        run: python3 ci/.github/scripts/check_shard_ran.py --args /tmp/ipad-ui-args.txt --log /tmp/ios-logs/xctest.log
+        run: python3 ci/.github/scripts/check_shard_ran.py --args /tmp/ipad-ui-args.txt --log /tmp/ios-logs/xctest.log --require-executed
 
       # The screenshot tour attaches keepAlways screenshots to the result
       # bundle, and this job uploads that bundle to a PUBLIC artifact. The

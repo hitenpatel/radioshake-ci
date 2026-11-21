@@ -237,6 +237,33 @@ class CheckShardRanTests(unittest.TestCase):
         other = "Test Case '-[RadioShakeUITests.A11yAuditOtherUITests testGateDefaultLight]' passed (1 seconds).\n"
         self.assertEqual(ran.missing_entries(entries[:1], other), ["A11yAuditHomeUITests/testGateDefaultLight"])
 
+    def test_strict_mode_rejects_all_skipped_and_partly_skipped_classes(self):
+        entries = ran.selected_entries("-only-testing:RadioShakeUITests/IPadUITests\n")
+        suite = "Test Suite 'IPadUITests' passed at x\n"
+        case = lambda m, s: f"Test Case '-[RadioShakeUITests.IPadUITests {m}]' {s} (0.1 seconds).\n"
+        all_skipped = case("testA", "skipped") + case("testB", "skipped") + suite
+        mixed = case("testA", "passed") + case("testB", "skipped") + suite
+        good = case("testA", "passed") + case("testB", "failed") + suite
+        # lenient (ui-shard) behaviour is unchanged
+        self.assertEqual(ran.missing_entries(entries, all_skipped), [])
+        self.assertEqual(ran.missing_entries(entries, mixed), [])
+        self.assertEqual(len(ran.missing_entries(entries, all_skipped, strict=True)), 1)
+        self.assertEqual(len(ran.missing_entries(entries, mixed, strict=True)), 1)
+        self.assertEqual(ran.missing_entries(entries, good, strict=True), [])
+        # another class's executed tests do not satisfy the selection
+        other = "Test Case '-[RadioShakeUITests.OtherUITests testA]' passed (1 seconds).\n" + all_skipped
+        self.assertEqual(len(ran.missing_entries(entries, other, strict=True)), 1)
+
+    def test_cli_require_executed_flag(self):
+        with tempfile.TemporaryDirectory() as d:
+            a, l = os.path.join(d, "a"), os.path.join(d, "l")
+            open(a, "w").write("-only-testing:RadioShakeUITests/IPadUITests\n")
+            open(l, "w").write("Test Case '-[RadioShakeUITests.IPadUITests testA]' skipped (0.0 seconds).\n"
+                               "Test Suite 'IPadUITests' passed at x\n")
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(ran.main(["--args", a, "--log", l]), 0)
+                self.assertEqual(ran.main(["--args", a, "--log", l, "--require-executed"]), 1)
+
     def test_cli_method_entries(self):
         with tempfile.TemporaryDirectory() as d:
             a, l = os.path.join(d, "a"), os.path.join(d, "l")

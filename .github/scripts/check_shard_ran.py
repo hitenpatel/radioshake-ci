@@ -41,15 +41,23 @@ def selected_entries(args_text):
     return entries
 
 
-def missing_entries(entries, log_text):
-    """Entries that did not run: a class needs a passed/failed suite line, a method a passed/failed test case line."""
+def missing_entries(entries, log_text, strict=False):
+    """Entries that did not run: a class needs a passed/failed suite line, a method a passed/failed test case line.
+
+    strict (--require-executed): xcodebuild prints `Test Suite 'X' passed` even when every test in X was skipped,
+    so a whole-class selection also needs at least one passed/failed test case of that class and no skipped one."""
     suites = set(re.findall(r"Test Suite '([A-Za-z_][A-Za-z0-9_]*)' (?:passed|failed) at", log_text))
     cases = set(re.findall(r"Test Case '-\[[A-Za-z0-9_]+\.([A-Za-z_][A-Za-z0-9_]*) ([A-Za-z_][A-Za-z0-9_]*)\]' (?:passed|failed) \(", log_text))
+    skipped = set(re.findall(r"Test Case '-\[[A-Za-z0-9_]+\.([A-Za-z_][A-Za-z0-9_]*) [A-Za-z_][A-Za-z0-9_]*\]' skipped \(", log_text))
     out = []
     for cls, method in entries:
         if method is None:
             if cls not in suites:
                 out.append(cls)
+            elif strict and not any(c == cls for c, _ in cases):
+                out.append(f"{cls} (suite passed but no test case executed)")
+            elif strict and cls in skipped:
+                out.append(f"{cls} (has skipped tests)")
         elif (cls, method) not in cases:
             out.append(f"{cls}/{method}")
     return out
@@ -64,6 +72,8 @@ def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--args", required=True)
     p.add_argument("--log", required=True)
+    p.add_argument("--require-executed", action="store_true",
+                   help="whole-class selections need an executed test case and no skipped one")
     a = p.parse_args(argv)
     try:
         with open(a.args, encoding="utf-8") as fh:
@@ -76,7 +86,7 @@ def main(argv=None):
     if not classes:
         print("::error::no UI test classes were selected for this job")
         return 1
-    missing = missing_entries(classes, log)
+    missing = missing_entries(classes, log, strict=a.require_executed)
     if missing:
         print(f"::error::selected UI tests that did not run (or were skipped): {', '.join(missing)}")
         return 1
