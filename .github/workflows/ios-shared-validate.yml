@@ -832,6 +832,55 @@ jobs:
           shasum -a 256 /tmp/ios-app-release-bundle-sha256.txt \
             | tee /tmp/ios-app-release-bundle-digest.txt
 
+      # Phase 5d: the shipped bundle must declare both device families and the orientations an iPad
+      # needs (App Store Connect rejects a universal build without them). Runs only when the source's
+      # ios/project.yml targets "1,2", so refs from before 5d skip it. Reads the raw Info.plist
+      # (CFBundle rewrites ~ipad keys per device). Holds no secrets.
+      - name: Universal bundle keys (Phase 5d)
+        run: |
+          set -euo pipefail
+          if ! grep -Eq '^[[:space:]]*TARGETED_DEVICE_FAMILY:[[:space:]]*"1,2"[[:space:]]*$' src/ios/project.yml; then
+            echo 'SKIP - src/ios/project.yml does not set TARGETED_DEVICE_FAMILY "1,2" (pre-5d ref)'
+            exit 0
+          fi
+          APP="/tmp/derived-data-release/Build/Products/Release-iphonesimulator/RadioShake.app"
+          test -d "$APP" || { echo "::error::release app not found at $APP"; exit 1; }
+          PB="${PLISTBUDDY:-/usr/libexec/PlistBuddy}"
+          FAIL=0
+          bad() { echo "::error::$1"; FAIL=1; }
+          # Array elements of a key, joined by spaces (empty when the key is absent).
+          elems() { "$PB" -c "Print :$2" "$1" 2>/dev/null | sed '1d;$d' | sed 's/^[[:space:]]*//' | tr '\n' ' ' | sed 's/ $//' || true; }
+          has() { "$PB" -c "Print :$2" "$1" >/dev/null 2>&1; }
+          PLIST="$APP/Info.plist"
+          [ "$(elems "$PLIST" UIDeviceFamily)" = "1 2" ] || bad "app UIDeviceFamily is '$(elems "$PLIST" UIDeviceFamily)', expected '1 2'"
+          PHONE="$(elems "$PLIST" UISupportedInterfaceOrientations)"
+          # iPhone keeps the orientations it ships with: all but upside down, or portrait only when
+          # the 5d Step 0 probe found the built main app declares just Portrait.
+          case "$PHONE" in
+            "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight") ;;
+            "UIInterfaceOrientationPortrait") ;;
+            *) bad "UISupportedInterfaceOrientations is '$PHONE'" ;;
+          esac
+          PAD="$(elems "$PLIST" 'UISupportedInterfaceOrientations~ipad')"
+          [ "$PAD" = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight" ] \
+            || bad "UISupportedInterfaceOrientations~ipad is '$PAD'"
+          # CarPlay needs multiple scenes: true, with the CarPlay application-role configuration present.
+          [ "$("$PB" -c 'Print :UIApplicationSceneManifest:UIApplicationSupportsMultipleScenes' "$PLIST" 2>/dev/null || true)" = "true" ] \
+            || bad "UIApplicationSupportsMultipleScenes is not true"
+          has "$PLIST" UIApplicationSceneManifest:UISceneConfigurations:CPTemplateApplicationSceneSessionRoleApplication \
+            || bad "the CPTemplateApplicationSceneSessionRoleApplication scene configuration is missing"
+          if has "$PLIST" UIRequiresFullScreen; then bad "UIRequiresFullScreen is present"; fi
+          N=0
+          for APPEX in "$APP"/PlugIns/*.appex; do
+            [ -d "$APPEX" ] || continue
+            N=$((N + 1))
+            [ "$(elems "$APPEX/Info.plist" UIDeviceFamily)" = "1 2" ] \
+              || bad "$(basename "$APPEX") UIDeviceFamily is '$(elems "$APPEX/Info.plist" UIDeviceFamily)', expected '1 2'"
+          done
+          [ "$N" -ge 1 ] || bad "no PlugIns/*.appex in the Release app (the widget extension is missing)"
+          [ "$FAIL" -eq 0 ] || exit 1
+          echo "OK - universal bundle keys, scene manifest and $N extension(s) are as expected"
+
       - name: Audit capture probe in Release binary
         env:
           REQUESTED_REF: ${{ inputs.ref || github.event.client_payload.ref || 'feat/task-7-ios-shared-framework' }}
@@ -864,7 +913,7 @@ jobs:
           # inside #if DEBUG blocks in SharedContext.makeForTesting).
           # SongIdTrace / "Song ID log": the song ID diagnostics log, compiled only into Debug and into internal
           # TestFlight archives built with RS_DIAGNOSTICS (ios-testflight input diagnostics=true), never into this build.
-          DENY='ui-test-reset-onboarding|ui-test-skip-onboarding|resetOnboardingForTesting|setCompletedForTesting|LaunchArguments|applyForTesting|ui-test-fixture-endpoints|ui-test-fake-player|FixtureURLProtocol|FixtureRouteTable|FixtureBundle|FakePlayerEngine|useFakeNetworkForTesting|usePlayerModeForTesting|PlayerModeMarker|player-mode-marker|RegionForceDetection|RegionDebugOverride|uiTestDatabaseName|RSForceColorScheme|RSDisableAnimations|SongIdTrace|Song ID log|RSDataSaver|RSDataUsageSeed|RSNetworkScript|FakeCloudTransport|RSFakeICloud|RSRealICloud|CarPreviewView|RecordingCarInterface|RSCarPreview|car\.np\.|RSForceIncreaseContrast|RSForceBoldText|a11y-trait-probe|RSHoldFileImportProgress|CarPreviewModel|CarPreviewSnapshot|RecordingNowPlayingHost|RSSeedFavourites|car\.(tab|row|image|section)\.'
+          DENY='ui-test-reset-onboarding|ui-test-skip-onboarding|resetOnboardingForTesting|setCompletedForTesting|LaunchArguments|applyForTesting|ui-test-fixture-endpoints|ui-test-fake-player|FixtureURLProtocol|FixtureRouteTable|FixtureBundle|FakePlayerEngine|useFakeNetworkForTesting|usePlayerModeForTesting|PlayerModeMarker|player-mode-marker|RegionForceDetection|RegionDebugOverride|uiTestDatabaseName|RSForceColorScheme|RSDisableAnimations|SongIdTrace|Song ID log|RSDataSaver|RSDataUsageSeed|RSNetworkScript|FakeCloudTransport|RSFakeICloud|RSRealICloud|CarPreviewView|RecordingCarInterface|RSCarPreview|car\.np\.|RSForceIncreaseContrast|RSForceBoldText|a11y-trait-probe|RSHoldFileImportProgress|CarPreviewModel|CarPreviewSnapshot|RecordingNowPlayingHost|RSSeedFavourites|car\.(tab|row|image|section)\.|RSRequestSecondWindow|now-playing-layout'
           if grep -qE "$DENY" /tmp/release-strings.txt; then
             echo "::error::Release binary contains debug-only symbols:"
             grep -E "$DENY" /tmp/release-strings.txt
@@ -1603,6 +1652,485 @@ jobs:
           # NEVER upload source, local.properties, gradle caches or app bundles
           path: ${{ env.EVIDENCE_PATHS }}
 
+  # iPad layout tests (Phase 5d). Same toolchain, clone and secret handling as `ui-shard`.
+  # On refs without IPadLayoutUITests.swift the guard step turns every later step off and the job
+  # ends green with no work. The iPad classes are excluded from the shard split (shard_ui_tests.py).
+  ipad-ui:
+    needs: resolve
+    runs-on: macos-26
+    timeout-minutes: 120
+    env:
+      # The secret scan and the upload step both read this list.
+      EVIDENCE_PATHS: |
+        /tmp/ios-logs/
+        /tmp/ios-app-test-ipad.xcresult
+    steps:
+      # ── Clone source from private Forgejo host ──────────────────────
+      - name: Clone source from private host
+        id: clone
+        env:
+          HOST: ${{ secrets.FORGEJO_HOST }}
+          TOKEN: ${{ secrets.FORGEJO_CLONE_TOKEN }}
+          REF: ${{ inputs.ref || github.event.client_payload.ref || 'feat/task-7-ios-shared-framework' }}
+          EXPECTED_SHA: ${{ needs.resolve.outputs.sha || inputs.sha || github.event.client_payload.sha || '' }}
+        run: |
+          set -euo pipefail
+          AUTH=$(printf 'oauth2:%s' "$TOKEN" | base64)
+          echo "::add-mask::$AUTH"
+          echo "::add-mask::$TOKEN"
+          echo "::add-mask::$HOST"
+
+          git -c http.extraheader="AUTHORIZATION: basic $AUTH" \
+            clone --depth 1 --branch "$REF" "https://${HOST}/hiten/RadioShake.git" src
+
+          # Verify auth was not persisted
+          if grep -rq "AUTHORIZATION" src/.git/config; then
+            echo "::error::auth header was persisted in src/.git/config"
+            exit 1
+          fi
+
+          HEAD_SHA=$(git -C src rev-parse HEAD)
+
+          # TASK-141 AC #4: when an expected SHA is given, the job must
+          # validate exactly that commit, not whatever the branch tip is now.
+          if [ -n "$EXPECTED_SHA" ]; then
+            if [ "$HEAD_SHA" != "$EXPECTED_SHA" ]; then
+              echo "Branch tip $HEAD_SHA != expected $EXPECTED_SHA; deepening history"
+              # Ancestry needs real history, so unshallow the branch first.
+              if [ "$(git -C src rev-parse --is-shallow-repository)" = "true" ]; then
+                git -C src -c http.extraheader="AUTHORIZATION: basic $AUTH" \
+                  fetch --unshallow origin "$REF" \
+                  || { echo "::error::could not fetch full history of $REF"; exit 1; }
+              fi
+              # If the SHA is still unknown locally, try fetching it directly
+              # (only succeeds when the server allows fetch-by-SHA).
+              if ! git -C src cat-file -e "${EXPECTED_SHA}^{commit}" 2>/dev/null; then
+                git -C src -c http.extraheader="AUTHORIZATION: basic $AUTH" \
+                  fetch --depth 1 origin "$EXPECTED_SHA" 2>/dev/null || true
+              fi
+              FULL_SHA=$(git -C src rev-parse --verify -q "${EXPECTED_SHA}^{commit}" || true)
+              if [ -z "$FULL_SHA" ]; then
+                echo "::error::expected SHA $EXPECTED_SHA does not exist in $REF"
+                exit 1
+              fi
+              # The SHA must belong to the branch, not just exist on the host.
+              if ! git -C src merge-base --is-ancestor "$FULL_SHA" "origin/$REF"; then
+                echo "::error::expected SHA $FULL_SHA is not an ancestor of origin/$REF"
+                exit 1
+              fi
+              git -C src checkout --detach "$FULL_SHA" \
+                || { echo "::error::could not check out $FULL_SHA"; exit 1; }
+              HEAD_SHA=$(git -C src rev-parse HEAD)
+            fi
+            if [ "$HEAD_SHA" != "$(git -C src rev-parse --verify "${EXPECTED_SHA}^{commit}")" ]; then
+              echo "::error::checked-out $HEAD_SHA does not match expected $EXPECTED_SHA"
+              exit 1
+            fi
+          fi
+
+          # Only record the SHA once it is verified, so report-status never
+          # posts success for, or substitutes the branch tip for, a commit
+          # the job did not validate (an unverified run leaves the output
+          # empty and report-status falls back to the requested SHA).
+          echo "head_sha=$HEAD_SHA" >> "$GITHUB_OUTPUT"
+          echo "Cloned $REF at $HEAD_SHA"
+
+
+      # Pre-5d refs have no IPadLayoutUITests.swift: the job then does nothing and ends green.
+      # Every step below this one carries `if: steps.guard.outputs.has_ipad == 'true'`
+      # (test_ci_workflow.py enforces it).
+      - name: Do the iPad tests exist in this source?
+        id: guard
+        run: |
+          set -euo pipefail
+          if test -f src/ios/UITests/RadioShakeUITests/IPadLayoutUITests.swift; then
+            echo "has_ipad=true" >> "$GITHUB_OUTPUT"
+            echo "IPadLayoutUITests.swift present: running the iPad tests"
+          else
+            echo "has_ipad=false" >> "$GITHUB_OUTPUT"
+            echo "No IPadLayoutUITests.swift in this source: nothing to run (pre-5d ref)"
+          fi
+
+      - name: Check out CI scripts (this repo, scripts only)
+        if: steps.guard.outputs.has_ipad == 'true'
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4
+        with:
+          path: ci
+          sparse-checkout: .github/scripts
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+
+      - name: Set up JDK 21
+        if: steps.guard.outputs.has_ipad == 'true'
+        uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3  # v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+
+      # ── macOS preflight (TASK-141 AC #3) ────────────────────────────
+      - name: macOS preflight
+        if: steps.guard.outputs.has_ipad == 'true'
+        run: |
+          set -euo pipefail
+          ARCH=$(uname -m)
+          if [ "$ARCH" != "arm64" ]; then
+            echo "::error::Expected arm64, got $ARCH"
+            exit 1
+          fi
+
+          if [ ! -d "$XCODE_APP" ]; then
+            echo "::error::$XCODE_APP is missing; the macos-26 image changed. Update XCODE_APP / SIM_OS in workflow env to the image's versions. Installed:"
+            ls -d /Applications/Xcode*.app || true
+            exit 1
+          fi
+          sudo xcode-select -s "$XCODE_APP"
+          mkdir -p /tmp/ios-logs
+
+          echo "=== xcode-select -p ==="
+          xcode-select -p
+          echo "=== xcodebuild -version ==="
+          xcodebuild -version
+          echo "=== uname -m ==="
+          echo "$ARCH"
+          echo "=== java -version ==="
+          java -version
+          echo "=== iOS SDK (device) ==="
+          xcrun --sdk iphoneos --show-sdk-path
+          echo "=== iOS SDK (simulator) ==="
+          xcrun --sdk iphonesimulator --show-sdk-path
+          echo "=== xcrun simctl list runtimes ==="
+          xcrun simctl list runtimes | tee /tmp/simctl-runtimes.txt
+          if ! grep -qF "iOS ${SIM_OS} (" /tmp/simctl-runtimes.txt; then
+            echo "::error::iOS ${SIM_OS} simulator runtime not installed; update XCODE_APP / SIM_OS in workflow env to the image's versions"
+            exit 1
+          fi
+          echo "=== iPhone 17 simulator under iOS ${SIM_OS} ==="
+          xcrun simctl list devices available \
+            | awk -v hdr="-- iOS ${SIM_OS} --" '$0 == hdr {f=1; next} /^-- /{f=0} f' \
+            | grep -F "iPhone 17 (" \
+            || { echo "::error::no iPhone 17 simulator under iOS ${SIM_OS}; update XCODE_APP / SIM_OS in workflow env to the image's versions"; exit 1; }
+
+
+      # ── iOS app build + XCTest ──────────────────────────────────────
+      - name: Install XcodeGen (pinned)
+        if: steps.guard.outputs.has_ipad == 'true'
+        run: |
+          set -euo pipefail
+          VERSION="2.42.0"
+          curl -fsSL -o /tmp/xcodegen.zip \
+            "https://github.com/yonaskolb/XcodeGen/releases/download/${VERSION}/xcodegen.zip"
+          unzip -q /tmp/xcodegen.zip -d /tmp/xcodegen
+          sudo mv /tmp/xcodegen/xcodegen/bin/xcodegen /usr/local/bin/xcodegen
+          sudo cp -R /tmp/xcodegen/xcodegen/share/* /usr/local/share/ || true
+          xcodegen --version
+
+
+      # Only the Debug XCFramework: this job builds and tests the Debug app. The Xcode
+      # preBuildScript re-runs the (cached) Gradle task and re-points the symlink itself.
+      - name: Assemble shared Debug XCFramework and point symlink at it
+        if: steps.guard.outputs.has_ipad == 'true'
+        working-directory: src
+        run: |
+          set -euo pipefail
+          ./gradlew --no-daemon :shared:assembleRadioShakeSharedDebugXCFramework
+          test -d "shared/build/XCFrameworks/debug/RadioShakeShared.xcframework" \
+            || { echo "::error::debug XCFramework not produced"; exit 1; }
+          mkdir -p shared/build/XCFrameworks/current
+          rm -rf shared/build/XCFrameworks/current/RadioShakeShared.xcframework
+          ln -sfn "$PWD/shared/build/XCFrameworks/debug/RadioShakeShared.xcframework" \
+                  "$PWD/shared/build/XCFrameworks/current/RadioShakeShared.xcframework"
+
+
+      - name: Generate Xcode project
+        if: steps.guard.outputs.has_ipad == 'true'
+        working-directory: src/ios
+        run: |
+          xcodegen generate --spec project.yml
+          xcodebuild -project RadioShake.xcodeproj -list
+
+
+      # The simulator is created from the device type when the image does not ship it, as
+      # ios-screenshots.yml does. The fixed name is not workflow input, so no validation regex is needed.
+      - name: Create and boot the iPad simulator
+        if: steps.guard.outputs.has_ipad == 'true'
+        env:
+          DEVICE: iPad Pro 13-inch (M5)
+        run: |
+          set -euo pipefail
+          RUNTIME_ID="com.apple.CoreSimulator.SimRuntime.iOS-${SIM_OS//./-}"
+          export RUNTIME_ID
+          UDID=$(xcrun simctl list devices available -j | python3 -c '
+          import json, os, sys
+          d = json.load(sys.stdin)["devices"]
+          name = os.environ["DEVICE"]
+          match = [x["udid"] for x in d.get(os.environ["RUNTIME_ID"], []) if x["name"] == name]
+          print(match[0] if match else "")')
+          if [ -z "$UDID" ]; then
+            TYPE_ID=$(xcrun simctl list devicetypes -j | python3 -c '
+          import json, os, sys
+          name = os.environ["DEVICE"]
+          match = [x["identifier"] for x in json.load(sys.stdin)["devicetypes"] if x["name"] == name]
+          print(match[0] if match else "")')
+            if [ -z "$TYPE_ID" ]; then
+              echo "::error::no simulator named '$DEVICE' under iOS ${SIM_OS} and no such device type on this image"
+              exit 1
+            fi
+            UDID=$(xcrun simctl create "RadioShake $DEVICE" "$TYPE_ID" "$RUNTIME_ID") \
+              || { echo "::error::could not create a '$DEVICE' simulator for iOS ${SIM_OS}"; exit 1; }
+          fi
+          [[ "$UDID" =~ ^[0-9A-F-]{36}$ ]] || { echo "::error::unexpected simulator id"; exit 1; }
+          echo "UDID=$UDID" >> "$GITHUB_ENV"
+          xcrun simctl boot "$UDID" || true
+          xcrun simctl bootstatus "$UDID" -b
+
+      - name: Select the iPad UI tests
+        if: steps.guard.outputs.has_ipad == 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/ios-logs
+          printf '%s\n' \
+            "-only-testing:RadioShakeUITests/IPadLayoutUITests" \
+            "-only-testing:RadioShakeTests/AppBundleConfigurationTests" \
+            "-only-testing:RadioShakeUITests/PodcastsUITests/test_onAnIPad_theShowPageUsesTheRegularWidthLayout" \
+            > /tmp/ipad-ui-args.txt
+          cat /tmp/ipad-ui-args.txt
+
+      # Retry once on failure like the UI shards; retried-then-passed tests are listed by the report step.
+      - name: Run XCTest iPad tests (retry once)
+        if: steps.guard.outputs.has_ipad == 'true'
+        working-directory: src/ios
+        run: |
+          set -euo pipefail
+          ONLY=()
+          while IFS= read -r arg; do ONLY+=("$arg"); done < /tmp/ipad-ui-args.txt
+          test "${#ONLY[@]}" -gt 0 || { echo "::error::empty -only-testing list for the iPad job"; exit 1; }
+          mkdir -p /tmp/ios-logs
+          xcodebuild test \
+            -project RadioShake.xcodeproj \
+            -scheme RadioShake \
+            -configuration Debug \
+            -destination "platform=iOS Simulator,id=${UDID}" \
+            -derivedDataPath /tmp/derived-data \
+            -resultBundlePath /tmp/ios-app-test-ipad.xcresult \
+            "${ONLY[@]}" \
+            -skip-testing:RadioShakeUITests/ScreenshotTourUITests \
+            -skip-testing:RadioShakeUITests/StoreScreenshotsUITests \
+            -retry-tests-on-failure -test-iterations 2 \
+            CODE_SIGNING_ALLOWED=NO 2>&1 | tee /tmp/ios-logs/xctest.log
+
+      - name: Report UI tests that needed a retry
+        if: always() && steps.guard.outputs.has_ipad == 'true'
+        run: python3 ci/.github/scripts/report_flaky_tests.py --log /tmp/ios-logs/xctest.log --label ipad-ui
+
+
+      # A skipped or missing test goes red (the iPad class, the bundle test, the Podcasts iPad method).
+      - name: Every selected iPad test ran and was not skipped
+        if: steps.guard.outputs.has_ipad == 'true'
+        run: python3 ci/.github/scripts/check_shard_ran.py --args /tmp/ipad-ui-args.txt --log /tmp/ios-logs/xctest.log
+
+      # The screenshot tour attaches keepAlways screenshots to the result
+      # bundle, and this job uploads that bundle to a PUBLIC artifact. The
+      # tour runs only in ios-screenshots.yml, which encrypts its output.
+      - name: Screenshot tour did not run in the public job
+        if: steps.guard.outputs.has_ipad == 'true'
+        run: |
+          set -euo pipefail
+          # Match executed test cases only: xcodebuild echoes its own command line,
+          # which contains the -skip-testing argument. xctest*.log covers the unit log too.
+          if grep -qE "Test Case '-\\[RadioShakeUITests\\.ScreenshotTourUITests" /tmp/ios-logs/xctest*.log; then
+            echo "::error::ScreenshotTourUITests ran in the public job; its screenshots would be uploaded unencrypted"
+            exit 1
+          fi
+          if grep -qE "Test Case '-\\[RadioShakeUITests\\.StoreScreenshotsUITests" /tmp/ios-logs/xctest*.log; then
+            echo "::error::StoreScreenshotsUITests ran in the public job; its screenshots would be uploaded unencrypted"
+            exit 1
+          fi
+          echo "OK - no screenshot tour or store screenshots in the public result bundle"
+
+
+      - name: Record iPad evidence
+        if: always() && steps.guard.outputs.has_ipad == 'true'
+        run: |
+          set -euo pipefail
+          echo "=== iPad job evidence ==="
+          echo "SHA: $(git -C src rev-parse HEAD)"
+          echo "Xcode: $(xcodebuild -version 2>/dev/null | sed -n 1p)"
+          echo "Date: $(date -u)"
+
+      # Nothing uploaded may contain the Forgejo tokens (raw, or the base64
+      # basic-auth value the clone step builds). xcresult blobs are
+      # zstd-compressed, so a token-free step first decompresses them into
+      # /tmp/scan-decompressed (it may use Homebrew's zstd; it holds no secrets).
+      - name: Decompress evidence for the secret scan
+        if: always() && steps.guard.outputs.has_ipad == 'true'
+        run: |
+          set +e -u -o pipefail
+          NEED=0
+          while IFS= read -r p; do
+            case "$p" in *.xcresult) [ -e "$p" ] && NEED=1 ;; esac
+          done <<< "$EVIDENCE_PATHS"
+          if [ "$NEED" = 1 ] && ! command -v zstd >/dev/null 2>&1; then
+            brew install zstd >/dev/null 2>&1
+          fi
+          python3 - <<'PY'
+          import json, os, subprocess, shutil
+
+          MAGIC = b"\x28\xb5\x2f\xfd"
+          zstd = shutil.which("zstd")
+          out = "/tmp/scan-decompressed"
+          os.makedirs(out, exist_ok=True)
+          items, failed, n = [], [], 0
+          for p in [x.strip() for x in os.environ["EVIDENCE_PATHS"].splitlines() if x.strip()]:
+              if not os.path.exists(p):
+                  continue
+              is_bundle = p.rstrip("/").endswith(".xcresult")
+              files = []
+              if os.path.isdir(p):
+                  for root, _, names in os.walk(p):
+                      files += [os.path.join(root, f) for f in names]
+              else:
+                  files = [p]
+              for f in files:
+                  label = p if is_bundle else f
+                  try:
+                      with open(f, "rb") as fh:
+                          data = fh.read()
+                  except OSError:
+                      continue  # the scan step reports unreadable files
+                  if not data.startswith(MAGIC):
+                      continue
+                  if zstd is None:
+                      failed.append(label + " (decompressor unavailable)")
+                      continue
+                  r = subprocess.run([zstd, "-dcq"], input=data, capture_output=True)
+                  if r.returncode != 0:
+                      failed.append(label + " (decompress failed)")
+                      continue
+                  n += 1
+                  dest = os.path.join(out, str(n))
+                  with open(dest, "wb") as fh:
+                      fh.write(r.stdout)
+                  items.append({"label": label, "file": dest, "source": f})
+          with open(os.path.join(out, "manifest.json"), "w") as fh:
+              json.dump({"items": items, "failed": failed}, fh)
+          print(f"Decompressed {len(items)} blobs, {len(failed)} failures")
+          PY
+
+
+      # Holds the Forgejo tokens and runs after branch code, so it uses only system tools by
+      # absolute path, a fixed PATH, a bash that ignores BASH_ENV (-p) and an allowlisted
+      # interpreter environment (env -i). Fails closed: unreadable files or a missing/failed
+      # decompression fail the step. Prints paths only.
+      # This narrows env/PATH hijacks; it is not a hard boundary against same-user file
+      # tampering or sudo.
+      - name: Secret scan of evidence artifacts
+        id: secret_scan
+        if: always() && steps.guard.outputs.has_ipad == 'true'
+        shell: /bin/bash --noprofile --norc -p -eo pipefail {0}
+        env:
+          FORGEJO_CLONE_TOKEN: ${{ secrets.FORGEJO_CLONE_TOKEN }}
+          FORGEJO_STATUS_TOKEN: ${{ secrets.FORGEJO_STATUS_TOKEN }}
+        run: |
+          PATH=/usr/bin:/bin:/usr/sbin:/sbin; export PATH
+          unset DEVELOPER_DIR BASH_ENV ENV PYTHONPATH PYTHONHOME PYTHONSTARTUP
+          set +e -u -o pipefail
+          trap '/bin/rm -rf /tmp/scan-decompressed' EXIT
+          /usr/bin/env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin HOME="$HOME" EVIDENCE_PATHS="$EVIDENCE_PATHS" \
+            FORGEJO_CLONE_TOKEN="$FORGEJO_CLONE_TOKEN" FORGEJO_STATUS_TOKEN="$FORGEJO_STATUS_TOKEN" \
+            /usr/bin/python3 -I - <<'PY'
+          import base64, json, os, sys
+
+          needles = {}
+          for name in ("FORGEJO_CLONE_TOKEN", "FORGEJO_STATUS_TOKEN"):
+              v = os.environ.get(name, "")
+              if v:
+                  needles[name] = v.encode()
+          clone = os.environ.get("FORGEJO_CLONE_TOKEN", "")
+          if clone:
+              needles["CLONE_AUTH_BASE64"] = base64.b64encode(b"oauth2:" + clone.encode())
+
+          leaked, failed, scanned_files, scanned_paths = [], [], 0, 0
+          have_bundle = False
+          magic_files = []
+
+          def check(label, data):
+              for n, v in needles.items():
+                  if v in data:
+                      leaked.append((n, label))
+
+          for p in [x.strip() for x in os.environ["EVIDENCE_PATHS"].splitlines() if x.strip()]:
+              if not os.path.exists(p):
+                  continue
+              scanned_paths += 1
+              is_bundle = p.rstrip("/").endswith(".xcresult")
+              have_bundle = have_bundle or is_bundle
+              files = []
+              if os.path.isdir(p):
+                  for root, _, names in os.walk(p):
+                      files += [os.path.join(root, n) for n in names]
+              else:
+                  files = [p]
+              for f in files:
+                  label = p if is_bundle else f
+                  try:
+                      with open(f, "rb") as fh:
+                          data = fh.read()
+                  except OSError:
+                      failed.append(label)
+                      continue
+                  scanned_files += 1
+                  check(label, data)
+                  if data.startswith(b"\x28\xb5\x2f\xfd"):
+                      magic_files.append((f, label))
+
+          decompressed = 0
+          manifest = "/tmp/scan-decompressed/manifest.json"
+          try:
+              with open(manifest, "r") as fh:
+                  m = json.load(fh)
+              for item in m["items"]:
+                  try:
+                      with open(item["file"], "rb") as fh:
+                          check(item["label"], fh.read())
+                      decompressed += 1
+                  except OSError:
+                      failed.append(item["label"] + " (decompressed copy unreadable)")
+              failed.extend(m["failed"])
+              listed = set(i.get("source") for i in m["items"])
+          except (OSError, ValueError, KeyError):
+              listed = set()
+              if have_bundle:
+                  failed.append("xcresult evidence (decompression manifest missing)")
+          for f, label in magic_files:
+              if f not in listed and not any(label in x for x in failed):
+                  failed.append(label + " (compressed blob not in decompression manifest)")
+
+          print(f"Scanned {scanned_paths} evidence paths, {scanned_files} files, {decompressed} decompressed blobs; {len(needles)} needles")
+          for n, label in sorted(set(leaked)):
+              print(f"::error::{n} value found in {label}")
+          for label in sorted(set(failed)):
+              print(f"::error::could not scan {label}")
+          if leaked or failed:
+              print("::error::secret scan failed; artifacts will not be uploaded")
+              sys.exit(1)
+          print("OK - no secret values in evidence artifacts")
+          PY
+
+
+      - name: Upload artifacts
+        if: always() && steps.guard.outputs.has_ipad == 'true' && steps.clone.outcome == 'success' && steps.secret_scan.outcome == 'success'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: ios-ipad-ui-evidence
+          retention-days: 30
+          if-no-files-found: error
+          # NEVER upload source, local.properties, gradle caches or app bundles
+          path: ${{ env.EVIDENCE_PATHS }}
+
+
+
   # TASK-141 AC #6: the Forgejo status callback is a separate job that
   # needs `validate`. It runs only after the whole job — including the
   # artifact upload — has finished, so an upload failure flips
@@ -1610,7 +2138,7 @@ jobs:
   # callback was the penultimate step inside `validate`, a later
   # artifact-upload failure could never influence the posted state.
   report-status:
-    needs: [validate, ui-shard]
+    needs: [validate, ui-shard, ipad-ui]
     if: always()
     runs-on: ubuntu-latest
     permissions:
@@ -1623,6 +2151,7 @@ jobs:
           HEAD_SHA: ${{ needs.validate.outputs.head_sha || github.event.client_payload.sha || inputs.sha || '' }}
           VALIDATE_RESULT: ${{ needs.validate.result }}
           SHARDS_RESULT: ${{ needs.ui-shard.result }}
+          IPAD_RESULT: ${{ needs.ipad-ui.result }}
         run: |
           set -eu
           echo "::add-mask::$STATUS_TOKEN"
@@ -1637,9 +2166,9 @@ jobs:
           # success only when every shard succeeded). Anything other than
           # success in either job is a red gate: an all-skipped or cancelled
           # run is not a green run.
-          RESULT="validate=${VALIDATE_RESULT},ui-shards=${SHARDS_RESULT}"
+          RESULT="validate=${VALIDATE_RESULT},ui-shards=${SHARDS_RESULT},ipad-ui=${IPAD_RESULT}"
           STATE="failure"
-          if [ "$VALIDATE_RESULT" = "success" ] && [ "$SHARDS_RESULT" = "success" ]; then STATE="success"; fi
+          if [ "$VALIDATE_RESULT" = "success" ] && [ "$SHARDS_RESULT" = "success" ] && [ "$IPAD_RESULT" = "success" ]; then STATE="success"; fi
 
           # A status that never reaches Forgejo must fail this job, so a
           # green GitHub run always means Forgejo saw the result.

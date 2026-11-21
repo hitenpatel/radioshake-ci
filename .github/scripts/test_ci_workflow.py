@@ -17,6 +17,7 @@ WORKFLOW = os.path.join(ROOT, ".github", "workflows", "ios-shared-validate.yml")
 VALIDATE_UNIT_STEP = "Run XCTest unit tests (no retry)"
 VALIDATE_UI_STEP = "Run XCTest UI tests (shard 0, retry once)"
 RETRY_FLAGS = "-retry-tests-on-failure -test-iterations 2"
+IPAD_GUARD = "steps.guard.outputs.has_ipad == 'true'"
 SHARED_STEPS = [
     "Clone source from private host",
     "Set up JDK 21",
@@ -70,6 +71,20 @@ class WorkflowTests(unittest.TestCase):
             self.assertIn(name, s, name)
             self.assertEqual(v[name], s[name], f"step {name!r} drifted between validate and ui-shard")
 
+    def test_ipad_job_clone_and_scan_steps_match_ui_shard(self):
+        s, i = self.steps(self.jobs["ui-shard"]), self.steps(self.jobs["ipad-ui"])
+        for name in ("Clone source from private host", "Set up JDK 21", "macOS preflight",
+                     "Install XcodeGen (pinned)", "Generate Xcode project",
+                     "Check out CI scripts (this repo, scripts only)",
+                     "Decompress evidence for the secret scan", "Secret scan of evidence artifacts",
+                     "Screenshot tour did not run in the public job"):
+            a, b = dict(s[name]), dict(i[name])
+            if name != "Clone source from private host":
+                self.assertEqual(b.pop("if"), IPAD_GUARD if not str(a.get("if", "")).startswith("always()")
+                                 else "always() && " + IPAD_GUARD, name)
+                a.pop("if", None)
+            self.assertEqual(a, b, f"step {name!r} drifted between ui-shard and ipad-ui")
+
     def test_matrix_covers_shards_1_to_n_minus_1_and_capacities(self):
         n = int(self.wf["env"]["UI_SHARDS"])
         caps = self.wf["env"]["UI_SHARD_CAPACITIES"].split(",")
@@ -79,13 +94,14 @@ class WorkflowTests(unittest.TestCase):
 
     def test_report_status_needs_every_test_job_and_requires_all_success(self):
         rs = self.jobs["report-status"]
-        self.assertEqual(sorted(rs["needs"]), ["ui-shard", "validate"])
+        self.assertEqual(sorted(rs["needs"]), ["ipad-ui", "ui-shard", "validate"])
         self.assertEqual(rs["if"], "always()")
         run = self.steps(rs)["Post status to Forgejo"]["run"]
-        self.assertIn('[ "$VALIDATE_RESULT" = "success" ] && [ "$SHARDS_RESULT" = "success" ]', run)
+        self.assertIn('[ "$VALIDATE_RESULT" = "success" ] && [ "$SHARDS_RESULT" = "success" ] && [ "$IPAD_RESULT" = "success" ]', run)
+        self.assertEqual(self.steps(rs)["Post status to Forgejo"]["env"]["IPAD_RESULT"], "${{ needs.ipad-ui.result }}")
 
     def test_every_job_clones_the_pinned_commit(self):
-        for job in ("validate", "ui-shard"):
+        for job in ("validate", "ui-shard", "ipad-ui"):
             env = self.steps(self.jobs[job])["Clone source from private host"]["env"]
             self.assertTrue(env["EXPECTED_SHA"].startswith("${{ needs.resolve.outputs.sha"), job)
             self.assertIn("resolve", self.jobs[job]["needs"])
@@ -280,7 +296,8 @@ class A11yGateWorkflowTests(unittest.TestCase):
     def test_release_deny_list_has_the_new_flags(self):
         run = self.steps["Audit Release binary for debug-only symbols (TASK-136 + TASK-137)"]["run"]
         deny = re.search(r"DENY='([^']*)'", run).group(1)
-        for flag in ("RSForceIncreaseContrast", "RSForceBoldText", "RSForceColorScheme", "a11y-trait-probe"):
+        for flag in ("RSForceIncreaseContrast", "RSForceBoldText", "RSForceColorScheme", "a11y-trait-probe",
+                     "RSRequestSecondWindow", "now-playing-layout"):
             self.assertIn(flag, deny.split("|"))
 
     def test_a11y_step_also_runs_the_baseline_from_log_tests_when_present(self):
@@ -608,7 +625,7 @@ class TokenStepHardeningTests(unittest.TestCase):
 
     def jobs_under_test(self):
         out = []
-        for path, names in ((WORKFLOW, ("validate", "ui-shard")), (AUDIT_WORKFLOW, ("audit",))):
+        for path, names in ((WORKFLOW, ("validate", "ui-shard", "ipad-ui")), (AUDIT_WORKFLOW, ("audit",))):
             with open(path, encoding="utf-8") as fh:
                 wf = yaml.safe_load(fh)
             for n in names:
@@ -641,7 +658,7 @@ class TokenStepHardeningTests(unittest.TestCase):
             d = names.index("Decompress evidence for the secret scan")
             self.assertEqual(names.index("Secret scan of evidence artifacts"), d + 1)
             self.assertNotIn("TOKEN", yaml.safe_dump(steps[d]))
-            self.assertEqual(steps[d]["if"], "always()")
+            self.assertEqual(steps[d]["if"], "always()" if job != "ipad-ui" else "always() && " + IPAD_GUARD)
 
     def run_hard(self, script_text, env=None):
         with tempfile.NamedTemporaryFile("w", suffix=".sh", delete=False) as fh:
@@ -918,3 +935,179 @@ class AscListingWorkflowTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipIf(yaml is None, "PyYAML not installed")
+class IPadWorkflowTests(unittest.TestCase):
+    """Phase 5d: the ipad-ui job, its guard and the guarded bundle-keys step."""
+    BUNDLE_STEP = "Universal bundle keys (Phase 5d)"
+
+    @classmethod
+    def setUpClass(cls):
+        with open(WORKFLOW, encoding="utf-8") as fh:
+            cls.wf = yaml.safe_load(fh)
+        cls.job = cls.wf["jobs"]["ipad-ui"]
+        cls.steps = {s["name"]: s for s in cls.job["steps"] if "name" in s}
+        cls.names = [s["name"] for s in cls.job["steps"]]
+
+    def test_job_shape_and_guard_follows_the_clone(self):
+        self.assertEqual(self.job["needs"], "resolve")
+        self.assertEqual(self.names[0], "Clone source from private host")
+        guard = self.job["steps"][1]
+        self.assertEqual(guard["id"], "guard")
+        self.assertIn("test -f src/ios/UITests/RadioShakeUITests/IPadLayoutUITests.swift", guard["run"])
+        self.assertIn('echo "has_ipad=true" >> "$GITHUB_OUTPUT"', guard["run"])
+        self.assertIn('echo "has_ipad=false" >> "$GITHUB_OUTPUT"', guard["run"])
+        self.assertNotIn("if", guard)
+
+    def test_every_step_after_the_guard_carries_the_guard(self):
+        for st in self.job["steps"][2:]:
+            cond = st.get("if", "")
+            self.assertIn(IPAD_GUARD, cond, st["name"])
+            self.assertTrue(cond == IPAD_GUARD or cond.startswith("always() && "), st["name"])
+            self.assertNotIn("continue-on-error", st, st["name"])
+        # the upload keeps the clone and scan conditions as well
+        up = [s for s in self.job["steps"] if s.get("uses", "").startswith("actions/upload-artifact")]
+        self.assertEqual(len(up), 1)
+        self.assertIn("steps.secret_scan.outcome == 'success'", up[0]["if"])
+        self.assertIn("steps.clone.outcome == 'success'", up[0]["if"])
+
+    def test_runs_the_three_selections_on_the_ipad_simulator(self):
+        args = self.steps["Select the iPad UI tests"]["run"]
+        for sel in ("-only-testing:RadioShakeUITests/IPadLayoutUITests",
+                    "-only-testing:RadioShakeTests/AppBundleConfigurationTests",
+                    "-only-testing:RadioShakeUITests/PodcastsUITests/test_onAnIPad_theShowPageUsesTheRegularWidthLayout"):
+            self.assertIn(f'"{sel}"', args)
+        sim = self.steps["Create and boot the iPad simulator"]
+        self.assertEqual(sim["env"]["DEVICE"], "iPad Pro 13-inch (M5)")
+        self.assertIn("simctl create", sim["run"])
+        run = self.steps["Run XCTest iPad tests (retry once)"]["run"]
+        self.assertIn('-destination "platform=iOS Simulator,id=${UDID}"', run)
+        self.assertIn("/tmp/ipad-ui-args.txt", run)
+        self.assertIn(RETRY_FLAGS, run)
+        self.assertIn("tee /tmp/ios-logs/xctest.log", run)
+        self.assertIn("-skip-testing:RadioShakeUITests/ScreenshotTourUITests", run)
+        ran = self.steps["Every selected iPad test ran and was not skipped"]["run"]
+        self.assertIn("check_shard_ran.py --args /tmp/ipad-ui-args.txt --log /tmp/ios-logs/xctest.log", ran)
+
+    def test_evidence_uploaded_is_exactly_what_the_scan_covers(self):
+        paths = self.job["env"]["EVIDENCE_PATHS"].splitlines()
+        self.assertEqual(paths, ["/tmp/ios-logs/", "/tmp/ios-app-test-ipad.xcresult"])
+        up = [s for s in self.job["steps"] if s.get("uses", "").startswith("actions/upload-artifact")][0]
+        self.assertEqual(up["with"]["path"], "${{ env.EVIDENCE_PATHS }}")
+        self.assertEqual(up["with"]["name"], "ios-ipad-ui-evidence")
+        # the result bundle is in the path list, so the decompress step and the scan walk it
+        self.assertIn('.xcresult', self.steps["Decompress evidence for the secret scan"]["run"])
+        self.assertEqual(self.steps["Secret scan of evidence artifacts"]["id"], "secret_scan")
+
+    def test_clone_token_only_in_clone_and_scan_steps(self):
+        for st in self.job["steps"]:
+            if st["name"] in ("Clone source from private host", "Secret scan of evidence artifacts"):
+                continue
+            self.assertNotRegex(yaml.safe_dump(st), r"FORGEJO_(CLONE|STATUS)_TOKEN|secrets\.", st["name"])
+
+    def test_iPad_class_is_not_sharded(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("sh", os.path.join(ROOT, ".github", "scripts", "shard_ui_tests.py"))
+        sh = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(sh)
+        self.assertIn("IPadLayoutUITests", sh.DEFAULT_EXCLUDE)
+
+    def test_bundle_keys_step_follows_the_release_build_and_is_guarded_by_the_project_yml(self):
+        steps = self.wf["jobs"]["validate"]["steps"]
+        names = [s.get("name") for s in steps]
+        self.assertGreater(names.index(self.BUNDLE_STEP), names.index("Build iOS app (Release, simulator, unsigned)"))
+        run = steps[names.index(self.BUNDLE_STEP)]["run"]
+        guard = [l for l in run.splitlines() if "grep -Eq" in l][0]
+        self.assertIn('TARGETED_DEVICE_FAMILY:', guard)
+        self.assertIn('"1,2"', guard)
+        self.assertIn("src/ios/project.yml", guard)
+        self.assertIn("exit 0", run.split("fi", 1)[0])  # the skip path comes before any check
+        self.assertNotIn("secrets.", yaml.safe_dump(steps[names.index(self.BUNDLE_STEP)]))
+        out = subprocess.run(["bash", "-n"], input=run, text=True, capture_output=True)
+        self.assertEqual(out.returncode, 0, out.stderr)
+
+    # -- executing the bundle-keys step against a fake PlistBuddy (plistlib) --------------------------
+    SHIM = r'''#!/usr/bin/env python3
+import plistlib, sys
+cmd, path = sys.argv[2], sys.argv[3]
+try:
+    v = plistlib.load(open(path, "rb"))
+    for k in cmd[len("Print :"):].split(":"):
+        v = v[int(k)] if isinstance(v, list) else v[k]
+except Exception:
+    print("Print: Entry, " + cmd + ", Does Not Exist", file=sys.stderr); sys.exit(1)
+if isinstance(v, list):
+    print("Array {"); [print("    %s" % x) for x in v]; print("}")
+elif isinstance(v, dict):
+    print("Dict {"); [print("    %s = %s" % kv) for kv in v.items()]; print("}")
+else:
+    print("true" if v is True else "false" if v is False else v)
+'''
+    ORI = ["UIInterfaceOrientationPortrait", "UIInterfaceOrientationLandscapeLeft", "UIInterfaceOrientationLandscapeRight"]
+    PAD = ["UIInterfaceOrientationPortrait", "UIInterfaceOrientationPortraitUpsideDown",
+           "UIInterfaceOrientationLandscapeLeft", "UIInterfaceOrientationLandscapeRight"]
+
+    def good_app(self):
+        return {"UIDeviceFamily": [1, 2], "UISupportedInterfaceOrientations": list(self.ORI),
+                "UISupportedInterfaceOrientations~ipad": list(self.PAD),
+                "UIApplicationSceneManifest": {"UIApplicationSupportsMultipleScenes": True, "UISceneConfigurations": {
+                    "CPTemplateApplicationSceneSessionRoleApplication": [{"UISceneClassName": "CPTemplateApplicationScene"}]}}}
+
+    def run_step(self, app_plist, project_family='"1,2"', appex=({"UIDeviceFamily": [1, 2]},)):
+        import plistlib
+        run = [s for s in self.wf["jobs"]["validate"]["steps"] if s.get("name") == self.BUNDLE_STEP][0]["run"]
+        with tempfile.TemporaryDirectory() as d:
+            os.makedirs(f"{d}/src/ios")
+            with open(f"{d}/src/ios/project.yml", "w") as fh:
+                fh.write(f"settings:\n  base:\n    TARGETED_DEVICE_FAMILY: {project_family}\n")
+            app = f"{d}/tmp/derived-data-release/Build/Products/Release-iphonesimulator/RadioShake.app"
+            os.makedirs(app)
+            with open(f"{app}/Info.plist", "wb") as fh:
+                plistlib.dump(app_plist, fh)
+            for n, pl in enumerate(appex):
+                os.makedirs(f"{app}/PlugIns/W{n}.appex")
+                with open(f"{app}/PlugIns/W{n}.appex/Info.plist", "wb") as fh:
+                    plistlib.dump(pl, fh)
+            shim = f"{d}/PlistBuddy"
+            with open(shim, "w") as fh:
+                fh.write(self.SHIM)
+            os.chmod(shim, 0o755)
+            script = run.replace("/tmp/derived-data-release", f"{d}/tmp/derived-data-release")
+            return subprocess.run(["bash", "-c", script], cwd=d, env={**os.environ, "PLISTBUDDY": shim},
+                                  text=True, capture_output=True)
+
+    def test_bundle_step_passes_on_a_good_universal_bundle(self):
+        r = self.run_step(self.good_app())
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("OK - universal bundle keys", r.stdout)
+
+    def test_bundle_step_accepts_portrait_only_iphone_array(self):
+        a = self.good_app()
+        a["UISupportedInterfaceOrientations"] = ["UIInterfaceOrientationPortrait"]
+        self.assertEqual(self.run_step(a).returncode, 0)
+
+    def test_bundle_step_skips_on_an_iphone_only_source_even_with_a_bad_bundle(self):
+        r = self.run_step({"UIDeviceFamily": [1]}, project_family='"1"')
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("SKIP", r.stdout)
+
+    def test_bundle_step_fails_each_violation(self):
+        cases = {
+            "family": lambda a: a.update(UIDeviceFamily=[1]),
+            "phone orientations": lambda a: a.update(UISupportedInterfaceOrientations=["UIInterfaceOrientationLandscapeLeft"]),
+            "pad orientations": lambda a: a.update({"UISupportedInterfaceOrientations~ipad": self.PAD[:2]}),
+            "multiple scenes false": lambda a: a["UIApplicationSceneManifest"].update(UIApplicationSupportsMultipleScenes=False),
+            "carplay config missing": lambda a: a["UIApplicationSceneManifest"].update(UISceneConfigurations={}),
+            "full screen": lambda a: a.update(UIRequiresFullScreen=True),
+        }
+        for label, mutate in cases.items():
+            a = self.good_app()
+            mutate(a)
+            r = self.run_step(a)
+            self.assertEqual(r.returncode, 1, f"{label}: {r.stdout}{r.stderr}")
+            self.assertIn("::error::", r.stdout, label)
+
+    def test_bundle_step_fails_on_an_iphone_only_or_missing_extension(self):
+        self.assertEqual(self.run_step(self.good_app(), appex=({"UIDeviceFamily": [1]},)).returncode, 1)
+        self.assertEqual(self.run_step(self.good_app(), appex=()).returncode, 1)
