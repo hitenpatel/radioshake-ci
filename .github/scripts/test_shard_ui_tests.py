@@ -50,8 +50,10 @@ class DiscoverTests(unittest.TestCase):
     def test_default_exclude_covers_tour_and_store_screenshot_classes(self):
         self.assertIn("ScreenshotTourUITests", sh.DEFAULT_EXCLUDE)
         self.assertIn("StoreScreenshotsUITests", sh.DEFAULT_EXCLUDE)
+        self.assertIn("IPadLayoutUITests", sh.DEFAULT_EXCLUDE)
         got = self.discover({
             "Store.swift": swift_class("StoreScreenshotsUITests", 9),
+            "IPad.swift": swift_class("IPadLayoutUITests", 12),
             "A.swift": swift_class("AUITests", 2),
         })
         self.assertEqual(got, {"AUITests": 2})

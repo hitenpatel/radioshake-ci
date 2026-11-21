@@ -24,7 +24,8 @@ import re
 import sys
 
 DEFAULT_SECONDS_PER_METHOD = 25.0
-DEFAULT_EXCLUDE = ("ScreenshotTourUITests", "StoreScreenshotsUITests")
+# IPadLayoutUITests run in the ipad-ui job (iPad simulator); on an iPhone shard they would all skip.
+DEFAULT_EXCLUDE = ("ScreenshotTourUITests", "StoreScreenshotsUITests", "IPadLayoutUITests")
 # Per-screen accessibility audits run in ios-a11y-audit.yml (nightly/weekly/manual), never in validate.
 AUDIT_CLASS = re.compile(r"^A11yAudit[A-Za-z0-9_]*UITests$")
 IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
