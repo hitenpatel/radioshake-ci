@@ -295,6 +295,33 @@ class FetchTest(unittest.TestCase):
                 if export:
                     self.assertIn('DIAGNOSTIC_ERROR',err.getvalue()); self.assertNotIn('DIAGNOSTIC_PASS',out.getvalue())
 
+    def archive_writing_decrypt(self, bundle):
+        def fake(files, work, runner=None):
+            (work/'key.enc').write_bytes(b'k'); (work/'bundle.tgz.enc').write_bytes(b'enc'); (work/'bundle.tgz').write_bytes(bundle)
+            return bundle
+        return fake
+
+    def test_verified_fetch_drops_archive_copies_and_keeps_evidence(self):
+        for native in ('passed','failed'):
+            with self.subTest(native=native), tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stdout(io.StringIO()):
+                conclusion='success' if native=='passed' else 'failure'
+                api=FakeAPI(selected=run(conclusion=conclusion), jobs=[dict(name='diagnostic',status='completed',conclusion=conclusion)], archive=zipdata(['key.enc','bundle.tgz.enc']))
+                with patch.object(d,'decrypt',side_effect=self.archive_writing_decrypt(self.fixture(native))):
+                    d.execute_fetch(REQ,api,Path(tmp),1)
+                attempt,=Path(tmp).glob('attempt-*')
+                self.assertTrue((attempt/'evidence/manifest.json').is_file())
+                for name in ('bundle.tgz','bundle.tgz.enc','key.enc'):
+                    self.assertFalse((attempt/name).exists(), name)
+
+    def test_unverified_evidence_keeps_archive_copies(self):
+        api=FakeAPI(archive=zipdata(['key.enc','bundle.tgz.enc']))
+        with tempfile.TemporaryDirectory() as tmp, patch.object(d,'decrypt',side_effect=self.archive_writing_decrypt(self.fixture())), patch.object(d,'verify_manifest',side_effect=d.DiagnosticError()):
+            with self.assertRaises(d.DiagnosticError): d.execute_fetch(REQ,api,Path(tmp),1)
+            attempt,=Path(tmp).glob('attempt-*')
+            for name in ('bundle.tgz','bundle.tgz.enc','key.enc'):
+                self.assertTrue((attempt/name).exists(), name)
+            self.assertEqual(api.deleted,[])
+
     def test_wrong_job_and_decrypt_failure_preserve_remote_artifact(self):
         for api in (FakeAPI(jobs=[dict(name='wrong',status='completed',conclusion='failure')]), FakeAPI(archive=zipdata(['key.enc','bundle.tgz.enc']))):
             with tempfile.TemporaryDirectory() as tmp, patch.object(d,'decrypt',side_effect=ValueError('private canary')), self.assertRaises(d.DiagnosticError):

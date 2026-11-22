@@ -225,6 +225,7 @@ def execute_fetch(req, api, work, deadline, runner=process, sleep=time.sleep, cl
     evidence=attempt/'evidence'; evidence.mkdir()
     extract_tar(bundle,evidence)
     result=verify_manifest(evidence,req,r)
+    for name in ('bundle.tgz','bundle.tgz.enc','key.enc'): (attempt/name).unlink(missing_ok=True)
     api.json('DELETE',API+'/actions/artifacts/%s' % artifact['id'])
     print('DIAGNOSTIC_PASS' if result==0 else 'DIAGNOSTIC_FAIL')
     print('run='+r['html_url']); print('evidence='+str(evidence))
