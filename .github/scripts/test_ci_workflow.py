@@ -495,7 +495,7 @@ class A11yAuditWorkflowTests(unittest.TestCase):
     def test_failed_reboot_marks_the_leg_red_and_moves_on_to_the_next_class(self):
         run = self.asteps["Run accessibility audit passes"]["run"]
         loop = run[run.index('for ARG in "${ONLY[@]}"'):]
-        m = re.search(r'if ! xcrun simctl bootstatus "\$UDID" -b; then(.*?)\n\s*fi\n', loop, re.S)
+        m = re.search(r'if ! perl -e \'alarm shift; exec @ARGV\' 300 xcrun simctl bootstatus "\$UDID" -b; then(.*?)\n\s*fi\n', loop, re.S)
         self.assertIsNotNone(m)
         self.assertIn("STATUS=1", m.group(1))
         self.assertIn("continue", m.group(1))
@@ -933,8 +933,6 @@ class AscListingWorkflowTests(unittest.TestCase):
         self.assertNotIn("upload-artifact", self.text)
 
 
-if __name__ == "__main__":
-    unittest.main()
 
 
 @unittest.skipIf(yaml is None, "PyYAML not installed")
@@ -1131,3 +1129,26 @@ else:
     def test_bundle_step_fails_on_an_iphone_only_or_missing_extension(self):
         self.assertEqual(self.run_step(self.good_app(), appex=({"UIDeviceFamily": [1]},)).returncode, 1)
         self.assertEqual(self.run_step(self.good_app(), appex=()).returncode, 1)
+
+
+class AuditClassDeadlineTests(unittest.TestCase):
+    """A11y-2 Task 0.4: one hung audit class cannot block the rest of the leg."""
+
+    def setUp(self):
+        with open(AUDIT_WORKFLOW) as f:
+            self.text = f.read()
+
+    def test_each_class_runs_under_a_perl_alarm_deadline(self):
+        self.assertIn("A11Y_CLASS_DEADLINE=2100", self.text)
+        self.assertIn("""perl -e 'alarm shift; exec @ARGV' "$A11Y_CLASS_DEADLINE" xcodebuild test-without-building""", self.text)
+
+    def test_a_deadline_hit_is_logged_and_fails_the_class_without_stopping_the_loop(self):
+        self.assertIn('if [ "$RC" -eq 142 ]; then', self.text)
+        self.assertIn('echo "A11Y-CLASS-DEADLINE ${ARG#-only-testing:}"', self.text)
+        self.assertIn('[ "$RC" -eq 0 ] || STATUS=1', self.text)
+
+    def test_the_reboot_wait_is_bounded(self):
+        self.assertIn("""perl -e 'alarm shift; exec @ARGV' 300 xcrun simctl bootstatus "$UDID" -b""", self.text)
+
+if __name__ == "__main__":
+    unittest.main()
