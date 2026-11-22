@@ -415,7 +415,7 @@ jobs:
               xcrun simctl boot "$UDID" || true
               # A simulator that will not come back fails this class only; the rest still run. The wait is bounded
               # (300 s) so a wedged boot cannot hold the leg.
-              if ! perl ci/.github/scripts/run_with_deadline.pl 300 xcrun simctl bootstatus "$UDID" -b; then
+              if ! perl "$GITHUB_WORKSPACE/ci/.github/scripts/run_with_deadline.pl" 300 xcrun simctl bootstatus "$UDID" -b; then
                 echo "::error::simulator did not reboot before ${ARG#-only-testing:}; skipping that class"
                 STATUS=1
                 continue
@@ -427,7 +427,7 @@ jobs:
             # Per-class deadline (A11y-2 Task 0.4): a hung class is killed after 35 minutes with its whole process group
             # (run_with_deadline.pl, exit 142), marked failed with an A11Y-CLASS-DEADLINE line, and the loop moves on; the
             # simulator reboot before the next class clears what it left. macOS runners have no GNU timeout.
-            perl ci/.github/scripts/run_with_deadline.pl "$A11Y_CLASS_DEADLINE" xcodebuild test-without-building \
+            perl "$GITHUB_WORKSPACE/ci/.github/scripts/run_with_deadline.pl" "$A11Y_CLASS_DEADLINE" xcodebuild test-without-building \
               -project RadioShake.xcodeproj \
               -scheme RadioShake \
               -configuration Debug \

@@ -495,7 +495,7 @@ class A11yAuditWorkflowTests(unittest.TestCase):
     def test_failed_reboot_marks_the_leg_red_and_moves_on_to_the_next_class(self):
         run = self.asteps["Run accessibility audit passes"]["run"]
         loop = run[run.index('for ARG in "${ONLY[@]}"'):]
-        m = re.search(r'if ! perl ci/\.github/scripts/run_with_deadline\.pl 300 xcrun simctl bootstatus "\$UDID" -b; then(.*?)\n\s*fi\n', loop, re.S)
+        m = re.search(r'if ! perl "\$GITHUB_WORKSPACE/ci/\.github/scripts/run_with_deadline\.pl" 300 xcrun simctl bootstatus "\$UDID" -b; then(.*?)\n\s*fi\n', loop, re.S)
         self.assertIsNotNone(m)
         self.assertIn("STATUS=1", m.group(1))
         self.assertIn("continue", m.group(1))
@@ -1140,7 +1140,7 @@ class AuditClassDeadlineTests(unittest.TestCase):
 
     def test_each_class_runs_under_a_perl_alarm_deadline(self):
         self.assertIn("A11Y_CLASS_DEADLINE=2100", self.text)
-        self.assertIn("""perl ci/.github/scripts/run_with_deadline.pl "$A11Y_CLASS_DEADLINE" xcodebuild test-without-building""", self.text)
+        self.assertIn("""perl "$GITHUB_WORKSPACE/ci/.github/scripts/run_with_deadline.pl" "$A11Y_CLASS_DEADLINE" xcodebuild test-without-building""", self.text)
 
     def test_a_deadline_hit_is_logged_and_fails_the_class_without_stopping_the_loop(self):
         self.assertIn('if [ "$RC" -eq 142 ]; then', self.text)
@@ -1148,8 +1148,18 @@ class AuditClassDeadlineTests(unittest.TestCase):
         self.assertIn('[ "$RC" -eq 0 ] || STATUS=1', self.text)
 
     def test_the_reboot_wait_is_bounded(self):
-        self.assertIn("""perl ci/.github/scripts/run_with_deadline.pl 300 xcrun simctl bootstatus "$UDID" -b""", self.text)
+        self.assertIn("""perl "$GITHUB_WORKSPACE/ci/.github/scripts/run_with_deadline.pl" 300 xcrun simctl bootstatus "$UDID" -b""", self.text)
 
+
+
+class RunWithDeadlinePathTests(unittest.TestCase):
+    """Canary run 45065023067: the run step works inside src/ios, so a relative ci/ path to the wrapper did not exist."""
+
+    def test_the_wrapper_is_called_by_an_absolute_workspace_path(self):
+        with open(AUDIT_WORKFLOW) as f:
+            text = f.read()
+        self.assertNotRegex(text, r'perl ci/')
+        self.assertIn('perl "$GITHUB_WORKSPACE/ci/.github/scripts/run_with_deadline.pl"', text)
 
 
 class RunWithDeadlineScriptTests(unittest.TestCase):
