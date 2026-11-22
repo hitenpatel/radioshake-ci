@@ -322,6 +322,47 @@ class FetchTest(unittest.TestCase):
                 self.assertTrue((attempt/name).exists(), name)
             self.assertEqual(api.deleted,[])
 
+    def counting_api(self, artifact_id=5):
+        api=FakeAPI(artifacts=[dict(id=artifact_id,name='ios-diagnostic-encrypted-'+RID,expired=False)], archive=zipdata(['key.enc','bundle.tgz.enc']))
+        api.downloads=0
+        original=api.archive
+        def archive(artifact_id):
+            api.downloads+=1
+            return original(artifact_id)
+        api.archive=archive
+        return api
+
+    def test_repeated_fetch_of_unverified_artifact_reuses_attempt_without_download(self):
+        api=self.counting_api()
+        with tempfile.TemporaryDirectory() as tmp, patch.object(d,'decrypt',side_effect=self.archive_writing_decrypt(self.fixture())), patch.object(d,'verify_manifest',side_effect=d.DiagnosticError()) as verify:
+            for _ in range(3):
+                with self.assertRaises(d.DiagnosticError): d.execute_fetch(REQ,api,Path(tmp),1)
+            self.assertEqual(api.downloads,1)
+            self.assertEqual(len(list(Path(tmp).glob('attempt-*'))),1)
+            self.assertEqual(verify.call_count,3)
+            self.assertEqual(api.deleted,[])
+
+    def test_reused_attempt_that_now_verifies_completes_and_cleans_up(self):
+        api=self.counting_api()
+        with tempfile.TemporaryDirectory() as tmp, patch.object(d,'decrypt',side_effect=self.archive_writing_decrypt(self.fixture())), contextlib.redirect_stdout(io.StringIO()) as out:
+            with patch.object(d,'verify_manifest',side_effect=d.DiagnosticError()):
+                with self.assertRaises(d.DiagnosticError): d.execute_fetch(REQ,api,Path(tmp),1)
+            self.assertEqual(d.execute_fetch(REQ,api,Path(tmp),1),1)
+            self.assertEqual(api.downloads,1)
+            attempt,=Path(tmp).glob('attempt-*')
+            self.assertFalse((attempt/'bundle.tgz.enc').exists())
+            self.assertIn('DIAGNOSTIC_FAIL',out.getvalue())
+            self.assertEqual(api.deleted,[d.API+'/actions/artifacts/5'])
+
+    def test_attempt_for_other_artifact_or_incomplete_extraction_is_not_reused(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(d,'decrypt',side_effect=self.archive_writing_decrypt(self.fixture())), patch.object(d,'verify_manifest',side_effect=d.DiagnosticError()):
+            other=Path(tmp)/'attempt-other'; (other/'evidence').mkdir(parents=True); (other/'artifact.json').write_text(json.dumps({'id':9}))
+            partial=Path(tmp)/'attempt-partial'; (partial/'evidence').mkdir(parents=True)
+            api=self.counting_api(5)
+            with self.assertRaises(d.DiagnosticError): d.execute_fetch(REQ,api,Path(tmp),1)
+            self.assertEqual(api.downloads,1)
+            self.assertEqual(len(list(Path(tmp).glob('attempt-*'))),3)
+
     def test_wrong_job_and_decrypt_failure_preserve_remote_artifact(self):
         for api in (FakeAPI(jobs=[dict(name='wrong',status='completed',conclusion='failure')]), FakeAPI(archive=zipdata(['key.enc','bundle.tgz.enc']))):
             with tempfile.TemporaryDirectory() as tmp, patch.object(d,'decrypt',side_effect=ValueError('private canary')), self.assertRaises(d.DiagnosticError):

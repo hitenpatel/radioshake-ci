@@ -205,6 +205,14 @@ def collection(api, url, key):
 def list_runs(api):
     return collection(api,API+'/actions/workflows/ios-diagnostic-tests.yml/runs?event=workflow_dispatch&per_page=100','workflow_runs')
 
+def extracted_attempt(work, artifact_id):
+    # A fully extracted earlier attempt of this artifact: verify it again instead of re-downloading.
+    for attempt in sorted(work.glob('attempt-*')):
+        try:
+            if (attempt/'evidence').is_dir() and json.loads((attempt/'artifact.json').read_text()).get('id') == artifact_id: return attempt
+        except (OSError, ValueError, AttributeError): continue
+    return None
+
 def execute_fetch(req, api, work, deadline, runner=process, sleep=time.sleep, clock=time.monotonic):
     while True:
         runs=list_runs(api)
@@ -218,12 +226,16 @@ def execute_fetch(req, api, work, deadline, runner=process, sleep=time.sleep, cl
     jobs=collection(api,API+'/actions/runs/%s/attempts/%s/jobs?per_page=100' % (r['id'],r['run_attempt']),'jobs')
     if len(jobs)!=1 or jobs[0].get('name')!='diagnostic' or jobs[0].get('status')!='completed' or jobs[0].get('conclusion') != r['conclusion']: raise DiagnosticError()
     artifact=select_artifact(collection(api,API+'/actions/runs/%s/artifacts?per_page=100' % r['id'],'artifacts'), req['request_id'])
-    files=unpack_zip(api.archive(artifact['id']))
-    attempt=Path(tempfile.mkdtemp(prefix='attempt-',dir=work))
-    try: bundle=decrypt(files,attempt,runner)
-    except Exception: raise DiagnosticError() from None
-    evidence=attempt/'evidence'; evidence.mkdir()
-    extract_tar(bundle,evidence)
+    attempt=extracted_attempt(work, artifact['id'])
+    if attempt is None:
+        files=unpack_zip(api.archive(artifact['id']))
+        attempt=Path(tempfile.mkdtemp(prefix='attempt-',dir=work))
+        try: bundle=decrypt(files,attempt,runner)
+        except Exception: raise DiagnosticError() from None
+        (attempt/'evidence').mkdir()
+        extract_tar(bundle,attempt/'evidence')
+        (attempt/'artifact.json').write_text(json.dumps({'id':artifact['id']}))
+    evidence=attempt/'evidence'
     result=verify_manifest(evidence,req,r)
     for name in ('bundle.tgz','bundle.tgz.enc','key.enc'): (attempt/name).unlink(missing_ok=True)
     api.json('DELETE',API+'/actions/artifacts/%s' % artifact['id'])
