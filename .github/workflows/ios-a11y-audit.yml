@@ -415,7 +415,7 @@ jobs:
               xcrun simctl boot "$UDID" || true
               # A simulator that will not come back fails this class only; the rest still run. The wait is bounded
               # (300 s) so a wedged boot cannot hold the leg.
-              if ! perl -e 'alarm shift; exec @ARGV' 300 xcrun simctl bootstatus "$UDID" -b; then
+              if ! perl ci/.github/scripts/run_with_deadline.pl 300 xcrun simctl bootstatus "$UDID" -b; then
                 echo "::error::simulator did not reboot before ${ARG#-only-testing:}; skipping that class"
                 STATUS=1
                 continue
@@ -424,10 +424,10 @@ jobs:
             BUNDLE="/tmp/ios-a11y-${PASS}-part${PART}.xcresult"
             echo "=== Audit class ${PART}/${#ONLY[@]}: ${ARG#-only-testing:} ===" | tee -a /tmp/ios-logs/xctest.log
             set +e
-            # Per-class deadline (A11y-2 ruling 13 / Task 0.4): a hung class is killed after 35 minutes (SIGALRM to the
-            # exec'd xcodebuild, exit 142), marked failed with an A11Y-CLASS-DEADLINE line, and the loop moves on; the
+            # Per-class deadline (A11y-2 Task 0.4): a hung class is killed after 35 minutes with its whole process group
+            # (run_with_deadline.pl, exit 142), marked failed with an A11Y-CLASS-DEADLINE line, and the loop moves on; the
             # simulator reboot before the next class clears what it left. macOS runners have no GNU timeout.
-            perl -e 'alarm shift; exec @ARGV' "$A11Y_CLASS_DEADLINE" xcodebuild test-without-building \
+            perl ci/.github/scripts/run_with_deadline.pl "$A11Y_CLASS_DEADLINE" xcodebuild test-without-building \
               -project RadioShake.xcodeproj \
               -scheme RadioShake \
               -configuration Debug \

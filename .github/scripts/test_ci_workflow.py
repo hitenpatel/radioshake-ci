@@ -495,7 +495,7 @@ class A11yAuditWorkflowTests(unittest.TestCase):
     def test_failed_reboot_marks_the_leg_red_and_moves_on_to_the_next_class(self):
         run = self.asteps["Run accessibility audit passes"]["run"]
         loop = run[run.index('for ARG in "${ONLY[@]}"'):]
-        m = re.search(r'if ! perl -e \'alarm shift; exec @ARGV\' 300 xcrun simctl bootstatus "\$UDID" -b; then(.*?)\n\s*fi\n', loop, re.S)
+        m = re.search(r'if ! perl ci/\.github/scripts/run_with_deadline\.pl 300 xcrun simctl bootstatus "\$UDID" -b; then(.*?)\n\s*fi\n', loop, re.S)
         self.assertIsNotNone(m)
         self.assertIn("STATUS=1", m.group(1))
         self.assertIn("continue", m.group(1))
@@ -1140,7 +1140,7 @@ class AuditClassDeadlineTests(unittest.TestCase):
 
     def test_each_class_runs_under_a_perl_alarm_deadline(self):
         self.assertIn("A11Y_CLASS_DEADLINE=2100", self.text)
-        self.assertIn("""perl -e 'alarm shift; exec @ARGV' "$A11Y_CLASS_DEADLINE" xcodebuild test-without-building""", self.text)
+        self.assertIn("""perl ci/.github/scripts/run_with_deadline.pl "$A11Y_CLASS_DEADLINE" xcodebuild test-without-building""", self.text)
 
     def test_a_deadline_hit_is_logged_and_fails_the_class_without_stopping_the_loop(self):
         self.assertIn('if [ "$RC" -eq 142 ]; then', self.text)
@@ -1148,7 +1148,31 @@ class AuditClassDeadlineTests(unittest.TestCase):
         self.assertIn('[ "$RC" -eq 0 ] || STATUS=1', self.text)
 
     def test_the_reboot_wait_is_bounded(self):
-        self.assertIn("""perl -e 'alarm shift; exec @ARGV' 300 xcrun simctl bootstatus "$UDID" -b""", self.text)
+        self.assertIn("""perl ci/.github/scripts/run_with_deadline.pl 300 xcrun simctl bootstatus "$UDID" -b""", self.text)
+
+
+
+class RunWithDeadlineScriptTests(unittest.TestCase):
+    """The deadline wrapper kills the whole process group and exits 142 (canary run 45051959419)."""
+
+    SCRIPT = os.path.join(ROOT, ".github", "scripts", "run_with_deadline.pl")
+
+    def run_script(self, *args):
+        import subprocess
+        return subprocess.run(["perl", self.SCRIPT, *args], capture_output=True, text=True, timeout=60)
+
+    def test_passes_the_command_status_through(self):
+        self.assertEqual(self.run_script("10", "sh", "-c", "exit 3").returncode, 3)
+        self.assertEqual(self.run_script("10", "sh", "-c", "exit 0").returncode, 0)
+
+    def test_a_command_past_the_deadline_exits_142_and_leaves_no_child(self):
+        import subprocess
+        marker = "47.31"
+        result = self.run_script("2", "sh", "-c", "sleep %s & sleep %s" % (marker, marker))
+        self.assertEqual(result.returncode, 142)
+        ps = subprocess.run(["ps", "-eo", "args"], capture_output=True, text=True).stdout
+        self.assertNotIn("sleep %s" % marker, ps)
+
 
 if __name__ == "__main__":
     unittest.main()
