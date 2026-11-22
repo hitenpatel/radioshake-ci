@@ -349,6 +349,7 @@ class A11yAuditWorkflowTests(unittest.TestCase):
     def test_concurrency_keyed_on_the_resolved_ref_without_cancelling(self):
         c = self.wf["concurrency"]
         self.assertTrue(c["group"].startswith("ios-a11y-audit-"))
+        self.assertIn("inputs.matrix || github.event.schedule", c["group"])
         self.assertIs(c["cancel-in-progress"], False)
 
     def test_resolve_reads_inputs_through_env_and_validates_them(self):

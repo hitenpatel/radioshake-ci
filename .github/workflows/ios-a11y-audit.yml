@@ -34,7 +34,9 @@ permissions:
 # Schedules always audit main (the same group); other branches get their own group. Runs queue
 # rather than cancel.
 concurrency:
-  group: ios-a11y-audit-${{ inputs.ref || 'main' }}
+  # One queue per ref and matrix (A11y-2): a gate and a full run of the same ref run side by side; schedules carry no
+  # inputs, so their cron string tells the nightly gate from the weekly full.
+  group: ios-a11y-audit-${{ inputs.ref || 'main' }}-${{ inputs.matrix || github.event.schedule || 'gate' }}
   cancel-in-progress: false
 
 env:
