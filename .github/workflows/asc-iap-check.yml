@@ -1,0 +1,156 @@
+name: asc-iap-check
+
+# Read-only App Store Connect API check for RadioShake's in-app purchases (Linear RAD-64): lists each product with its
+# type, state, Family Sharing, localizations, base territory and manual prices, territory availability and whether a
+# review screenshot is attached. Logs are public, so it prints product data only, never key material or account data.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    # The App Store Connect secrets live only in the `testflight` environment (owner approval per run, main-only).
+    environment: testflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out the hash-locked requirements
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          path: ci
+          sparse-checkout: .github/scripts/requirements-asc.txt
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - name: Install PyJWT and requests (hash-locked)
+        run: |
+          pip install --quiet --require-hashes --only-binary=:all: -r ci/.github/scripts/requirements-asc.txt
+
+      - name: Read the in-app purchases
+        env:
+          ASC_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          ASC_KEY_B64: ${{ secrets.APP_STORE_CONNECT_PRIVATE_KEY_B64 }}
+        shell: python
+        run: |
+          import base64, os, sys, time
+          import jwt, requests
+
+          for name in ("ASC_KEY_ID", "ASC_ISSUER_ID", "ASC_KEY_B64"):
+              if not os.environ.get(name):
+                  sys.exit(f"missing secret for {name}")
+          key = base64.b64decode(os.environ["ASC_KEY_B64"]).decode()
+          now = int(time.time())
+          token = jwt.encode({"iss": os.environ["ASC_ISSUER_ID"], "iat": now, "exp": now + 900, "aud": "appstoreconnect-v1"},
+                             key, algorithm="ES256", headers={"kid": os.environ["ASC_KEY_ID"], "typ": "JWT"})
+          base = "https://api.appstoreconnect.apple.com"
+          s = requests.Session()
+          s.headers["Authorization"] = f"Bearer {token}"
+
+          def get(path, **params):
+              r = s.get(f"{base}{path}", params=params, timeout=30)
+              if r.status_code != 200:
+                  return None, f"HTTP {r.status_code}"
+              return r.json(), None
+
+          expected = {
+              "com.radioshake.pro_unlock": ("NON_CONSUMABLE", "19.99"),
+              "com.radioshake.pro_trial_14_day": ("NON_CONSUMABLE", "0.0"),
+              "com.radioshake.thank_you_tip": ("CONSUMABLE", "2.99"),
+          }
+          out, problems = [], []
+          apps, err = get("/v1/apps", **{"filter[bundleId]": "com.radioshake"})
+          if err or not apps["data"]:
+              sys.exit(f"app record for com.radioshake: {err or 'missing'}")
+          app_id = apps["data"][0]["id"]
+          iaps, err = get(f"/v1/apps/{app_id}/inAppPurchasesV2", limit=50)
+          if err:
+              sys.exit(f"in-app purchases: {err}")
+          seen = set()
+          for iap in iaps["data"]:
+              a, iid = iap["attributes"], iap["id"]
+              pid = a.get("productId")
+              seen.add(pid)
+              out.append(f"== {pid}  name={a.get('name')!r}  type={a.get('inAppPurchaseType')}  state={a.get('state')}  "
+                         f"familySharable={a.get('familySharable')}")
+              want = expected.get(pid)
+              if want is None:
+                  problems.append(f"{pid}: not one of the three product IDs the app asks for")
+              elif a.get("inAppPurchaseType") != want[0]:
+                  problems.append(f"{pid}: type {a.get('inAppPurchaseType')}, expected {want[0]}")
+              if a.get("familySharable"):
+                  problems.append(f"{pid}: Family Sharing is ON")
+              if a.get("state") not in ("READY_TO_SUBMIT", "WAITING_FOR_REVIEW", "IN_REVIEW", "APPROVED"):
+                  problems.append(f"{pid}: state {a.get('state')}")
+
+              locs, err = get(f"/v2/inAppPurchases/{iid}/inAppPurchaseLocalizations", limit=50)
+              if err:
+                  out.append(f"   localizations: {err}")
+              else:
+                  if not locs["data"]:
+                      problems.append(f"{pid}: no localization (display name)")
+                  for l in locs["data"]:
+                      la = l["attributes"]
+                      out.append(f"   localization {la.get('locale')}: name={la.get('name')!r} state={la.get('state')} "
+                                 f"description={la.get('description')!r}")
+
+              sched, err = get(f"/v2/inAppPurchases/{iid}/iapPriceSchedule")
+              if err or not sched.get("data"):
+                  out.append(f"   price schedule: {err or 'none'}")
+                  problems.append(f"{pid}: no price schedule")
+              else:
+                  sid = sched["data"]["id"]
+                  bt, _ = get(f"/v1/inAppPurchasePriceSchedules/{sid}/baseTerritory")
+                  out.append(f"   base territory: {bt['data']['id'] if bt and bt.get('data') else '?'}")
+                  prices, err = get(f"/v1/inAppPurchasePriceSchedules/{sid}/manualPrices",
+                                    include="inAppPurchasePricePoint,territory", limit=50)
+                  if err:
+                      out.append(f"   manual prices: {err}")
+                  else:
+                      points = {x["id"]: x["attributes"] for x in prices.get("included", [])
+                                if x["type"] == "inAppPurchasePricePoints"}
+                      gbp = None
+                      for p in prices["data"]:
+                          rel = p.get("relationships", {})
+                          terr = (rel.get("territory", {}).get("data") or {}).get("id")
+                          pp = points.get((rel.get("inAppPurchasePricePoint", {}).get("data") or {}).get("id"), {})
+                          pa = p.get("attributes", {})
+                          out.append(f"   manual price {terr}: customerPrice={pp.get('customerPrice')} "
+                                     f"proceeds={pp.get('proceeds')} start={pa.get('startDate')} end={pa.get('endDate')}")
+                          if terr == "GBR":
+                              gbp = pp.get("customerPrice")
+                      if want and gbp is not None and float(gbp) != float(want[1]):
+                          problems.append(f"{pid}: UK price {gbp}, expected {want[1]}")
+                      if want and gbp is None:
+                          problems.append(f"{pid}: no manual UK price")
+
+              avail, err = get(f"/v2/inAppPurchases/{iid}/inAppPurchaseAvailability")
+              if err or not avail.get("data"):
+                  out.append(f"   availability: {err or 'none'}")
+                  problems.append(f"{pid}: availability not set")
+              else:
+                  aid = avail["data"]["id"]
+                  terr, err = get(f"/v1/inAppPurchaseAvailabilities/{aid}/availableTerritories", limit=200)
+                  ids = sorted(t["id"] for t in terr["data"]) if terr else []
+                  out.append(f"   availability: availableInNewTerritories="
+                             f"{avail['data']['attributes'].get('availableInNewTerritories')} territories={len(ids)} "
+                             f"GBR={'GBR' in ids} USA={'USA' in ids} JPN={'JPN' in ids}")
+                  if "GBR" not in ids:
+                      problems.append(f"{pid}: not available in the United Kingdom")
+
+              shot, err = get(f"/v2/inAppPurchases/{iid}/appStoreReviewScreenshot")
+              has_shot = bool(shot and shot.get("data"))
+              out.append(f"   review screenshot: {'yes' if has_shot else 'no'}")
+
+          for pid in expected:
+              if pid not in seen:
+                  problems.append(f"{pid}: MISSING (the app asks for this exact ID)")
+
+          report = "\n".join(out + ["", "PROBLEMS:" if problems else "No problems found."] + [f"- {p}" for p in problems])
+          print(report)
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+              f.write("```\n" + report + "\n```\n")
+          sys.exit(1 if problems else 0)
