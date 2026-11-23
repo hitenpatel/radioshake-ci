@@ -307,7 +307,7 @@ else: sys.exit(3)
         self.assertIn('bundle.tgz.enc',text)
         self.assertIn('key.enc',text)
         self.assertEqual(wf['concurrency']['cancel-in-progress'], False)
-        self.assertEqual(on['workflow_dispatch']['inputs']['device']['options'], ['iPhone 17','iPhone SE (3rd generation)'])
+        self.assertEqual(on['workflow_dispatch']['inputs']['device']['options'], ['iPhone 17','iPhone SE (3rd generation)','iPad Pro 13-inch (M5)'])
         steps=wf['jobs']['diagnostic']['steps']
         uploads=[s for s in steps if 'upload-artifact@' in s.get('uses','')]
         self.assertEqual(len(uploads),1)

@@ -30,7 +30,7 @@ def validate_inputs(ref, sha, selector, request_id, device):
         valid_uuid = str(uuid.UUID(request_id, version=4)) == request_id
     except (ValueError, AttributeError):
         valid_uuid = False
-    if not valid_uuid or device not in ('iPhone 17', 'iPhone SE (3rd generation)'):
+    if not valid_uuid or device not in ('iPhone 17', 'iPhone SE (3rd generation)', 'iPad Pro 13-inch (M5)'):
         raise ValueError('invalid request')
     return dict(ref=ref, sha=sha, selector=selector, request_id=request_id, device=device)
 

@@ -22,6 +22,7 @@ on:
         options:
           - iPhone 17
           - iPhone SE (3rd generation)
+          - iPad Pro 13-inch (M5)
 permissions:
   contents: read
 concurrency:
